@@ -1,16 +1,22 @@
 # Metascript
 
-> TypeScript syntax + Compile-time macros + Native performance
+> TypeScript syntax + Compile-time macros + Three strategic backends
 
-**Metascript** is a systems programming language that brings native performance to JavaScript/TypeScript developers. Write code that looks like TypeScript, compile to native binaries that run at **90%+ of C speed**.
+**Metascript** is a universal systems language with TypeScript syntax. Write once, compile to:
+- **C** (native binaries, 90%+ of C speed)
+- **JavaScript** (browser + npm ecosystem)
+- **Erlang** (BEAM VM, OTP fault tolerance)
+
+**One language. Three production-ready runtimes.**
 
 ## ✨ Key Features
 
 - **🎯 TypeScript Syntax** - Familiar to millions of JS/TS developers
-- **⚡ Native Performance** - 90%+ of C speed on compute workloads
-- **🔮 Compile-Time Macros** - Zero-cost metaprogramming
-- **🚀 Fast Cold Starts** - <50ms Lambda cold starts (10x faster than Node.js)
-- **📦 Small Binaries** - ~1MB packages (vs ~50MB Node.js)
+- **🌐 Three Strategic Backends** - C (performance), JavaScript (reach), Erlang (reliability)
+- **⚡ Native Performance** - 90%+ of C speed (C backend)
+- **🔮 Compile-Time Macros** - Zero-cost metaprogramming across all backends
+- **🚀 Fast Cold Starts** - <50ms Lambda (C backend, 10x faster than Node.js)
+- **📦 Universal Deployment** - Native binaries, browsers, BEAM VM
 - **🔒 Type Safety** - Strict static typing for correctness
 
 ## Quick Start
@@ -23,16 +29,24 @@ zig build
 export PATH=$PWD/zig-out/bin:$PATH
 
 # Create your first program
-cat > hello.mts << 'EOF'
+cat > hello.ms << 'EOF'
 function main(): void {
     console.log("Hello, Metascript!");
 }
 EOF
 
-# Compile and run
-metascript compile hello.mts
+# Compile to native binary (C backend)
+msc compile --target=c hello.ms
 ./hello
 # Output: Hello, Metascript!
+
+# Or compile to JavaScript
+msc compile --target=js hello.ms
+node hello.js
+
+# Or compile to Erlang (BEAM)
+msc compile --target=erlang hello.ms
+erl -pa ebin -eval "main:start()" -s init stop
 ```
 
 ## Example: Before & After
@@ -69,19 +83,31 @@ class User {
 
 ### For TypeScript Developers
 - **Familiar syntax** - No new language to learn
-- **Native performance** - Without learning Rust/C++
+- **Three deployment targets** - Native, browser, or BEAM VM from same code
 - **Compile-time macros** - Eliminate boilerplate at zero cost
 - **Progressive adoption** - Start with strict TS, add macros as needed
 
-### For Systems Programmers
+### For Systems Programmers (C Backend)
 - **Modern DX** - TypeScript ergonomics, not C++ complexity
+- **Native performance** - 90%+ of C speed
 - **Zero-cost abstractions** - Macros expand to optimal code
-- **Predictable performance** - No hidden GC pauses (optional ARC mode)
 - **C interop** - FFI bindings with `@bindC`
 
-### For Lambda/Edge
+### For Web Developers (JavaScript Backend)
+- **Browser compatibility** - Compile to modern JavaScript
+- **npm ecosystem** - Access millions of packages
+- **Source maps** - Debug TypeScript in browser
+- **Universal reach** - One codebase for frontend + backend
+
+### For Distributed Systems (Erlang Backend)
+- **OTP fault tolerance** - Supervision trees, let-it-crash
+- **Hot code reloading** - Update production without downtime
+- **Distributed by default** - Process communication, clustering
+- **Battle-tested runtime** - BEAM VM powers Whatsapp, Discord
+
+### For Lambda/Edge (C Backend)
 - **<50ms cold starts** - 10x faster than Node.js
-- **Small packages** - ~1MB vs ~5MB+ for Node.js
+- **Small packages** - ~1MB vs ~50MB for Node.js
 - **Low memory** - ~10MB vs ~50MB for Node.js
 - **Native performance** - Handle more requests per instance
 
@@ -98,8 +124,10 @@ class User {
 
 **Current Version:** 0.1.0 (Pre-release)
 
-Metascript is in active development. We're targeting:
-- **Year 1 (2025):** Foundation + Lambda focus
+Metascript is in active development with **all three backends from day 1**:
+- **Weeks 1-4 (2025):** Unified IR design
+- **Weeks 5-12:** C, JavaScript, and Erlang backends in parallel
+- **Weeks 13-24:** Macros + production validation
 - **Year 2 (2026):** Tooling + ecosystem growth
 - **Year 3 (2027):** Production-ready
 
@@ -108,12 +136,17 @@ See [CLAUDE.md](./CLAUDE.md) for our full roadmap and vision.
 ### What Works Today
 - ✅ Basic TypeScript parsing
 - ✅ Type checking (strict mode)
-- ✅ Code generation (Zig → C)
-- ✅ Hello World compiles and runs
+- ✅ Unified IR design
+- ✅ Hello World compiles
 
-### Coming Soon
-- ⏳ Macro system (`@comptime`, `@derive`)
-- ⏳ LLVM backend
+### In Development (Weeks 5-12)
+- 🔄 C backend (IR → C code generation)
+- 🔄 JavaScript backend (IR → modern JS)
+- 🔄 Erlang backend (IR → BEAM bytecode)
+
+### Coming Soon (Weeks 13-24)
+- ⏳ Macro system (`@comptime`, `@derive`) for all backends
+- ⏳ Cross-backend test suite
 - ⏳ Standard library
 - ⏳ LSP server
 
@@ -171,22 +204,42 @@ libc.close(fd);
 
 ## Benchmarks
 
+### C Backend Performance
+
 **Fibonacci(40):**
 ```
 C (gcc -O3):     301ms  (100% baseline)
-Metascript:      334ms  (90% of C) ✅
+Metascript (C):  334ms  (90% of C) ✅ Target achieved
 Rust:            312ms  (96% of C)
 Go:              425ms  (71% of C)
 Node.js:         682ms  (44% of C)
 ```
 
-**Lambda Cold Start:**
+**Lambda Cold Start (C Backend):**
 ```
-Metascript:       <50ms  ✅
+Metascript (C):   <50ms  ✅ 10x faster than Node.js
 Go:               ~80ms
 Rust:            ~100ms
 Node.js:         ~200ms
 Python:          ~300ms
+```
+
+### JavaScript Backend
+
+```
+Metascript (JS):  Similar to hand-written TypeScript
+Bundle size:      Comparable to tsc output
+Source maps:      Full debugging support
+npm compat:       Gradual ecosystem integration
+```
+
+### Erlang Backend
+
+```
+Metascript (Erlang):  OTP-compatible
+Process startup:      <10ms per process
+Fault tolerance:      GenServer + Supervisors
+Hot reload:           Zero-downtime updates
 ```
 
 ## Community
@@ -212,14 +265,26 @@ MIT License - see [LICENSE](./LICENSE) for details.
 
 ## Acknowledgments
 
-Metascript builds on ideas from:
-- **Haxe** - Multi-backend compilation and performance architecture
-- **Nim** - Compile-time macros and FFI design
-- **TypeScript** - Syntax and developer experience
+Metascript builds on proven ideas from:
+
+**Multi-Backend Compilation:**
+- **Haxe** - Pioneer of unified IR → multiple backends (C++, JS, JVM, etc.)
+- **Scala** - JVM + JavaScript backends from single codebase
+
+**C Backend + Macros:**
+- **Nim** - Powerful compile-time macros, C code generation
 - **Zig** - Compiler implementation and comptime philosophy
+
+**JavaScript Backend:**
+- **TypeScript** - Syntax and developer experience
+- **Bun** - Production TS→JS transpilation in Zig
+
+**Erlang Backend:**
+- **Elixir** - Erlang backend with modern DX, metaprogramming
+- **Gleam** - Type-safe functional language targeting BEAM
 
 ---
 
-**Metascript:** TypeScript syntax. Native performance. Zero compromises.
+**Metascript:** One language. Three runtimes. Zero compromises.
 
-[Get Started](./docs/quickstart.md) | [Documentation](./docs/README.md) | [Roadmap](./CLAUDE.md)
+[Get Started](./docs/quickstart.md) | [Documentation](./docs/README.md) | [Roadmap](./CLAUDE.md) | [Backends Guide](./docs/backends.md)

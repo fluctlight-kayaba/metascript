@@ -1,22 +1,22 @@
 # Metascript
 
-A systems programming language with TypeScript syntax and compile-time metaprogramming, achieving 85-95% of C performance.
+A universal systems language with TypeScript syntax, compile-time metaprogramming, and three strategic backends: C (native performance), JavaScript (browser/npm ecosystem), and Erlang (fault-tolerant distributed systems).
 
 ## Core Vision
 
-**The Magic Formula:** TypeScript syntax + Compile-time macros + Native performance
+**The Magic Formula:** TypeScript syntax + Compile-time macros + Three strategic backends
 
-Metascript bridges familiar developer experience with systems-level performance. Write code that looks like TypeScript, compile to native binaries via Zig/LLVM with performance approaching hand-written C.
+Metascript is a universal systems language: write once in TypeScript syntax, deploy to three strategic runtimes. Get native performance (C), browser/npm reach (JavaScript), or fault-tolerant distribution (Erlang) from the same codebase.
 
 **What We're Building:**
 - TypeScript syntax (familiar, copy-paste friendly)
 - Compile-time macro system (bridge dynamic patterns to static code)
-- Native compilation (Zig → C/LLVM)
+- **Three backends:** C (90%+ of C perf), JavaScript (browser/npm), Erlang (OTP runtime)
+- Unified IR (one language, three runtimes)
 - Strict static typing (no `any`)
-- 90%+ of C performance
 
 **Why This Matters:**
-JS/TS developers need native performance without learning Rust/C++. Existing solutions sacrifice either performance (Node.js, Bun), require new syntax (Rust, Go), or lack metaprogramming (most compiled languages). Metascript gives TS developers a path to native performance while keeping syntax familiarity and adding compile-time superpowers.
+Developers face a false choice: fast development (TypeScript/Node.js) OR native performance (C/Rust) OR fault tolerance (Erlang/Elixir). Metascript eliminates this trade-off with one language targeting three strategic runtimes. Write TypeScript-like code once, deploy for performance (C backend), reach (JavaScript backend), or reliability (Erlang backend).
 
 ## The Four Pillars
 
@@ -59,32 +59,53 @@ const route = @route `GET /users/:id => handler`;
 - Standard macro library (`@derive`, `@serialize`, `@ffi`, `@route`)
 - Hygienic (no variable capture)
 
+**Critical Insight - Macros Are Additive, Not Breaking:**
+Metascript's metaprogramming is **perfectly compatible with JavaScript AST** - macros add compile-time superpowers, not runtime overhead:
+
+```typescript
+// Metascript with macros
+@derive(Eq, Hash)
+class User { name: string; }
+
+// Compiles to clean JavaScript (all backends)
+// - C backend: Optimized structs
+// - JavaScript backend: Clean ES2020 classes (zero macro runtime!)
+// - Erlang backend: Erlang records
+```
+
+**JavaScript Backend Gets Full Macro Power:**
+- Macros expand before JavaScript emission → standard JS output
+- Compatible everywhere: Browser, Node.js, Deno, Bun, Hermes
+- **Additive optimization**: JavaScript + compile-time manipulation = more powerful JavaScript
+- Zero breaking changes - works with existing npm ecosystem
+
 **See:** [Macro System](./docs/macro-system.md) for details
 
-### 3. Performance
+### 3. Multi-Backend Architecture
 
-**Goal:** 90%+ of C on compute-bound code, 80%+ on allocation-heavy workloads
+**Goal:** One language, three strategic runtimes - choose the right backend for each use case
 
 **Architecture:**
 ```
 TypeScript → AST → Macro expansion → Type checking →
-Monomorphization → Zig IR → C/LLVM → Native binary
+Unified IR → Backend Selection
+    ├─ C backend → GCC/Clang → Native binary (90%+ of C)
+    ├─ JavaScript backend → Modern JS (browser/npm compatible)
+    └─ Erlang backend → BEAM bytecode (OTP fault tolerance)
 ```
 
+**Backend Capabilities:**
+- **C backend:** 90%+ of C performance, <50ms Lambda cold starts, native binaries
+- **JavaScript backend:** Browser/Node.js compatibility, npm ecosystem access
+- **Erlang backend:** OTP supervision, distributed systems, hot code reloading
+
 **Key Techniques:**
-- Static types → concrete native types (no boxing)
-- Generics specialized at compile-time (monomorphization)
-- Stack allocation preferred, generational GC for heap
-- Struct-based object model (no hash table properties)
-- Zero-cost abstractions via macros
+- Unified IR validates abstraction across all backends
+- Backend-specific optimizations (SIMD for C, tree-shaking for JS, process pooling for Erlang)
+- Macros generate IR (backend-agnostic), backends translate idiomatically
+- Cross-backend code sharing via common type system
 
-**Targets:**
-- Compute-bound: 90%+ of C
-- Mixed workloads: 80%+ of C
-- Lambda cold start: <50ms (10x faster than Node.js)
-- Memory: Within 20% of equivalent C
-
-**See:** [Performance Guide](./docs/performance-guide.md), [Design References](./docs/design-references.md)
+**See:** [Architecture](./docs/architecture.md), [Backends Guide](./docs/backends.md)
 
 ### 4. Market Adoption
 
@@ -110,8 +131,13 @@ Monomorphization → Zig IR → C/LLVM → Native binary
 # Build compiler
 zig build
 
-# Compile Metascript file
+# Compile Metascript file (default: C backend)
 metascript compile main.mts
+
+# Compile to specific backend
+metascript compile --target=c main.mts          # Native binary
+metascript compile --target=js main.mts         # JavaScript
+metascript compile --target=erlang main.mts     # Erlang/BEAM
 
 # Run with JIT (development)
 metascript run main.mts
@@ -128,8 +154,11 @@ metascript expand --macro=derive main.mts
 # Performance profiling
 metascript profile main.mts
 
-# Generate C code (debugging)
-metascript emit-c main.mts
+# Emit intermediate representations
+metascript emit-ir main.mts                     # Unified IR
+metascript emit-c main.mts                      # C code
+metascript emit-js main.mts                     # JavaScript code
+metascript emit-erl main.mts                    # Erlang code
 ```
 
 ### Project Structure
@@ -140,8 +169,8 @@ metascript/
 │   ├── parser/       # TypeScript parser
 │   ├── checker/      # Type checker
 │   ├── macro/        # Macro expander
-│   ├── codegen/      # Code generation
-│   └── backend/      # LLVM/C backend
+│   ├── ir/           # Unified IR
+│   └── backends/     # C, JavaScript, Erlang backends
 ├── runtime/          # Minimal runtime
 │   ├── gc/          # Garbage collector
 │   ├── allocator/   # Memory allocator
@@ -232,49 +261,78 @@ metascript/
 
 We synthesize proven approaches rather than inventing new paradigms:
 
-**Haxe (Performance):**
-- Validated 85-95% of C performance achievable
-- Generational GC for native targets
-- Struct-based object model
+**Haxe (Multi-Backend Pioneer):**
+- Validates multi-backend compilation works (6+ backends)
+- 85-95% of C performance on C++ backend
+- Proven IR abstraction across very different targets
+- Multi-backend development is tractable
 
-**Nim (Macros):**
-- Powerful hygienic macro system
-- Compile-time code execution
-- Zero-cost abstractions
+**Nim (Macros + C Backend):**
+- Powerful hygienic macro system with AST manipulation
+- C backend achieving 90-95% of C performance
+- Compile-time code execution validates our approach
+- Zero-cost abstractions via compile-time expansion
 
-**TypeScript (Syntax/Tooling):**
-- Familiar syntax drives adoption
-- World-class LSP integration
-- Progressive enhancement
+**Elixir (Erlang Backend with Modern DX):**
+- Proves modern syntax + BEAM runtime works
+- TypeScript-like developer experience on OTP
+- Fault-tolerant distributed systems accessible
+- Validation that familiar syntax drives OTP adoption
 
-**Deno (Modern Tooling):**
-- Zero-config experience
-- Integrated development workflow
-- Developer-friendly defaults
+**TypeScript (Syntax/Tooling Excellence):**
+- Familiar syntax drives massive adoption
+- World-class LSP integration sets the bar
+- Progressive enhancement philosophy
+- Millions of developers already know the syntax
+
+**Local Reference Implementations:**
+
+We have production-grade source code to study locally:
+
+**For C Backend + Metaprogramming:**
+- `~/projects/nim` - Nim compiler (C backend, powerful macros, AST manipulation)
+- `~/projects/haxe` - Haxe compiler (C++ backend, multi-backend IR, proven at scale)
+
+**For Erlang Backend:**
+- `~/projects/elixir` - Elixir compiler (Erlang backend, metaprogramming, modern DX)
+- `~/projects/gleam` - Gleam compiler (Erlang backend, type-safe functional)
+
+**For JavaScript Backend:**
+- `~/projects/bun` - Bun runtime (Zig implementation, production TypeScript transpilation)
+- `~/projects/hermes` - Hermes JS engine (Meta's AOT bytecode compiler, React Native optimized)
+
+**When stuck, study these codebases first** - they've solved the exact problems we're tackling.
 
 **See:** [Design References](./docs/design-references.md) for detailed analysis
 
 ## Current Roadmap
 
-### Year 1: Prove the Concept (Q1-Q4 2025)
+### Year 1: Prove Multi-Backend Concept (Q1-Q4 2025)
 
-**Q1-Q2 Foundation:**
-- Basic compiler (parser, type checker, codegen)
-- Core stdlib
-- Simple macros
-- "Hello World" to native binary
+**Weeks 1-4: Unified IR Design**
+- Parser (TypeScript subset)
+- Type checker (strict static)
+- **Unified IR** (design for all 3 backends)
+- Macro system foundation
 
-**Q3-Q4 Lambda Focus:**
-- Lambda runtime optimization
-- Performance benchmarks
-- Standard macros (`@derive`, `@serialize`)
-- 3-5 production pilots
+**Weeks 5-12: All 3 Backends in Parallel**
+- C backend (native performance)
+- JavaScript backend (browser/npm)
+- Erlang backend (OTP runtime)
+- "Hello World" compiles to all 3
+
+**Weeks 13-24: Validation & Optimization**
+- Performance benchmarks (all backends)
+- Standard macros working across backends
+- Lambda/Edge deployment (C backend)
+- Browser demo (JS backend)
+- Distributed demo (Erlang backend)
 
 **Milestones:**
-- 50% of strict TS compiles
-- 80%+ of C performance
-- <100ms Lambda cold starts
-- 1k+ developers testing
+- Same code compiles to all 3 backends
+- C backend: 80%+ of C performance
+- JS backend: Works in browser/Node.js
+- Erlang backend: OTP supervision working
 
 ### Year 2: Build Ecosystem (2026)
 
@@ -317,19 +375,20 @@ We synthesize proven approaches rather than inventing new paradigms:
 
 ## What We're NOT Building
 
-**Not a JavaScript runtime:**
-- No browser/Node.js compatibility
-- Not targeting dynamic JS code
-
 **Not TypeScript-compatible:**
 - Not a drop-in `tsc` replacement
-- Subset only (no `any`, no eval)
-- Breaking changes for performance
+- Subset only (no `any`, no eval, restricted dynamics)
+- Breaking changes for multi-backend support
 
-**Not replacing high-level languages:**
-- Not for web frontend
-- Not competing with Node.js for I/O-heavy apps
-- Not prioritizing npm compatibility
+**Not targeting all platforms:**
+- C backend: Lambda, CLI, servers (not embedded/IoT)
+- JS backend: Modern browsers/Node.js (not IE11)
+- Erlang backend: Distributed systems (not single-machine apps)
+
+**Not a general-purpose transpiler:**
+- Not competing with esbuild/SWC for pure JS→JS
+- Multi-backend requires IR abstraction
+- Compile-time macros change architecture
 
 **Not a new syntax:**
 - TypeScript syntax is non-negotiable
@@ -338,10 +397,13 @@ We synthesize proven approaches rather than inventing new paradigms:
 **Not a quick project:**
 - 2-3 year timeline to production-ready
 - Quality over speed
+- All 3 backends from day 1 = longer initial development
 
 **See:** [Philosophy](./docs/philosophy.md) for complete non-goals
 
 ## Documentation
+
+**Writing Style:** Documentation in `docs/` must be laser-focused on facts and critical design decisions only. Strip verbose explanations, redundant examples, and implementation details that don't directly support the core message. Prefer tables, code snippets, and bullet points over prose. Target: Dense, scannable documentation that respects reader's time.
 
 **Getting Started:**
 - [Quickstart Guide](./docs/quickstart.md) - 30-minute intro
@@ -349,7 +411,8 @@ We synthesize proven approaches rather than inventing new paradigms:
 
 **Reference:**
 - [Macro System](./docs/macro-system.md) - Compile-time metaprogramming
-- [Architecture](./docs/architecture.md) - Compiler internals
+- [Architecture](./docs/architecture.md) - Compiler internals & unified IR
+- [Backends Guide](./docs/backends.md) - C, JavaScript, Erlang backends
 - [Performance Guide](./docs/performance-guide.md) - Optimization techniques
 
 **Planning:**
@@ -367,4 +430,4 @@ We synthesize proven approaches rather than inventing new paradigms:
 
 ---
 
-**This is our north star.** Every decision—technical, strategic, or tactical—should advance the Four Pillars while staying true to the core vision: TypeScript syntax, compile-time macros, native performance.
+**This is our north star.** Every decision—technical, strategic, or tactical—should advance the Four Pillars while staying true to the core vision: TypeScript syntax, compile-time macros, three strategic backends (C/JavaScript/Erlang). One language, three runtimes—choose the right tool for each job.

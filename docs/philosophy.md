@@ -1,55 +1,73 @@
 # Metascript Philosophy
 
-Core principles and design philosophy guiding Metascript development.
+Core principles guiding development.
+
+---
 
 ## Developer Experience First
 
 Every technical decision considers developer impact. Performance means nothing if developers won't use the language.
 
-**Implementation:**
-- Clear, helpful error messages pointing to user code
-- Quality tooling (LSP, debugger, profiler)
-- Familiar syntax requiring minimal learning
-- Progressive adoption path
+**Implementation:** Clear error messages, quality tooling (LSP, debugger), familiar syntax, progressive adoption.
+
+---
+
+## One Language, Three Runtimes
+
+| Backend | Best For | Key Metrics |
+|---------|----------|-------------|
+| **C** | Lambda/Edge, CLI, perf-critical | <50ms cold start, 90%+ C perf |
+| **JavaScript** | Browser, npm ecosystem, TS migration | Universal reach, millions of developers |
+| **Erlang** | Distributed, fault-tolerant | OTP supervision, hot reload, production reliability |
+
+**Why Three Backends:**
+- Unified IR validates design (if it maps to all three, abstraction is sound)
+- Different strengths (performance, reach, reliability)
+- One codebase, multiple targets (write once, deploy anywhere)
+- De-risks the project (not betting on single runtime)
+
+**Universal Promise:** Same TypeScript syntax. Same macros. Three strategic runtimes.
+
+---
 
 ## Macros Make Restrictions Palatable
 
-Instead of "we removed features," it's "we added compile-time superpowers." Macros shift the narrative from limitation to empowerment.
+Instead of "we removed features," it's "we added compile-time superpowers."
 
-**Why This Matters:**
-- No `any` type becomes "type-safe by design"
-- No dynamic properties becomes "zero-cost abstractions via macros"
-- No runtime reflection becomes "compile-time introspection"
-- Static restrictions enable native performance
+**Reframing:**
+- No `any` → "Type-safe by design"
+- No dynamic properties → "Zero-cost abstractions via macros"
+- No runtime reflection → "Compile-time introspection"
+- Static restrictions → Enable native performance
 
 **Example:**
 ```typescript
-// Dynamic pattern in TypeScript
-const value = obj[key];  // Runtime lookup
-
-// Metascript with macros
-const value = obj[key];  // Macro generates type-safe compile-time switch
+// Dynamic (TypeScript): obj[key]  // Runtime lookup
+// Metascript: obj[key]  // Macro generates type-safe compile-time switch
 ```
+
+---
 
 ## Proven, Not Novel
 
-We combine proven techniques (Haxe performance, Nim macros, TS syntax) rather than inventing new paradigms.
+Combine proven techniques from production languages. Lower risk, faster development, easier adoption.
 
 **Reference Models:**
-- **Haxe**: Performance architecture (85-95% of C proven achievable)
-- **Nim**: Compile-time macro system design
-- **TypeScript**: Syntax and tooling patterns
-- **Deno**: Modern tooling integration
 
-**Why Not Novel:**
-- Lower risk (proven approaches)
-- Clear precedents for performance claims
-- Faster development (learn from others)
-- Easier adoption (familiar patterns)
+| What | Proven By |
+|------|-----------|
+| **Multi-backend IR** | Haxe (20 years production, C++/JS/JVM) |
+| **C backend + macros** | Nim (90%+ C perf), Haxe (85-95% C++ perf) |
+| **TS→JS in Zig** | Bun (millions of users, 10-20x faster than tsc) |
+| **Erlang backend** | Elixir (Discord, WhatsApp), Gleam (type-safe BEAM) |
+
+**Local Reference:** All in `~/projects/{haxe,nim,bun,elixir,gleam,typescript-go}`
+
+---
 
 ## Incremental Adoption
 
-Developers start with familiar TypeScript, add metaprogramming as needed. No all-or-nothing migration.
+Start with familiar TypeScript, add metaprogramming as needed. No all-or-nothing migration.
 
 **Adoption Path:**
 1. Start with strict TypeScript subset (minimal changes)
@@ -57,145 +75,86 @@ Developers start with familiar TypeScript, add metaprogramming as needed. No all
 3. Explore compile-time features (`@comptime`)
 4. Build custom macros (advanced users)
 
-**Migration Strategy:**
-- 70% of strict TS compiles unchanged (goal)
-- 90% works with < 10% modifications (goal)
-- Clear migration guide from TypeScript
-- Compatibility layer where beneficial
-
-## Performance as Feature
-
-85-95% of C performance isn't just a metric—it's the core value proposition that justifies the learning curve.
-
-**Performance Targets:**
-- Compute-bound: 90-95% of C (validated via benchmarks)
-- Mixed workloads: 80-90% of C
-- Allocation-heavy: 70-85% of C (GC overhead)
-- Lambda cold start: < 50ms (10x faster than Node.js)
-
-**Why Performance Matters:**
-- Enables new use cases (Lambda, Edge, real-time)
-- Direct cost savings (serverless pricing)
-- Better user experience (faster response times)
-- Differentiator vs high-level languages
-
-## The Magic Formula
-
-**TypeScript syntax + Compile-time macros + Native performance = Metascript**
-
-Each component is essential:
-
-**TypeScript Syntax:**
-- Familiar to millions of developers
-- Copy-paste friendly
-- Excellent tooling ecosystem
-- Gradual typing mindset
-
-**Compile-Time Macros:**
-- Bridge dynamic patterns to static code
-- Eliminate boilerplate
-- Enable DSLs and custom syntax
-- Zero-cost abstractions
-
-**Native Performance:**
-- Competitive with C/Rust/Go
-- Small binaries, fast startup
-- Predictable resource usage
-- Production-grade performance
-
-## Design Principles
-
-### Type System
-- Static-first: All types resolvable at compile-time
-- No `any`: Explicit `unknown` with type guards
-- Nominal typing for classes (identity matters)
-- Structural typing for interfaces (shape matters)
-
-### Macro System
-- Transparent: Bridge dynamic → static without friction
-- Hygienic: No variable capture issues
-- Type-driven: Access full type information
-- Fail-fast: Clear errors at compile-time
-
-### Compilation
-- Optimize for runtime, not compile-time
-- Clear errors pointing to source (not generated code)
-- Debuggability via source maps
-- LLVM optimization passes
-
-### Memory Model
-- Stack allocation for value types (preferred)
-- Generational GC for heap objects
-- Optional ARC mode for predictable deallocation
-- Explicit annotations (`@stack`, `@heap`) where needed
-
-## Success Philosophy
-
-### What Success Looks Like
-
-**Year 1:**
-- Developers say "this actually works!"
-- Performance claims validated
-- Clear migration path from TypeScript
-
-**Year 2:**
-- Developers say "macros are a superpower"
-- Ecosystem forming organically
-- Production deployments growing
-
-**Year 3:**
-- Developers say "worth learning over Rust for our use case"
-- Sustainable community and funding
-- Corporate adoption beginning
-
-### What Failure Looks Like
-
-**Avoid:**
-- "Yet another language" without clear differentiator
-- Performance claims that don't hold up
-- Developer experience sacrificed for purity
-- Community fragmentation and burnout
-
-## Non-Goals
-
-### What We're NOT Building
-
-**Not a JavaScript runtime:**
-- No browser compatibility
-- No Node.js API compatibility
-- Not targeting dynamic JavaScript code
-
-**Not TypeScript-compatible:**
-- Not a drop-in `tsc` replacement
-- Breaking changes for performance
-- Subset only (no `any`, no eval, restricted dynamics)
-
-**Not replacing high-level languages:**
-- Not targeting web frontend development
-- Not competing with Node.js/Deno/Bun for I/O-heavy apps
-- Not prioritizing npm package compatibility
-
-**Not a new syntax:**
-- Not inventing new language paradigms
-- Not chasing academic type system features
-- TypeScript syntax is non-negotiable
-
-**Not a quick project:**
-- Not aiming for 6-month MVP
-- Not sacrificing quality for speed
-- 2-3 year timeline to production-ready
-
-## Core Beliefs
-
-1. **Syntax familiarity lowers adoption barriers** - Millions know TypeScript
-2. **Compile-time metaprogramming is underutilized** - Most languages lack it
-3. **Native performance is achievable** - Haxe proved it's possible
-4. **Developer experience matters most** - Best tech loses if DX is poor
-5. **Incremental adoption wins** - All-or-nothing migrations fail
+**Migration:** 70% of strict TS works unchanged, 90% works with <10% modifications.
 
 ---
 
-**See Also:**
-- [CLAUDE.md](../CLAUDE.md) - Project overview
-- [Design References](./design-references.md) - Proven reference models
-- [Market Strategy](./market-strategy.md) - Target markets and adoption
+## Performance as Feature
+
+85-95% of C performance isn't just a metric—it's the core value proposition.
+
+**Targets:**
+- Compute-bound: 90-95% of C
+- Mixed workloads: 80-90% of C
+- Allocation-heavy: 70-85% of C (GC overhead)
+- Lambda cold start: <50ms (10x faster than Node.js)
+
+**Why:** Enables new use cases (Lambda, Edge), direct cost savings (serverless), better UX (faster response).
+
+---
+
+## The Magic Formula
+
+**TypeScript syntax + Compile-time macros + Three strategic backends = Metascript**
+
+Each component is essential:
+
+**TypeScript Syntax:** Familiar to millions, copy-paste friendly, excellent tooling
+**Compile-Time Macros:** Bridge dynamic→static, eliminate boilerplate, zero-cost abstractions
+**Three Backends:** C (performance), JavaScript (reach), Erlang (reliability)
+
+**Why This Works:** Unified IR ensures same semantics, developer chooses backend for deployment, macros expand consistently.
+
+---
+
+## Design Principles
+
+**Type System:** Static-first (all types resolvable at compile-time), no `any` (explicit `unknown`), nominal typing for classes, structural for interfaces
+
+**Macro System:** Transparent (bridge dynamic→static), hygienic (no variable capture), type-driven (full type info access), fail-fast (clear compile-time errors)
+
+**Compilation:** Optimize runtime (not compile-time), clear errors (point to source), debuggability (source maps), LLVM optimization
+
+**Memory Model:**
+- **C backend:** Stack allocation (preferred), generational GC, optional ARC
+- **JavaScript backend:** V8/engine-managed
+- **Erlang backend:** Per-process heaps, immutable data
+
+**Backend Selection:** Auto-inference from imports (e.g., `@metascript/web` → JS), explicit via `--target=c|js|erlang`, same semantics across all
+
+---
+
+## Success Philosophy
+
+**Year 1:** "This actually works!" - Performance claims validated, clear TS migration path
+**Year 2:** "Macros are a superpower" - Ecosystem forming, production deployments growing
+**Year 3:** "Worth learning over Rust for our use case" - Sustainable community, corporate adoption
+
+**Avoid:** "Yet another language" without differentiator, performance claims that fail, DX sacrificed for purity, community burnout
+
+---
+
+## Non-Goals
+
+**NOT:**
+- TypeScript drop-in replacement (strict subset only, breaking changes for perf)
+- Single-purpose language (universal with backend choice)
+- New syntax invention (TypeScript syntax non-negotiable)
+- Dynamic code prioritization (no `eval`, runtime type manipulation)
+- Quick project (2-3 year timeline, quality over speed)
+
+---
+
+## Core Beliefs
+
+1. **Syntax familiarity lowers adoption barriers** (millions know TypeScript)
+2. **Compile-time metaprogramming is underutilized** (most languages lack it)
+3. **Multi-backend compilation validates design** (if IR maps to C/JS/Erlang, abstraction is sound)
+4. **Native performance is achievable** (Haxe proved 85-95% of C possible)
+5. **Developer experience matters most** (best tech loses if DX is poor)
+6. **Incremental adoption wins** (all-or-nothing migrations fail)
+7. **One codebase, multiple runtimes** (write once, deploy to native/browser/BEAM)
+
+---
+
+**See:** `design-references.md` (proven reference models), `positioning.md` (target markets)

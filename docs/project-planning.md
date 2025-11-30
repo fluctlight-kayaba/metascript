@@ -1,290 +1,105 @@
 # Project Planning & Critical Success Factors
 
-Essential planning considerations and risk factors for Metascript's success.
+Essential planning considerations for Metascript's success.
 
-## Critical Success Factors
+---
 
-### 1. Team & Resources
+## Team & Resources
 
-**Minimum Viable Team:**
+| Phase | Engineers | DevRel | Annual Cost | Funding Source |
+|-------|-----------|--------|-------------|----------------|
+| **Year 1** | 3-5 | 0 | $300k-500k | Seed, grants, bootstrap |
+| **Year 2** | 5-8 | 1 | $600k-1M | Series A, corporate backing |
+| **Year 3** | 8-12 | 2 | $1M-2M | Revenue, sponsorship, funding |
 
-**Year 1: Foundation (3-5 engineers)**
+**Year 1 Team (3-5 engineers):**
 - 2 compiler engineers (parser, type checker, codegen)
 - 1 systems engineer (runtime, GC, performance)
 - 1 tooling engineer (LSP, build system)
 - 1 full-stack engineer (stdlib, examples, docs)
 
-**Year 2: Growth (5-8 engineers + 1 DevRel)**
-- Core team from Year 1
-- +1 macro system specialist
-- +1 optimization engineer
-- +1-2 ecosystem engineers
-- +1 DevRel/community manager
+**Alternative Paths:** Open-source (part-time contributors, slower), corporate backing (single sponsor), grant funding (NSF, DARPA), hybrid
 
-**Year 3: Scale (8-12 engineers + support)**
-- Core engineering team
-- +2-4 ecosystem/integrations
-- +1 security specialist
-- +1 performance engineer
-- +2 DevRel/community
-- +1 technical writer
+**Avoid:** Single maintainer (burnout), unfunded development (unsustainable), over-hiring early (burn rate)
 
-**Funding Requirements:**
+---
 
-| Phase | Annual Cost | Funding Source |
-|-------|------------|----------------|
-| Year 1 | $300k-500k | Seed, grants, bootstrap |
-| Year 2 | $600k-1M | Series A, corporate backing |
-| Year 3 | $1M-2M | Revenue, sponsorship, funding |
+## Technical Validation
 
-**Alternative Paths:**
-- **Open-source model**: Part-time contributors, slower timeline
-- **Corporate backing**: Single sponsor (Google, Meta, Microsoft)
-- **Grant funding**: NSF, DARPA, language research grants
-- **Hybrid**: Mix of sources
+### Must Prove Early (Year 1 Q1-Q2)
 
-**Avoid:**
-- Single maintainer (burnout risk)
-- Unfunded development (unsustainable)
-- Over-hiring too early (burn rate)
+| What | Target | Why Critical |
+|------|--------|--------------|
+| **Performance claims** | 80%+ of C on compute-bound | Validate core value prop |
+| **Lambda cold start** | <100ms (Year 1), <50ms (Year 3) | Primary use case |
+| **Real-world apps** | 3-5 pilot projects | Prove practical viability |
+| **Memory safety** | GC correctness, no leaks | Reliability foundation |
 
-### 2. Technical Validation
+### Cannot Defer (Must Be High-Quality from Start)
 
-**Must Prove Early (Year 1 Q1-Q2):**
+1. **LSP quality:** <200ms response, accurate autocomplete, helpful hover
+2. **Error messages:** Point to user code, suggest fixes, clear explanations
+3. **Debugging:** Source maps working, accurate breakpoints, clear stack traces
+4. **Macro system design:** Get design right early (breaking changes later = ecosystem chaos)
 
-1. **Performance claims**
-   - Benchmark suite vs C/Rust/Go
-   - Published results with methodology
-   - Reproducible by third parties
-   - Target: 80%+ of C on compute-bound
-
-2. **Lambda cold start**
-   - Real AWS Lambda deployments
-   - Measured cold start times
-   - Comparison vs Node.js/Go/Rust
-   - Target: <100ms (Year 1), <50ms (Year 3)
-
-3. **Real-world applications**
-   - 3-5 pilot projects
-   - Different use cases (API, CLI, Lambda)
-   - Case studies with metrics
-   - Developer testimonials
-
-4. **Memory safety**
-   - GC correctness validation
-   - Memory leak testing
-   - Stress testing
-   - Fuzzing
-
-**Cannot Defer:**
-
-These must be high-quality from the start:
-
-1. **LSP quality**
-   - <200ms response time
-   - Accurate autocomplete
-   - Helpful hover information
-   - Fast go-to-definition
-
-2. **Error messages**
-   - Point to user code (not generated)
-   - Suggest fixes
-   - Clear explanations
-   - No cryptic compiler jargon
-
-3. **Debugging experience**
-   - Source maps working
-   - Breakpoints accurate
-   - Variable inspection reliable
-   - Stack traces clear
-
-4. **Macro system design**
-   - Get design right early
-   - Breaking changes later = ecosystem chaos
-   - Hygienic by default
-   - Clear mental model
-
-**Can Defer:**
-
-These can wait for later phases:
+### Can Defer (Add in Later Phases)
 
 - Full TypeScript compatibility (start with subset)
 - Advanced optimizations (LLVM handles basics)
-- Mobile/embedded targets (focus on server first)
-- Async runtime (add in Year 2-3)
+- Mobile/embedded targets (focus server first)
+- Async runtime (Year 2-3)
 - GUI frameworks (not core use case)
 
-### 3. Market Timing
+---
 
-**Current Advantages (2025):**
+## Market Timing
 
-1. **Lambda/Edge growth**
-   - Serverless market growing 25% annually
-   - Edge computing exploding (Cloudflare, Vercel)
-   - Performance = cost savings (clear ROI)
+### Current Advantages (2025)
 
-2. **TypeScript dominance**
-   - 80%+ of new npm packages use TS
-   - Millions of developers know it
-   - Syntax familiarity = low adoption barrier
+| Opportunity | Why Now |
+|-------------|---------|
+| **Lambda/Edge growth** | Serverless 25% annual growth, edge exploding, performance = cost savings |
+| **TypeScript dominance** | 80%+ new npm packages, millions know it, low adoption barrier |
+| **Rust fatigue** | Learning curve too steep, borrow checker frustration, web devs want native perf |
+| **Compiler tech maturity** | LLVM stable, Zig emerging, macro systems proven (Nim, Lisp) |
 
-3. **Rust fatigue**
-   - Learning curve too steep for many
-   - Borrow checker frustration
-   - Web developers want native performance without Rust complexity
+### Current Risks
 
-4. **Compiler tech maturity**
-   - LLVM stable and excellent
-   - Zig emerging as great systems language
-   - Macro systems proven (Nim, Lisp)
+| Risk | Window | Mitigation |
+|------|--------|-----------|
+| **Microsoft Go compiler for TS** | Expected 2025 | Focus on native perf gap + macros |
+| **Bun/Deno improvements** | Ongoing | Native still 5-10x better for Lambda/CLI |
+| **WebAssembly maturation** | 2025-2027 | Native still faster for Lambda/CLI |
+| **Corporate resistance** | Always | Start with individuals, prove value |
 
-**Current Risks:**
+---
 
-1. **Microsoft Go compiler for TypeScript**
-   - Expected 2025
-   - Could improve TS performance significantly
-   - Mitigation: Focus on native performance gap + macros
-
-2. **Bun/Deno improvements**
-   - Continuously getting faster
-   - Better developer experience
-   - Mitigation: Native performance still 5-10x better
-
-3. **WebAssembly maturation**
-   - WASM improving rapidly
-   - Could be "good enough" solution
-   - Mitigation: Native still faster for Lambda/CLI
-
-4. **Corporate resistance**
-   - "Yet another language" fatigue
-   - Risk aversion in enterprises
-   - Mitigation: Start with individuals, prove value
-
-**Timing Windows:**
-
-| Opportunity | Window | Action |
-|------------|--------|--------|
-| Lambda performance | 2025-2027 | Launch Year 1, prove claims |
-| Rust alternative | 2025-2028 | Position as easier path to native |
-| TS ecosystem | Ongoing | Leverage familiarity |
-| Edge computing | 2025-2030 | First-class Cloudflare/Vercel support |
-
-### 4. Community & Ecosystem
-
-**Early Priorities (Year 1):**
-
-1. **High-quality documentation**
-   - Clear quickstart (< 30 min)
-   - Comprehensive reference
-   - Migration guide from TypeScript
-   - Performance optimization guide
-
-2. **Responsive issue triage**
-   - < 24 hour first response
-   - Close invalid issues quickly
-   - Prioritize bugs over features
-   - Transparent roadmap
-
-3. **Clear contribution guidelines**
-   - Good first issues labeled
-   - Architecture documentation
-   - Code review standards
-   - Recognition for contributors
-
-4. **Welcoming community culture**
-   - Code of conduct enforced
-   - Beginner-friendly environment
-   - No elitism or gatekeeping
-   - Celebrate contributions
-
-**Library Priorities (Year 2):**
-
-1. **HTTP server frameworks**
-   - Express-like API (familiar)
-   - High performance
-   - Middleware support
-   - WebSocket support
-
-2. **Database drivers**
-   - Postgres (most requested)
-   - Redis (caching/sessions)
-   - SQLite (embedded)
-   - Type-safe query builders
-
-3. **Serialization**
-   - JSON (essential)
-   - Protocol Buffers
-   - MessagePack
-   - Custom binary formats
-
-4. **Cloud integrations**
-   - AWS Lambda
-   - Cloudflare Workers
-   - Vercel Edge Functions
-   - GCP Cloud Functions
-
-**Ecosystem Health Metrics:**
-
-| Metric | Year 1 Target | Year 2 Target | Year 3 Target |
-|--------|--------------|--------------|--------------|
-| Core libraries | 5 | 15 | 30 |
-| Community packages | 10 | 50 | 200 |
-| Active contributors | 10 | 50 | 100 |
-| Corporate sponsors | 0 | 1-2 | 3-5 |
-
-### 5. Positioning & Marketing
-
-**Core Message:**
+## Core Messaging
 
 **Primary:** "TypeScript with Native Performance"
 
 **Supporting:**
 - "10x Faster Lambda Cold Starts"
-- "Compile-Time Macros for Zero-Cost Abstractions"
 - "90% of C Performance, 100% TypeScript Syntax"
+- "Compile-Time Macros for Zero-Cost Abstractions"
 
 **Target Personas:**
 
-**Persona 1: The Serverless Developer**
-- 3-5 years TS/JS experience
-- Building Lambda/Edge functions
-- Frustrated with cold starts
-- Cost-conscious
-- **Value prop:** <50ms cold starts, lower costs
-
-**Persona 2: The CLI Builder**
-- Full-stack developer
-- Building internal tools
-- Needs portable binaries
-- TypeScript background
-- **Value prop:** Single binary, fast startup
-
-**Persona 3: The Systems Programmer (TS Background)**
-- 5+ years experience
-- Building performance-critical services
-- TS expert, Rust beginner
-- Wants native performance
-- **Value prop:** 90% of C, familiar syntax
+| Persona | Profile | Pain | Solution |
+|---------|---------|------|----------|
+| **Serverless Dev** | 3-5 years TS/JS, building Lambda/Edge, cost-conscious | 200ms+ cold starts, high costs | <50ms cold starts, lower costs |
+| **CLI Builder** | Full-stack dev, internal tools, TS background | Node.js slow startup, npm distribution issues | Single binary, fast startup |
+| **Systems Programmer (TS)** | 5+ years, perf-critical, TS expert, Rust beginner | Rust learning curve, C++ complexity | 90% of C, familiar syntax |
 
 **Differentiation:**
 
-**vs Node.js/Deno/Bun:**
-- Not "restrictive TypeScript"
-- But "TypeScript with superpowers"
-- Macros compensate for restrictions
-- 10x performance improvement
+| vs | Advantage | Trade-off |
+|----|-----------|-----------|
+| **Node.js/Deno/Bun** | 10x perf improvement, "TS with superpowers" (macros) | No npm compat (initially) |
+| **Go** | Easier for TS devs, compile-time metaprogramming, better abstractions | Go has larger ecosystem, mature tooling |
+| **Rust** | Gentler learning curve, no borrow checker, faster compilation | Rust has stronger memory safety, larger ecosystem |
 
-**vs Go:**
-- Easier for TS developers
-- Compile-time metaprogramming
-- Better abstractions
-- Similar performance
-
-**vs Rust:**
-- Gentler learning curve
-- No borrow checker
-- Faster compilation
-- Team with TS background
+---
 
 ## Risk Assessment & Mitigation
 
@@ -292,9 +107,9 @@ These can wait for later phases:
 
 | Risk | Probability | Impact | Mitigation |
 |------|------------|--------|------------|
-| Performance claims fail | Low | Critical | Early benchmarking, Haxe validation |
-| Macro system too complex | Medium | High | Start simple, iterate, great docs |
-| Compilation too slow | Medium | Medium | Incremental compilation, caching |
+| Performance claims fail | Low | Critical | Early benchmarking, Haxe validation, conservative targets |
+| Macro system too complex | Medium | High | Start simple, iterate based on feedback, excellent docs |
+| Compilation too slow | Medium | Medium | Incremental compilation, caching, performance monitoring |
 | Memory safety issues | Low | High | Thorough testing, fuzzing |
 | LSP performance poor | Medium | High | Incremental parsing, caching |
 
@@ -302,83 +117,53 @@ These can wait for later phases:
 
 | Risk | Probability | Impact | Mitigation |
 |------|------------|--------|------------|
-| Competing languages improve | High | Medium | Focus on unique value (macros) |
-| Ecosystem doesn't form | Medium | High | Core team builds critical libs |
-| Developer adoption slow | Medium | High | Excellent DX, migration path |
-| Corporate resistance | High | Medium | Pilot programs, case studies |
-| "Yet another language" | High | Medium | Clear differentiation, TS syntax |
+| Competing languages improve | High | Medium | Focus unique value (TS syntax + macros), niche first |
+| Ecosystem doesn't form | Medium | High | Core team builds critical libs, corporate partnerships |
+| Developer adoption slow | Medium | High | Excellent DX, clear migration path, killer demos |
+| Corporate resistance | High | Medium | Pilot programs, case studies, training/cert |
+| "Yet another language" | High | Medium | Emphasize TS compatibility, clear differentiation |
 
 ### Resource Risks
 
 | Risk | Probability | Impact | Mitigation |
 |------|------------|--------|------------|
-| Funding shortage | Medium | Critical | Multiple sources, sustainable pace |
-| Team burnout | Medium | High | Realistic timeline, healthy culture |
-| Key contributor loss | Medium | High | Knowledge sharing, documentation |
+| Funding shortage | Medium | Critical | Multiple revenue streams, sustainable pace, corporate backing |
+| Team burnout | Medium | High | Realistic timeline, no death marches, healthy culture |
+| Key contributor loss | Medium | High | Knowledge sharing, good documentation, multiple maintainers |
 | Scope creep | High | Medium | Clear non-goals, disciplined roadmap |
+
+---
 
 ## Decision Framework
 
 **When evaluating features/changes, ask:**
 
-1. **Does it advance the Four Pillars?**
-   - Developer Experience
-   - Compile-Time Macros
-   - Performance
-   - Market Adoption
+1. **Does it advance the Four Pillars?** Developer Experience, Compile-Time Macros, Performance, Market Adoption
+2. **Is it proven elsewhere?** Prefer proven approaches, validate novel ideas before implementing
+3. **Does it improve or hurt DX?** DX is top priority. Performance without good DX = failure.
+4. **Can we deliver it with quality?** Better to do less, but well. Half-finished features hurt adoption.
+5. **Does it serve target markets?** Lambda/Edge (Year 1), CLI tools (Year 2), Systems programming (Year 3). If not, defer or reject.
 
-2. **Is it proven elsewhere?**
-   - Prefer proven approaches
-   - Novel ideas = higher risk
-   - Validate before implementing
-
-3. **Does it improve or hurt DX?**
-   - DX is top priority
-   - Performance without good DX = failure
-   - Sometimes sacrifice performance for DX
-
-4. **Can we deliver it with quality?**
-   - Better to do less, but well
-   - Half-finished features hurt adoption
-   - Quality > quantity
-
-5. **Does it serve target markets?**
-   - Lambda/Edge (Year 1)
-   - CLI tools (Year 2)
-   - Systems programming (Year 3)
-   - If not, defer or reject
+---
 
 ## Resource Allocation
 
-### Year 1 (Foundation)
+| Year | Compiler | Runtime | Tooling | Ecosystem | Docs/Community |
+|------|----------|---------|---------|-----------|----------------|
+| **1: Foundation** | 70% | 15% | 10% | 0% | 5% |
+| **2: Growth** | 40% | 0% | 20% | 30% | 10% |
+| **3: Scale** | 30% | 0% | 20% | 30% | 20% |
 
-- 70% Compiler core (parser, type checker, codegen)
-- 15% Runtime (GC, allocator)
-- 10% Tooling (basic LSP, build system)
-- 5% Documentation
-
-### Year 2 (Growth)
-
-- 40% Compiler features (macros, optimization)
-- 20% Tooling (LSP, debugging, IDE)
-- 30% Ecosystem (libraries, integrations)
-- 10% Documentation & community
-
-### Year 3 (Scale)
-
-- 30% Compiler maturity (self-hosting, optimization)
-- 20% Tooling (advanced features)
-- 30% Ecosystem (major libraries)
-- 20% Documentation, training, community
+---
 
 ## Go/No-Go Criteria
 
-**End of Year 1 Checkpoints:**
+### End of Year 1 Checkpoints
 
 **Must Have:**
 - [ ] Compiler compiles 50%+ of strict TS
 - [ ] Performance: 80%+ of C on benchmarks
-- [ ] Lambda cold start < 100ms
+- [ ] Lambda cold start <100ms
 - [ ] 3+ production pilot projects
 - [ ] 100+ GitHub stars
 - [ ] Basic documentation complete
@@ -389,18 +174,14 @@ These can wait for later phases:
 - [ ] Basic LSP working
 - [ ] Clear path to Year 2 funding
 
-**If Not Met:**
-- Reassess technical approach
-- Consider pivoting focus
-- Evaluate market fit
-- Decision: Continue, pivot, or stop
+**If Not Met:** Reassess technical approach, consider pivoting, evaluate market fit. Decision: Continue, pivot, or stop.
 
-**End of Year 2 Checkpoints:**
+### End of Year 2 Checkpoints
 
 **Must Have:**
 - [ ] Compiler compiles 70%+ of strict TS
 - [ ] Performance: 85%+ of C
-- [ ] LSP < 200ms response time
+- [ ] LSP <200ms response time
 - [ ] 50+ production deployments
 - [ ] 10k+ active developers
 - [ ] 50+ ecosystem packages
@@ -411,22 +192,15 @@ These can wait for later phases:
 - [ ] Sustainable community
 - [ ] Conference presence established
 
-**If Not Met:**
-- Evaluate market adoption barriers
-- Consider strategy changes
-- Assess sustainability
-- Decision: Scale, sustain, or sunset
+**If Not Met:** Evaluate market adoption barriers, consider strategy changes, assess sustainability. Decision: Scale, sustain, or sunset.
 
 ---
 
-**Remember:** Success requires all five factors:
-1. Team & Resources ✓
-2. Technical Validation ✓
-3. Market Timing ✓
-4. Community & Ecosystem ✓
-5. Positioning & Marketing ✓
+**Success requires all five factors:**
+1. Team & Resources
+2. Technical Validation
+3. Market Timing
+4. Community & Ecosystem
+5. Positioning & Marketing
 
-**See Also:**
-- [Roadmap](./roadmap.md) - Development timeline
-- [Market Strategy](./market-strategy.md) - Go-to-market plan
-- [Philosophy](./philosophy.md) - Design principles
+**See:** `roadmap.md` (development timeline), `positioning.md` (go-to-market), `philosophy.md` (design principles)

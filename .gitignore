@@ -1,0 +1,31 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Compiled binaries
+msc
+metascript
+*.exe
+*.out
+*.app
+
+# Test outputs
+*.test
+
+# Temporary files
+*.tmp
+*.log
+
+# Generated code (from tests)
+/examples/output/

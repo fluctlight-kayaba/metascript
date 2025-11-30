@@ -1,46 +1,62 @@
 # Proven Reference Models
 
-Metascript learns from languages that solved similar problems. This document details what we adopt from each reference model and why.
+Metascript synthesizes proven approaches from production languages. Each reference solves specific problems we face.
 
-## Haxe: Performance Architecture
+---
 
-**What They Did Well:**
-- Multi-backend compilation (C++, JS, JVM) with 85-95% of C performance
-- Generational GC optimized for native targets
-- Proved high-level syntax can compile to efficient native code
-- Struct-based object model over hash-table properties
+## Reference Implementation Matrix
 
-**Performance Evidence:**
+| Feature | Haxe | Nim | Elixir | Bun | Hermes | Metascript |
+|---------|------|-----|--------|-----|--------|------------|
+| **Syntax** | Custom | Pascal-like | Ruby-like | TS subset | JS | **TS superset** |
+| **Macros** | Limited | Powerful | Powerful | None | None | **Powerful** |
+| **Backends** | C++, JS, JVM+ | C, C++, JS | Erlang | JS only | JS bytecode | **C, JS, Erlang** |
+| **Compilation** | AOT | AOT | AOT | JIT+AOT | AOT bytecode | **AOT** |
+| **Performance (C)** | 85-95% | 90-95% | N/A | N/A | N/A | **90%+ target** |
+| **Mobile** | Partial | No | No | No | Optimized | **Yes (Hermes)** |
+| **Fault Tolerance** | No | No | Yes (OTP) | No | No | **Yes (Erlang)** |
+| **Tooling** | Basic | Good | Excellent | Excellent | Good | **Excellent** |
+
+---
+
+## Haxe: Multi-Backend Pioneer
+
+**What They Proved:**
+- Multi-backend compilation works in production (since 2005)
+- Unified IR → C++, JS, JVM, Python, Lua, PHP
+- 85-95% of C performance on native backends
+
+**Benchmarks:**
 ```
-Haxe/C++ Benchmarks (vs C):
-- nbody: 89% of C performance
-- fannkuch: 92% of C performance
-- mandelbrot: 87% of C performance
-- spectral-norm: 91% of C performance
+Haxe/C++ vs C:
+nbody:        89%
+fannkuch:     92%
+mandelbrot:   87%
+spectral-norm: 91%
 ```
 
 **What We Adopt:**
-- **Performance target**: 85-95% of C on compute workloads
-- **GC strategy**: Generational, optimized for allocation patterns
-- **Multi-stage compilation**: High-level → IR → Native
-- **Object model**: Structs with fixed layout, no dynamic properties
+- Multi-backend architecture (unified IR → multiple targets)
+- Performance target: 90%+ of C on compute workloads
+- Generational GC optimized for allocation patterns
+- Struct-based object model (fixed layout, no hash lookups)
 
-**Key Insight:**
-Haxe validated that TypeScript-like syntax can achieve near-C performance when compiled correctly. This isn't theoretical—it's proven in production.
+**Key Validation:** 20 years of production use proves multi-backend compilation from single high-level language works.
+
+**Reference:** `~/projects/haxe`
+
+---
 
 ## Nim: Compile-Time Macros
 
-**What They Did Well:**
-- Powerful hygienic macro system with AST manipulation
-- Compile-time code execution (macros are Turing-complete)
-- C/C++ FFI with minimal friction
+**What They Proved:**
+- Compile-time macros + C backend = 90%+ C performance
+- Hygienic AST manipulation
 - Zero-cost abstractions via compile-time expansion
 
-**Macro Examples:**
+**Macro Example:**
 ```nim
-# Nim macro example
 macro derive(T: typedesc): untyped =
-  # Generate code at compile-time
   result = newStmtList()
   for field in T.fields:
     result.add genGetter(field)
@@ -48,26 +64,26 @@ macro derive(T: typedesc): untyped =
 ```
 
 **What We Adopt:**
-- **Macro philosophy**: Transparent bridge from high-level to low-level
-- **AST-based metaprogramming**: Not just text substitution
-- **`comptime` execution model**: Explicit compile-time boundary
-- **FFI-first approach**: Ecosystem integration via C libraries
-- **Hygienic macros**: No variable capture issues
+- AST-based metaprogramming (not text substitution)
+- `@comptime` execution model (explicit compile-time boundary)
+- FFI-first approach (ecosystem integration via C)
+- Hygienic macros (no variable capture)
 
-**Key Insight:**
-Compile-time macros make restrictions feel like superpowers. Instead of "we removed dynamic features," it's "we added compile-time capabilities."
+**Key Insight:** Compile-time macros make restrictions feel like superpowers.
 
-## TypeScript: Syntax & Tooling
+**Reference:** `~/projects/nim`
 
-**What They Did Well:**
-- Gradual typing that feels natural to JS developers
+---
+
+## TypeScript: Syntax & Ecosystem
+
+**What They Proved:**
+- Familiar syntax drives massive adoption (80%+ of npm)
 - World-class LSP and IDE integration
-- Structural typing for flexibility
-- Massive ecosystem adoption via minimal friction
+- Gradual typing for minimal friction
 
-**Adoption Strategy:**
+**Adoption Pattern:**
 ```
-TypeScript Adoption Pattern:
 1. Start with JavaScript (zero changes)
 2. Add type annotations incrementally
 3. Enable strict mode progressively
@@ -77,55 +93,154 @@ Result: 80%+ of new npm packages use TypeScript
 ```
 
 **What We Adopt:**
-- **Syntax compatibility**: Minimize learning curve
-- **LSP-first tooling strategy**: <200ms response time target
-- **Clear error messages**: Tied to source code, not generated code
-- **Progressive enhancement**: Start simple, add features incrementally
+- TypeScript-compatible syntax (minimize learning curve)
+- LSP-first tooling (<200ms response target)
+- Clear error messages tied to source code
+- Progressive enhancement philosophy
 
-**Key Insight:**
-Syntax familiarity is the #1 adoption factor. TypeScript succeeded because developers already knew JavaScript—we succeed if developers already know TypeScript.
+**Key Insight:** Syntax familiarity is #1 adoption factor.
+
+---
+
+## Bun: Production TS→JS in Zig
+
+**What They Proved:**
+- Zig is excellent for production TypeScript tooling
+- TS→JS transpilation: 10-20x faster than tsc, 3x faster than esbuild
+- Millions of users validate Zig→JavaScript path
+
+**Architecture:**
+```
+TypeScript → Parser (Zig) → AST → Transpiler → JavaScript + Source Maps
+```
+
+**What We Adopt:**
+- Implementation in Zig (proven for TS→JS)
+- Fast compilation (critical for DX)
+- npm compatibility (standard JavaScript output)
+- Source map generation (debugging support)
+
+**Metascript's Advantage:**
+```typescript
+// Bun: Fast TS→JS transpiler (no macros)
+// Metascript: TS syntax + compile-time macros → optimized JavaScript
+
+// Metascript with macros
+@derive(Eq, Hash, Serialize)
+class User { name: string; age: number; }
+
+// Compiles to clean JavaScript (no macro runtime!)
+class User {
+    constructor(name, age) { this.name = name; this.age = age; }
+    equals(other) { return this.name === other.name && this.age === other.age; }
+    hash() { return hashCombine(hashString(this.name), hashNumber(this.age)); }
+    toJSON() { return { name: this.name, age: this.age }; }
+}
+```
+
+**Key Insight:** Macros are **additive** to JavaScript - compile-time optimization, zero runtime cost.
+
+**Reference:** `~/projects/bun`, `~/projects/typescript-language-server`
+
+---
+
+## Hermes: AOT JavaScript for Mobile
+
+**What They Proved:**
+- AOT bytecode beats JIT for mobile startup (powers Facebook, Instagram, Oculus)
+- 50-70% faster startup, ~50% less memory vs V8/JavaScriptCore
+- Billions of users validate AOT JavaScript approach
+
+**Performance:**
+```
+Startup Time:     50-70% faster than JSC/V8
+Memory Usage:     ~50% less
+TTI Improvement:  20-30% on React Native
+```
+
+**Architecture:**
+```
+JavaScript → Parser (C++) → AST → Bytecode Compiler → Hermes Bytecode (no JIT)
+```
+
+**What We Adopt:**
+- AOT compilation philosophy (aligns with compile-time macros)
+- Startup optimization techniques
+- Potential Hermes bytecode target for mobile
+
+**Metascript Mobile Stack:**
+```
+Metascript Source (with macros)
+    ↓ [Compile-time macro expansion]
+Optimized JavaScript (no macro runtime)
+    ↓ [Hermes AOT compiler]
+Hermes Bytecode (fast startup, low memory)
+```
+
+**Key Insight:** AOT compilation + compile-time macros = optimal mobile performance. All work happens **before runtime**.
+
+**Reference:** `~/projects/hermes`
+
+---
+
+## Elixir & Gleam: Erlang Backend
+
+**What They Proved:**
+- Modern DX + metaprogramming + Erlang/OTP = production fault tolerance
+- Type-safe compilation to BEAM works (Gleam)
+- Powers Discord, WhatsApp, Pinterest (99.999% uptime)
+
+**BEAM Advantages:**
+- Fault tolerance (process isolation, let-it-crash)
+- Hot code reloading (zero-downtime updates)
+- Distributed by default (clustering, messaging)
+- 30+ years telecom reliability (Ericsson)
+
+**Code Generation:**
+```typescript
+// Metascript class
+class Counter extends GenServer {
+    count: number = 0;
+    increment(): void { this.count += 1; }
+}
+
+// Compiles to Erlang
+-module(counter).
+-behaviour(gen_server).
+-export([init/1, handle_cast/2]).
+
+init([]) -> {ok, #{count => 0}}.
+handle_cast(increment, #{count := Count} = State) ->
+    {noreply, State#{count => Count + 1}}.
+```
+
+**What We Adopt:**
+- OTP patterns (GenServer, Supervisor, Application)
+- Process model (classes → GenServer processes)
+- Hot reloading (zero-downtime updates)
+- Distributed messaging primitives
+
+**Reference:** `~/projects/elixir`, `~/projects/gleam`
+
+---
 
 ## Deno: Modern Tooling
 
-**What They Did Well:**
-- Built-in tooling (formatter, linter, test runner)
-- First-class TypeScript support without configuration
-- Modern module system (ES modules, URL imports)
-- Security-first defaults
-
-**Tooling Integration:**
-```
-Deno Developer Experience:
-- No package.json required
-- No tsconfig.json required
-- No webpack/babel/etc required
-- Everything works out of the box
-
-Result: 30-minute onboarding time
-```
+**What They Proved:**
+- Zero-config tooling improves DX dramatically
+- Built-in formatter, linter, test runner
+- 30-minute onboarding time
 
 **What We Adopt:**
-- **Zero-config tooling**: Works immediately after install
-- **Integrated development workflow**: Compiler + LSP + formatter + linter
-- **Standard library design**: Comprehensive, well-documented
-- **Developer-friendly defaults**: Secure, fast, simple
+- Integrated development workflow (compiler + LSP + formatter + linter)
+- Zero-config defaults (works immediately after install)
+- Developer-friendly defaults
 
-**Key Insight:**
-Modern developers expect integrated tooling. Separate compiler, linter, formatter, test runner = poor DX.
+**Key Insight:** Modern developers expect integrated tooling. Separate tools = poor DX.
+
+---
 
 ## Zig: Systems Language Design
-
-**What They Did Well:**
-- Comptime execution (compile-time code evaluation)
-- Cross-compilation built-in
-- No hidden control flow
-- Explicit over implicit philosophy
-
-**What We Adopt:**
-- **Build system integration**: Zig's build system for compilation
-- **Cross-compilation**: Target multiple platforms easily
-- **Explicit design**: No hidden allocations, clear performance
-- **C interop**: Direct C library integration
 
 **Why Zig for Implementation:**
 - Fast compilation times
@@ -133,145 +248,63 @@ Modern developers expect integrated tooling. Separate compiler, linter, formatte
 - C interop for LLVM integration
 - Self-hosting path (write compiler in Metascript later)
 
-## Go: Simplicity & Deployment
+**What We Adopt:**
+- Build system integration
+- Cross-compilation built-in
+- Explicit design (no hidden allocations)
+- Direct C library integration
 
-**What They Did Well:**
-- Simple language (easy to learn, easy to maintain)
-- Fast compilation
-- Single-binary distribution
-- Strong standard library
-
-**What We Consider:**
-- **Simplicity**: Don't over-complicate the language
-- **Fast iteration**: Compilation speed matters for DX
-- **Deployment**: Single binary with no dependencies
-- **Stdlib quality**: Better to have fewer, well-designed features
-
-**What We Don't Adopt:**
-- Lack of generics (we need them for performance)
-- Weak metaprogramming (macros are core to Metascript)
-- Structural typing only (we use nominal for classes)
-
-## Rust: Performance & Safety
-
-**What They Did Well:**
-- Zero-cost abstractions
-- Memory safety without GC
-- Powerful trait system
-- Excellent documentation
-
-**What We Consider:**
-- **Zero-cost abstractions**: Via macros and monomorphization
-- **Type system**: Strong, expressive, catches errors
-- **Documentation quality**: Follow Rust's doc standards
-
-**What We Don't Adopt:**
-- Borrow checker (too complex for our target audience)
-- Ownership model (GC is simpler for most use cases)
-- Syntax (TS syntax is our requirement)
-
-**Why Not Just Use Rust:**
-- Learning curve too steep for TS developers
-- Borrow checker friction slows development
-- Syntax unfamiliar to web developers
-- We target different audience (TS → native)
+---
 
 ## What We Learned From Failures
 
-### CoffeeScript: Don't Fight the Ecosystem
-**What went wrong:** Custom syntax that didn't age well
-**Lesson:** Use existing syntax (TypeScript), don't invent new
+| Language | What Went Wrong | Lesson |
+|----------|----------------|---------|
+| CoffeeScript | Custom syntax didn't age well | Use TypeScript syntax, don't invent new |
+| Dart | Google-only → limited adoption | Open governance, community-driven |
+| Scala | Too many features, complex types | Keep simple, focus on core use cases |
+| Flow | Lost to TypeScript | Don't fight TypeScript—embrace it |
 
-### Dart: Don't Depend on Single Company
-**What went wrong:** Google-only project → limited adoption
-**Lesson:** Open governance, community-driven
-
-### Scala: Don't Over-Complicate
-**What went wrong:** Too many features, complex type system
-**Lesson:** Keep language simple, focus on core use cases
-
-### Flow: Don't Compete With Better Tool
-**What went wrong:** Facebook's TypeScript alternative lost
-**Lesson:** Don't fight TypeScript—embrace it
+---
 
 ## Synthesis: The Metascript Approach
 
 **Combine the Best:**
-- Haxe's proven performance model
-- Nim's compile-time macro system
-- TypeScript's syntax and tooling
-- Deno's integrated developer experience
-- Zig's explicit systems programming
+- **Haxe:** Multi-backend compilation (unified IR → C/JS/Erlang)
+- **Nim:** Compile-time macros (powerful AST manipulation)
+- **TypeScript:** Syntax and tooling (millions know this)
+- **Bun:** Production TS→JS in Zig (proven approach)
+- **Hermes:** AOT JavaScript bytecode (mobile optimization)
+- **Elixir/Gleam:** Erlang backend + metaprogramming (OTP)
+- **Deno:** Integrated tooling (zero-config)
+- **Zig:** Systems programming (safe, fast, C interop)
+
+**The Multi-Backend Strategy:**
+- **C Backend:** Haxe (perf) + Nim (codegen) + Bun (Zig impl)
+- **JavaScript Backend:** Bun (TS→JS) + Hermes (AOT bytecode) + TypeScript (ecosystem)
+- **Erlang Backend:** Elixir (macros + OTP) + Gleam (type-safe BEAM)
 
 **Avoid the Pitfalls:**
-- Novel syntax (use TypeScript)
-- Over-complexity (keep simple)
-- Poor tooling (LSP-first)
-- Unrealistic performance claims (Haxe validates)
-- Single-company control (community-driven)
-
-## Performance Validation Strategy
-
-**Benchmark Suite:**
-```
-Planned Benchmarks (vs C, Rust, Go, Node.js):
-- nbody (compute-bound)
-- fannkuch-redux (integer computation)
-- spectral-norm (floating-point)
-- mandelbrot (SIMD potential)
-- binary-trees (allocation-heavy)
-- reverse-complement (string processing)
-- k-nucleotide (hash tables)
-- regex-redux (regex performance)
-
-Target: Within 90% of C on compute-bound, 80% on mixed
-```
-
-**Real-World Validation:**
-```
-Production Use Cases:
-- Lambda cold start time
-- CLI tool startup time
-- HTTP server throughput
-- Database query performance
-- JSON serialization speed
-
-Target: 5-10x improvement over Node.js
-```
-
-## Reference Implementation Comparison
-
-| Feature | Haxe | Nim | TypeScript | Metascript |
-|---------|------|-----|------------|------------|
-| Syntax | Custom | Pascal-like | JS superset | TS superset |
-| Macros | Limited | Powerful | None | Powerful |
-| Performance | 85-95% C | 90-95% C | N/A | 85-95% C |
-| GC | Yes | Optional | N/A | Yes + ARC |
-| FFI | C++ | C/C++ | N/A | C |
-| Tooling | Basic | Good | Excellent | Excellent |
-| Community | Small | Medium | Massive | Building |
-
-**Metascript Positioning:**
-- Performance: Match Haxe/Nim
-- Macros: Match Nim
-- Syntax: Use TypeScript
-- Tooling: Match TypeScript
-- Community: Leverage TS ecosystem
-
-## Conclusion
-
-Metascript isn't inventing new computer science. We're synthesizing proven approaches:
-
-1. **Haxe proved** high-level syntax → native performance works
-2. **Nim proved** compile-time macros enable powerful abstractions
-3. **TypeScript proved** familiar syntax drives adoption
-4. **Deno proved** integrated tooling improves DX
-
-By combining these proven models, we reduce risk and validate our approach before writing code.
+- Novel syntax → Use TypeScript
+- Single backend → Three strategic targets
+- Over-complexity → Keep simple
+- Poor tooling → LSP-first
+- Unrealistic perf claims → Validated by Haxe/Nim benchmarks
+- Single-company control → Community-driven
 
 ---
 
-**See Also:**
-- [Philosophy](./philosophy.md) - Design principles
-- [Architecture](./architecture.md) - Technical implementation
-- [Performance Guide](./performance-guide.md) - Optimization techniques
+## Validation Summary
+
+**Multi-Backend:** Haxe (20 years production, C++/JS/JVM)
+**C Performance:** Nim (90%+ of C proven)
+**TS→JS:** Bun (millions of users, Zig implementation)
+**Mobile:** Hermes (billions of users, Facebook/Instagram)
+**Fault Tolerance:** Elixir (Discord, WhatsApp, 99.999% uptime)
+**Tooling:** TypeScript (80%+ npm adoption)
+
+All reference implementations in `~/projects/{haxe,nim,bun,hermes,elixir,gleam}`
+
+---
+
+**See:** `architecture.md` (technical implementation), `performance-guide.md` (optimization)

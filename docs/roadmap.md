@@ -1,86 +1,62 @@
 # Metascript Roadmap
 
-Development roadmap from concept to production-ready language.
-
-## Overview
-
-**Total Timeline:** 2-3 years to production-ready
+**Timeline:** 2-3 years to production-ready
 **Philosophy:** Quality over speed, validation over hype
 
-## Year 1: Prove the Concept
+---
 
-**Focus:** Demonstrate technical feasibility and performance claims
+## Year 1: Prove Multi-Backend Concept
 
-### Q1-Q2: Foundation
+### Weeks 1-4: Foundation & Unified IR
+- [x] TypeScript parser (strict subset)
+- [x] Type checker (strict mode)
+- [x] Unified IR design (backend-agnostic)
+- [x] Core stdlib (primitives, collections)
+- [x] "Hello World" compiles
 
-**Goal:** Basic compiler working end-to-end
+**Success:** IR maps cleanly to C, JavaScript, Erlang
 
-**Deliverables:**
-- [ ] TypeScript parser (subset)
-- [ ] Type checker (strict mode)
-- [ ] Zig code generation
-- [ ] C backend compilation
-- [ ] Core stdlib (primitives, basic collections)
-- [ ] "Hello World" to native binary
-- [ ] Basic test suite
+### Weeks 5-12: Three Backends in Parallel (3-5 person team)
 
-**Success Metrics:**
-- Compile 20% of strict TypeScript examples
-- Hello World binary < 500KB
-- Compilation time < 5s for small programs
+| Backend | Team | Deliverables |
+|---------|------|--------------|
+| **C** | 2 engineers | IR→C, generational GC, stdlib, <500KB binary, 80%+ C perf |
+| **JavaScript** | 1-2 engineers | IR→JS (ES2020+), source maps, npm/ESM/CJS, <10KB bundled |
+| **Erlang** | 1 engineer | IR→Erlang, BEAM bytecode, OTP basics, process model |
 
-### Q3-Q4: Lambda Focus
+**Success:** Same program compiles to all 3 backends, cross-backend tests pass
 
-**Goal:** Optimize for serverless deployment, validate performance
+### Weeks 13-24: Macros + Production Validation
+- [ ] `@comptime` execution (all backends)
+- [ ] `@derive` macros (Eq, Hash, Clone, Debug)
+- [ ] Lambda runtime optimization (C backend)
+- [ ] Performance benchmarks vs Node.js/Bun/Go/Elixir
+- [ ] 3-5 production pilot projects (one per backend)
 
-**Deliverables:**
-- [ ] Lambda runtime optimization
-- [ ] Simple macro system (`@comptime` functions)
-- [ ] Standard macros (`@derive`, `@serialize`)
-- [ ] Performance benchmarks vs Node.js/Bun/Go
-- [ ] Lambda deployment guide
-- [ ] 3-5 production pilot projects
+**Success:** C <50ms cold start, 90%+ C perf; JS output ~hand-written; Erlang OTP working
 
-**Success Metrics:**
-- Compile 50% of strict TypeScript examples
-- Achieve 80%+ of C performance on benchmarks
-- <100ms Lambda cold starts
-- 100+ GitHub stars, 1k+ developers testing
+**Milestones:**
+- **M1 (Week 4):** Unified IR design complete
+- **M2 (Week 8):** All 3 backends compile "Hello World"
+- **M3 (Week 12):** Cross-backend test suite passing
+- **M4 (Week 16):** Basic macros working (all backends)
+- **M5 (Week 24):** First production deployment (each backend)
 
-**Key Milestones:**
-- **M1 (Q1):** Parser + type checker working
-- **M2 (Q2):** Code generation working
-- **M3 (Q3):** Basic macros functional
-- **M4 (Q4):** First production deployment
+---
 
 ## Year 2: Build Ecosystem
 
-**Focus:** Developer experience, tooling, and ecosystem growth
-
 ### Q1-Q2: Tooling & DX
-
-**Goal:** Production-quality developer experience
-
-**Deliverables:**
-- [ ] LSP server with full IDE integration
+- [ ] LSP server (<200ms responsiveness)
 - [ ] VS Code extension
-- [ ] Source maps & debugging support
+- [ ] Source maps & debugging
 - [ ] Package manager integration
-- [ ] Comprehensive documentation
-- [ ] Tutorial series (beginner → advanced)
+- [ ] Comprehensive docs + tutorials
 - [ ] Error message quality pass
 
-**Success Metrics:**
-- LSP responsiveness < 200ms
-- Error messages rated "helpful" by 80%+ users
-- 30-minute onboarding (quickstart tutorial)
-- 1k+ weekly active developers
+**Success:** 30-min onboarding, 1k+ weekly active developers
 
 ### Q3-Q4: Ecosystem Growth
-
-**Goal:** Core libraries and ecosystem foundations
-
-**Deliverables:**
 - [ ] CLI framework
 - [ ] HTTP/web server libraries
 - [ ] Database drivers (Postgres, Redis, SQLite)
@@ -89,90 +65,132 @@ Development roadmap from concept to production-ready language.
 - [ ] 10+ community libraries
 - [ ] Package registry
 
-**Success Metrics:**
-- 70% of strict TS code compiles unchanged
-- 10k+ active developers
-- 50+ production deployments
-- 3-5 corporate pilot programs
+**Success:** 70% of strict TS compiles unchanged, 10k+ developers, 50+ prod deployments, 3-5 corporate pilots
 
-**Key Milestones:**
-- **M5 (Q1):** LSP feature-complete
-- **M6 (Q2):** VS Code extension released
-- **M7 (Q3):** Core ecosystem libraries ready
-- **M8 (Q4):** 10k developer milestone
+**Milestones:**
+- **M6 (Q1):** LSP feature-complete
+- **M7 (Q2):** VS Code extension released
+- **M8 (Q3):** Core ecosystem libraries ready
+- **M9 (Q4):** 10k developer milestone
+
+---
 
 ## Year 3: Mainstream Adoption
 
-**Focus:** Maturity, scale, and corporate adoption
-
 ### Q1-Q2: Maturity
-
-**Goal:** Production-grade language and compiler
-
-**Deliverables:**
 - [ ] Advanced macros (custom syntax, DSLs)
 - [ ] Optimization passes (devirtualization, inlining)
 - [ ] Self-hosting compiler (written in Metascript)
 - [ ] Security audits & hardening
 - [ ] Performance profiling tools
-- [ ] Memory leak detection
 - [ ] 1.0 release
 
-**Success Metrics:**
-- 90%+ of C performance validated
-- Self-hosting compiler working
-- <50ms Lambda cold start consistently
-- Zero critical security issues
+**Success:** 90%+ C perf validated, self-hosting works, <50ms cold start consistent
 
 ### Q3-Q4: Scale
-
-**Goal:** Corporate adoption and sustainable growth
-
-**Deliverables:**
 - [ ] Conference talks & case studies
 - [ ] Corporate support/sponsorship
 - [ ] Training materials & certification
 - [ ] Multi-platform support (mobile, embedded)
 - [ ] Enterprise support packages
-- [ ] Professional services network
 
-**Success Metrics:**
-- 50k-200k developers
-- 500+ production apps
-- Major framework/library ports
-- Sustainable funding model
-- 5+ companies with >10 engineers using Metascript
+**Success:** 50k-200k developers, 500+ prod apps, sustainable funding, 5+ companies (>10 eng)
 
-**Key Milestones:**
-- **M9 (Q1):** Self-hosting complete
-- **M10 (Q2):** 1.0 release
-- **M11 (Q3):** 50k developer milestone
-- **M12 (Q4):** Corporate adoption validated
+**Milestones:**
+- **M10 (Q1):** Self-hosting complete
+- **M11 (Q2):** 1.0 release
+- **M12 (Q3):** 50k developer milestone
+- **M13 (Q4):** Corporate adoption validated
+
+---
+
+## Success Metrics
+
+| Metric | Year 1 | Year 2 | Year 3 |
+|--------|--------|--------|--------|
+| **Developers** | 1k-10k | 10k-50k | 50k-200k |
+| **GitHub Stars** | 100-1k | 1k-10k | 10k-20k |
+| **Discord Members** | 10-100 | 100-1k | 1k-5k |
+| **Production Apps** | 3-10 | 10-50 | 50-500 |
+| **Companies (>10 eng)** | 0-1 | 1-5 | 5-10 |
+| **Lambda invocations/day** | 10k-100k | 100k-10M | 10M-1B |
+
+### Technical Quality Targets
+
+| Metric | Year 1 | Year 2 | Year 3 |
+|--------|--------|--------|--------|
+| **TS Compatibility** | 50% | 70% | 80% |
+| **C Backend:** | | | |
+| C performance | 80% | 85% | 90% |
+| Cold start | <100ms | <75ms | <50ms |
+| Binary size | <1MB | <800KB | <500KB |
+| **JavaScript Backend:** | | | |
+| npm compatibility | 30% | 60% | 80% |
+| Bundle size | 50KB | 30KB | 20KB |
+| **Erlang Backend:** | | | |
+| OTP compatibility | Basic | Full | Production |
+| Process startup | <10ms | <5ms | <2ms |
+| **Shared:** | | | |
+| LSP response | N/A | <200ms | <100ms |
+| Compile time | <10s | <5s | <2s |
+
+---
+
+## Team & Resources
+
+| Year | Engineers | DevRel | Funding |
+|------|-----------|--------|---------|
+| **1** | 3-5 | 0 | $300k-500k |
+| **2** | 5-8 | 1 | $600k-1M |
+| **3** | 8-12 | 2 | $1M-2M |
+
+---
+
+## Library Priorities
+
+### Year 1: Core (Backend-Specific)
+
+**C Backend:** Primitives/collections, file I/O, Lambda runtime, GC tuning, FFI (`@bindC`)
+**JavaScript Backend:** Browser APIs, npm compat layer, bundling, source maps, testing
+**Erlang Backend:** OTP GenServer/Supervisor, process comms, distributed nodes, hot reload
+**Shared:** JSON serialization, testing utilities, core primitives
+
+### Year 2: Ecosystem
+
+**C Backend:** HTTP server, database drivers (Postgres/Redis/SQLite), CLI framework, crypto (OpenSSL FFI)
+**JavaScript Backend:** React/Vue bindings, npm publishing, browser testing, bundler plugins
+**Erlang Backend:** Phoenix-like web framework, distributed DB drivers, clustering, Mnesia
+**Shared:** HTTP client, logging/monitoring, authentication
+
+### Year 3: Expansion
+
+**C Backend:** Advanced async runtime, SIMD optimizations, GPU computing (CUDA/Metal)
+**JavaScript Backend:** SSR, PWAs, WebAssembly interop
+**Erlang Backend:** Distributed consensus (Raft/Paxos), real-time streaming, multi-DC replication
+**Shared:** GraphQL/gRPC, cloud integrations (AWS/GCP/Azure), ML libraries
+
+---
+
+## Risk Mitigation
+
+| Risk | Mitigation |
+|------|-----------|
+| **Perf claims don't hold** | Early benchmarking, Haxe validation, conservative targets |
+| **Macro system too complex** | Start simple, iterate based on feedback, excellent docs |
+| **Compilation too slow** | Incremental compilation, caching, performance monitoring |
+| **Competing languages improve** | Focus unique value (TS syntax + macros), niche first |
+| **Ecosystem doesn't materialize** | Core team builds critical libs, corporate partnerships |
+| **Slow developer adoption** | Excellent DX, clear migration path, killer demos |
+| **Funding dries up** | Multiple revenue streams, sustainable pace, corporate backing |
+| **Team burnout** | Realistic timeline, no death marches, healthy culture |
+
+---
 
 ## Critical Success Factors
 
-### Team & Resources
-
-**Minimum Viable Team:**
-- Year 1: 3-5 full-time engineers
-- Year 2: 5-8 engineers + 1 DevRel/community manager
-- Year 3: 8-12 engineers + 2 DevRel + support team
-
-**Funding Needs:**
-- Year 1: $300k-500k (seed/grants)
-- Year 2: $600k-1M (Series A or corporate)
-- Year 3: $1M-2M (sustainable revenue or funding)
-
-**Alternative Path:**
-- Open-source with sponsored development
-- Part-time contributors (slower timeline)
-- Corporate backing from day one
-
-### Technical Validation
-
 **Must Prove Early (Year 1):**
 - Performance claims via benchmarks
-- Lambda cold start < 50ms
+- Lambda cold start <50ms
 - Real-world case studies
 - Macro system usability
 
@@ -182,163 +200,23 @@ Development roadmap from concept to production-ready language.
 - Debugging experience
 - Build system reliability
 
-### Market Timing
-
-**Advantages:**
-- Lambda/Edge computing growing rapidly
-- TypeScript developers seeking performance
-- Rust fatigue among web developers
-- Compiler tech maturity (LLVM, Zig)
-
-**Risks:**
-- Microsoft Go-based TypeScript compiler (2025)
-- Bun/Deno performance improvements
-- WebAssembly ecosystem maturation
-- Corporate resistance to new languages
+---
 
 ## Non-Goals by Phase
 
-### Year 1 Non-Goals
-- Browser compatibility
-- npm package compatibility
-- Full TypeScript compatibility
-- Windows native support
-- Mobile/embedded targets
+**Year 1:** Browser compatibility, npm package compat, full TS compat, Windows native, mobile/embedded
+**Year 2:** Async runtime (defer Year 3), GUI frameworks, games/graphics, academic type features
+**Year 3:** Everything - focus on core use cases, quality over quantity
 
-### Year 2 Non-Goals
-- Async runtime (defer to Year 3)
-- GUI frameworks
-- Games/graphics
-- Academic type system features
-
-### Year 3 Non-Goals
-- Everything (focus on core use cases)
-- Don't chase every market
-- Quality over quantity
-
-## Community Building Roadmap
-
-### Year 1: Foundation
-- Launch GitHub repository
-- Create Discord server
-- Weekly development updates
-- Responsive issue triage
-- Welcoming contribution guide
-
-**Target:** 100+ Discord members, 1k+ GitHub stars
-
-### Year 2: Growth
-- Monthly contributor calls
-- Developer workshops
-- Conference talks (3-5 per year)
-- Blog post series
-- Video tutorials
-
-**Target:** 1k+ Discord members, 10k+ GitHub stars
-
-### Year 3: Maturity
-- Annual conference (MetascriptConf)
-- Training certification program
-- Corporate outreach program
-- Open governance model
-- Foundation establishment
-
-**Target:** 5k+ Discord members, 20k+ GitHub stars
-
-## Library Priorities by Phase
-
-### Year 1: Core
-1. Primitives and collections
-2. Basic I/O
-3. JSON serialization
-4. Lambda runtime support
-5. Testing utilities
-
-### Year 2: Ecosystem
-1. HTTP server framework
-2. Database drivers (Postgres, Redis)
-3. CLI framework
-4. Logging/monitoring
-5. Authentication/security
-
-### Year 3: Expansion
-1. Async runtime
-2. Web framework
-3. GraphQL/gRPC support
-4. Cloud integrations (AWS, GCP, Azure)
-5. Specialized libraries (ML, crypto, etc.)
-
-## Risk Mitigation
-
-### Technical Risks
-
-**Risk:** Performance claims don't hold up
-**Mitigation:** Early benchmarking, Haxe validation, conservative targets
-
-**Risk:** Macro system too complex
-**Mitigation:** Start simple, iterate based on feedback, excellent documentation
-
-**Risk:** Compilation too slow
-**Mitigation:** Incremental compilation, caching, performance monitoring
-
-### Market Risks
-
-**Risk:** Competing languages improve too fast
-**Mitigation:** Focus on unique value (TS syntax + macros), niche first
-
-**Risk:** Ecosystem doesn't materialize
-**Mitigation:** Core team builds critical libraries, corporate partnerships
-
-**Risk:** Developer adoption too slow
-**Mitigation:** Excellent DX, clear migration path, killer demos
-
-### Resource Risks
-
-**Risk:** Funding dries up
-**Mitigation:** Multiple revenue streams, sustainable pace, corporate backing
-
-**Risk:** Team burnout
-**Mitigation:** Realistic timeline, no death marches, healthy work culture
-
-**Risk:** Key contributors leave
-**Mitigation:** Knowledge sharing, good documentation, multiple maintainers
-
-## Success Metrics Summary
-
-### Developer Adoption
-
-| Metric | Year 1 | Year 2 | Year 3 |
-|--------|--------|--------|--------|
-| Active developers | 1k-10k | 10k-50k | 50k-200k |
-| GitHub stars | 100-1k | 1k-10k | 10k-20k |
-| Discord members | 10-100 | 100-1k | 1k-5k |
-| Weekly downloads | 100-1k | 1k-10k | 10k-50k |
-
-### Production Usage
-
-| Metric | Year 1 | Year 2 | Year 3 |
-|--------|--------|--------|--------|
-| Production apps | 3-10 | 10-50 | 50-500 |
-| Companies (>10 eng) | 0-1 | 1-5 | 5-10 |
-| Lambda invocations/day | 10k-100k | 100k-10M | 10M-1B |
-
-### Technical Quality
-
-| Metric | Year 1 | Year 2 | Year 3 |
-|--------|--------|--------|--------|
-| TS compatibility | 50% | 70% | 80% |
-| C performance | 80% | 85% | 90% |
-| Cold start time | <100ms | <75ms | <50ms |
-| LSP response | N/A | <200ms | <100ms |
+---
 
 ## Beyond Year 3
 
 **Long-term Vision (Year 4-5):**
 - Mainstream alternative for systems programming
 - Standard toolchain for Lambda/Edge
-- Active ecosystem with 500+ packages
+- 500+ ecosystem packages
 - Self-sustaining community
-- Corporate training programs
 - Multiple production success stories
 
 **Sustainability:**
@@ -350,9 +228,6 @@ Development roadmap from concept to production-ready language.
 
 ---
 
-**This roadmap is a living document.** We'll adjust based on learnings, market feedback, and technical discoveries. The core vision remains constant; the path evolves.
+**This roadmap is a living document.** Core vision constant; path evolves based on learnings and market feedback.
 
-**See Also:**
-- [CLAUDE.md](../CLAUDE.md) - Project overview
-- [Market Strategy](./market-strategy.md) - Adoption strategy
-- [Architecture](./architecture.md) - Technical implementation
+**See:** `positioning.md` (adoption strategy), `architecture.md` (technical implementation)

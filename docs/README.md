@@ -81,7 +81,7 @@ Begin with [Quickstart Guide](./quickstart.md) - you'll build your first program
 
 ## 🤝 Community
 
-- **GitHub**: [github.com/metascript/metascript](https://github.com/metascript/metascript)
+- **GitHub**: [github.com/fluctlight-kayaba/metascript](https://github.com/fluctlight-kayaba/metascript)
 - **Discord**: [discord.gg/metascript](https://discord.gg/metascript)
 - **Forum**: [forum.metascript.dev](https://forum.metascript.dev)
 

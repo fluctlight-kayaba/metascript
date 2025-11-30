@@ -101,7 +101,7 @@ git push origin feature/my-feature
 
 ### Building from Source
 ```bash
-git clone https://github.com/metascript/metascript.git
+git clone https://github.com/fluctlight-kayaba/metascript.git
 cd metascript
 zig build
 zig build test
@@ -255,7 +255,7 @@ pub fn parse(self: *Parser) !AST { /* implementation */ }
 ## Getting Help
 
 - **Discord:** [#contributors channel](https://discord.gg/metascript)
-- **GitHub Discussions:** [metascript/discussions](https://github.com/metascript/metascript/discussions)
+- **GitHub Discussions:** [metascript/discussions](https://github.com/fluctlight-kayaba/metascript/discussions)
 - **Office Hours:** Weekly video calls (see Discord)
 
 ---

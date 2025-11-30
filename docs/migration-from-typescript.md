@@ -212,6 +212,6 @@ project/
 **See:** `macro-system.md` (compile-time metaprogramming), `performance-guide.md` (optimization)
 
 **Help:**
-- GitHub Discussions: [metascript/discussions](https://github.com/metascript/metascript/discussions)
+- GitHub Discussions: [metascript/discussions](https://github.com/fluctlight-kayaba/metascript/discussions)
 - Discord: [#migration channel](https://discord.gg/metascript)
 - Examples: [metascript-examples repo](https://github.com/metascript/examples)

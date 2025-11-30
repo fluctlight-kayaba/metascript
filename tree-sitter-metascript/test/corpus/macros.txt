@@ -1,0 +1,74 @@
+==================
+Macro decorator on class
+==================
+
+@derive(Eq, Hash)
+class User {
+    name: string;
+}
+
+---
+
+(program
+  (class_declaration
+    (macro_decorator
+      name: (identifier)
+      (macro_arguments
+        (identifier)
+        (identifier)))
+    name: (identifier)
+    body: (class_body
+      (property_declaration
+        name: (identifier)
+        (type_annotation
+          (type
+            (primitive_type)))))))
+
+==================
+Comptime block
+==================
+
+const config = @comptime {
+    return "production";
+};
+
+---
+
+(program
+  (variable_declaration
+    name: (identifier)
+    (macro_comptime
+      (block
+        (return_statement
+          (string))))))
+
+==================
+Function declaration
+==================
+
+function greet(name: string): void {
+    console.log("Hello");
+}
+
+---
+
+(program
+  (function_declaration
+    name: (identifier)
+    (parameters
+      (parameter
+        name: (identifier)
+        (type_annotation
+          (type
+            (primitive_type)))))
+    (type_annotation
+      (type
+        (primitive_type)))
+    body: (block
+      (expression_statement
+        (call_expression
+          function: (member_expression
+            object: (identifier)
+            property: (identifier))
+          arguments: (arguments
+            (string)))))))

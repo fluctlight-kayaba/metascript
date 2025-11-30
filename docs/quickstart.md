@@ -27,7 +27,7 @@ Universal systems language with TypeScript syntax that compiles to three strateg
 # Prerequisites: Zig 0.15.1+, Git
 
 # Clone and build
-git clone https://github.com/metascript/metascript.git
+git clone https://github.com/fluctlight-kayaba/metascript.git
 cd metascript
 zig build
 export PATH=$PWD/zig-out/bin:$PATH
@@ -255,7 +255,7 @@ A: Metascript prioritizes TS syntax + compile-time macros over Rust's borrow che
 
 **Get Help:**
 - Discord: [discord.gg/metascript](https://discord.gg/metascript)
-- GitHub: [github.com/metascript/metascript/issues](https://github.com/metascript/metascript/issues)
+- GitHub: [github.com/fluctlight-kayaba/metascript/issues](https://github.com/fluctlight-kayaba/metascript/issues)
 - Docs: [docs.metascript.dev](https://docs.metascript.dev)
 
 **Contribute:**

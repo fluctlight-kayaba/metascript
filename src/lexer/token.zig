@@ -1,0 +1,384 @@
+// Token definitions for Metascript
+// Extends TypeScript syntax with macro tokens (@derive, @comptime, etc.)
+
+const std = @import("std");
+const ast = @import("../ast/ast.zig");
+
+/// Token kinds - all TypeScript tokens + macro extensions
+pub const TokenKind = enum {
+    // ===== Literals =====
+    number,           // 42, 3.14, 0x1A
+    string,           // "hello", 'world'
+    template_string,  // `template ${x}`
+    regex,            // /pattern/flags
+
+    // ===== Identifiers =====
+    identifier,       // foo, myVar
+
+    // ===== Keywords (TypeScript) =====
+    keyword_break,
+    keyword_case,
+    keyword_catch,
+    keyword_class,
+    keyword_const,
+    keyword_continue,
+    keyword_debugger,
+    keyword_default,
+    keyword_delete,
+    keyword_do,
+    keyword_else,
+    keyword_enum,
+    keyword_export,
+    keyword_extends,
+    keyword_false,
+    keyword_finally,
+    keyword_for,
+    keyword_function,
+    keyword_if,
+    keyword_import,
+    keyword_in,
+    keyword_instanceof,
+    keyword_interface,
+    keyword_let,
+    keyword_new,
+    keyword_null,
+    keyword_return,
+    keyword_super,
+    keyword_switch,
+    keyword_this,
+    keyword_throw,
+    keyword_true,
+    keyword_try,
+    keyword_typeof,
+    keyword_var,
+    keyword_void,
+    keyword_while,
+    keyword_with,
+
+    // TypeScript-specific keywords
+    keyword_abstract,
+    keyword_as,
+    keyword_async,
+    keyword_await,
+    keyword_constructor,
+    keyword_declare,
+    keyword_from,
+    keyword_get,
+    keyword_implements,
+    keyword_is,
+    keyword_keyof,
+    keyword_namespace,
+    keyword_never,
+    keyword_of,
+    keyword_private,
+    keyword_protected,
+    keyword_public,
+    keyword_readonly,
+    keyword_require,
+    keyword_set,
+    keyword_static,
+    keyword_type,
+    keyword_unknown,
+
+    // ===== Macro Tokens (Metascript extensions) =====
+    at_sign,          // @ (generic)
+    at_derive,        // @derive
+    at_comptime,      // @comptime
+    at_serialize,     // @serialize
+    at_ffi,           // @ffi
+
+    // ===== Operators =====
+    // Arithmetic
+    plus,             // +
+    minus,            // -
+    star,             // *
+    slash,            // /
+    percent,          // %
+    star_star,        // **
+
+    // Assignment
+    equals,           // =
+    plus_equals,      // +=
+    minus_equals,     // -=
+    star_equals,      // *=
+    slash_equals,     // /=
+    percent_equals,   // %=
+
+    // Comparison
+    equals_equals,    // ==
+    equals_equals_equals,  // ===
+    bang_equals,      // !=
+    bang_equals_equals,    // !==
+    less_than,        // <
+    less_equals,      // <=
+    greater_than,     // >
+    greater_equals,   // >=
+
+    // Logical
+    ampersand_ampersand,  // &&
+    pipe_pipe,            // ||
+    bang,                 // !
+
+    // Bitwise
+    ampersand,        // &
+    pipe,             // |
+    caret,            // ^
+    tilde,            // ~
+    less_less,        // <<
+    greater_greater,  // >>
+    greater_greater_greater,  // >>>
+
+    // Increment/Decrement
+    plus_plus,        // ++
+    minus_minus,      // --
+
+    // Other
+    question,         // ?
+    dot,              // .
+    dot_dot_dot,      // ...
+    arrow,            // =>
+
+    // ===== Punctuation =====
+    left_paren,       // (
+    right_paren,      // )
+    left_brace,       // {
+    right_brace,      // }
+    left_bracket,     // [
+    right_bracket,    // ]
+    semicolon,        // ;
+    colon,            // :
+    comma,            // ,
+
+    // ===== Special =====
+    newline,          // \n (significant in some contexts)
+    end_of_file,
+    syntax_error,
+
+    /// Get string representation for debugging
+    pub fn toString(self: TokenKind) []const u8 {
+        return switch (self) {
+            .number => "number",
+            .string => "string",
+            .identifier => "identifier",
+            .keyword_function => "function",
+            .keyword_class => "class",
+            .at_derive => "@derive",
+            .at_comptime => "@comptime",
+            .equals => "=",
+            .semicolon => ";",
+            .end_of_file => "EOF",
+            else => @tagName(self),
+        };
+    }
+};
+
+/// Token with location information
+pub const Token = struct {
+    kind: TokenKind,
+    loc: ast.SourceLocation,
+
+    // Payload for literals/identifiers (points into source text)
+    text: []const u8 = "",
+
+    /// Create a new token
+    pub fn init(kind: TokenKind, loc: ast.SourceLocation, text: []const u8) Token {
+        return .{
+            .kind = kind,
+            .loc = loc,
+            .text = text,
+        };
+    }
+
+    /// Check if token is a keyword
+    pub fn isKeyword(self: Token) bool {
+        return switch (self.kind) {
+            .keyword_break,
+            .keyword_case,
+            .keyword_catch,
+            .keyword_class,
+            .keyword_const,
+            .keyword_continue,
+            .keyword_debugger,
+            .keyword_default,
+            .keyword_delete,
+            .keyword_do,
+            .keyword_else,
+            .keyword_enum,
+            .keyword_export,
+            .keyword_extends,
+            .keyword_false,
+            .keyword_finally,
+            .keyword_for,
+            .keyword_function,
+            .keyword_if,
+            .keyword_import,
+            .keyword_in,
+            .keyword_instanceof,
+            .keyword_interface,
+            .keyword_let,
+            .keyword_new,
+            .keyword_null,
+            .keyword_return,
+            .keyword_super,
+            .keyword_switch,
+            .keyword_this,
+            .keyword_throw,
+            .keyword_true,
+            .keyword_try,
+            .keyword_typeof,
+            .keyword_var,
+            .keyword_void,
+            .keyword_while,
+            .keyword_with,
+            .keyword_abstract,
+            .keyword_as,
+            .keyword_async,
+            .keyword_await,
+            .keyword_constructor,
+            .keyword_declare,
+            .keyword_from,
+            .keyword_get,
+            .keyword_implements,
+            .keyword_is,
+            .keyword_keyof,
+            .keyword_namespace,
+            .keyword_never,
+            .keyword_of,
+            .keyword_private,
+            .keyword_protected,
+            .keyword_public,
+            .keyword_readonly,
+            .keyword_require,
+            .keyword_set,
+            .keyword_static,
+            .keyword_type,
+            .keyword_unknown,
+            => true,
+            else => false,
+        };
+    }
+
+    /// Check if token is a macro token
+    pub fn isMacro(self: Token) bool {
+        return switch (self.kind) {
+            .at_sign,
+            .at_derive,
+            .at_comptime,
+            .at_serialize,
+            .at_ffi,
+            => true,
+            else => false,
+        };
+    }
+};
+
+/// Keyword lookup table
+pub const KeywordMap = std.StringHashMap(TokenKind);
+
+/// Initialize keyword map
+pub fn initKeywordMap(allocator: std.mem.Allocator) !KeywordMap {
+    var map = KeywordMap.init(allocator);
+
+    // JavaScript/TypeScript keywords
+    try map.put("break", .keyword_break);
+    try map.put("case", .keyword_case);
+    try map.put("catch", .keyword_catch);
+    try map.put("class", .keyword_class);
+    try map.put("const", .keyword_const);
+    try map.put("continue", .keyword_continue);
+    try map.put("debugger", .keyword_debugger);
+    try map.put("default", .keyword_default);
+    try map.put("delete", .keyword_delete);
+    try map.put("do", .keyword_do);
+    try map.put("else", .keyword_else);
+    try map.put("enum", .keyword_enum);
+    try map.put("export", .keyword_export);
+    try map.put("extends", .keyword_extends);
+    try map.put("false", .keyword_false);
+    try map.put("finally", .keyword_finally);
+    try map.put("for", .keyword_for);
+    try map.put("function", .keyword_function);
+    try map.put("if", .keyword_if);
+    try map.put("import", .keyword_import);
+    try map.put("in", .keyword_in);
+    try map.put("instanceof", .keyword_instanceof);
+    try map.put("interface", .keyword_interface);
+    try map.put("let", .keyword_let);
+    try map.put("new", .keyword_new);
+    try map.put("null", .keyword_null);
+    try map.put("return", .keyword_return);
+    try map.put("super", .keyword_super);
+    try map.put("switch", .keyword_switch);
+    try map.put("this", .keyword_this);
+    try map.put("throw", .keyword_throw);
+    try map.put("true", .keyword_true);
+    try map.put("try", .keyword_try);
+    try map.put("typeof", .keyword_typeof);
+    try map.put("var", .keyword_var);
+    try map.put("void", .keyword_void);
+    try map.put("while", .keyword_while);
+    try map.put("with", .keyword_with);
+
+    // TypeScript-specific
+    try map.put("abstract", .keyword_abstract);
+    try map.put("as", .keyword_as);
+    try map.put("async", .keyword_async);
+    try map.put("await", .keyword_await);
+    try map.put("constructor", .keyword_constructor);
+    try map.put("declare", .keyword_declare);
+    try map.put("from", .keyword_from);
+    try map.put("get", .keyword_get);
+    try map.put("implements", .keyword_implements);
+    try map.put("is", .keyword_is);
+    try map.put("keyof", .keyword_keyof);
+    try map.put("namespace", .keyword_namespace);
+    try map.put("never", .keyword_never);
+    try map.put("of", .keyword_of);
+    try map.put("private", .keyword_private);
+    try map.put("protected", .keyword_protected);
+    try map.put("public", .keyword_public);
+    try map.put("readonly", .keyword_readonly);
+    try map.put("require", .keyword_require);
+    try map.put("set", .keyword_set);
+    try map.put("static", .keyword_static);
+    try map.put("type", .keyword_type);
+    try map.put("unknown", .keyword_unknown);
+
+    return map;
+}
+
+test "token kind toString" {
+    try std.testing.expectEqualStrings("number", TokenKind.number.toString());
+    try std.testing.expectEqualStrings("@derive", TokenKind.at_derive.toString());
+    try std.testing.expectEqualStrings("EOF", TokenKind.end_of_file.toString());
+}
+
+test "token keyword detection" {
+    const loc = ast.SourceLocation.dummy();
+
+    const keyword_token = Token.init(.keyword_class, loc, "class");
+    try std.testing.expect(keyword_token.isKeyword());
+
+    const identifier_token = Token.init(.identifier, loc, "myVar");
+    try std.testing.expect(!identifier_token.isKeyword());
+}
+
+test "token macro detection" {
+    const loc = ast.SourceLocation.dummy();
+
+    const macro_token = Token.init(.at_derive, loc, "@derive");
+    try std.testing.expect(macro_token.isMacro());
+
+    const normal_token = Token.init(.identifier, loc, "foo");
+    try std.testing.expect(!normal_token.isMacro());
+}
+
+test "keyword map lookup" {
+    var map = try initKeywordMap(std.testing.allocator);
+    defer map.deinit();
+
+    try std.testing.expect(map.get("class").? == .keyword_class);
+    try std.testing.expect(map.get("function").? == .keyword_function);
+    try std.testing.expect(map.get("async").? == .keyword_async);
+    try std.testing.expect(map.get("notakeyword") == null);
+}

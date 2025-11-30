@@ -8,6 +8,225 @@ A universal systems language with TypeScript syntax, compile-time metaprogrammin
 
 Metascript is a universal systems language: write once in TypeScript syntax, deploy to three strategic runtimes. Get native performance (C), browser/npm reach (JavaScript), or fault-tolerant distribution (Erlang) from the same codebase.
 
+---
+
+## 🚨 CRITICAL: Development Methodology (READ THIS FIRST!)
+
+### Philosophy: See It, Feel It, Fix It
+
+**Rule 1: Make It Visible IMMEDIATELY**
+- LSP, syntax highlighting, and compiler output must be **touchable/visible/feel-able** as soon as possible
+- Even if broken, even if error-prone → WE MUST SEE IT
+- Psychology: Feeling the syntax, seeing the power, experiencing the workflow drives design decisions
+- Adjust and optimize AFTER we see it working (even partially)
+
+**Rule 2: Aggressive TDD with Real-Time Feedback**
+- Extensive test-driven development cycle
+- Claude (LLM) must have ALL tools needed to debug/inspect/verify
+- Create tools if they don't exist (test harnesses, visualizers, debuggers)
+- Real state inspection, real error messages, real output validation
+
+### Development Cycle
+
+```
+1. Write minimal implementation (even if incomplete)
+   ↓
+2. Make it VISIBLE immediately
+   - Can we see syntax highlighting? → Yes, even if buggy
+   - Can we see LSP hover? → Yes, even if limited
+   - Can we see compiler output? → Yes, even if wrong
+   ↓
+3. Create tests that verify WHAT WE SEE
+   - TDD: Write test for expected behavior
+   - Run: See actual behavior (might fail)
+   - Fix: Iterate until test passes
+   ↓
+4. Repeat: Small iterations, always visible, always tested
+```
+
+**Anti-Pattern to AVOID:**
+- ❌ Building large features in isolation without feedback
+- ❌ "It'll work once we finish" (No! Show broken version NOW)
+- ❌ Waiting for "complete" implementation before testing
+- ❌ Theoretical correctness without real-world validation
+
+**What This Means in Practice:**
+
+**For Compiler:**
+```bash
+# Create even if it outputs garbage initially
+$ ./zig-out/bin/msc compile examples/macro.ms
+[PARSE] ✓ Lexer: 169 tokens
+[PARSE] ✗ Parser: Not implemented yet (but we see it!)
+[MACRO] ⏸ Waiting for parser
+[ERROR] Cannot proceed without AST
+
+# This is GOOD! We see the pipeline, we see what's missing
+```
+
+**For LSP:**
+```typescript
+// VSCode shows hover (even if incomplete)
+@derive(Eq, Hash)
+//      ^ Hover: "Macro: @derive (expansion preview unavailable)"
+
+// This is GOOD! User sees SOMETHING, we iterate from there
+```
+
+**For Syntax Highlighting:**
+```typescript
+// Tree-sitter highlights @derive even if parser is incomplete
+@derive(Eq, Hash)  // ← @derive is colored differently
+class User {       // ← class keyword highlighted
+
+// This is GOOD! Syntax is visible, feels real, drives motivation
+```
+
+### TDD Requirements for Claude
+
+**Claude MUST have these tools available:**
+
+1. **Test Runner Integration**
+   ```bash
+   zig build test --summary all  # See all test results
+   zig build test -Dfilter=lexer # Run specific tests
+   ```
+
+2. **Real Output Inspection**
+   ```bash
+   # Not just pass/fail, but actual output
+   zig run test_lexer.zig        # See tokenization
+   zig run test_parser.zig       # See AST dump
+   zig run test_lsp.zig          # See LSP messages
+   ```
+
+3. **Debugging Tools** (create if missing)
+   - AST visualizer (print tree structure)
+   - Token dump (see all tokens with locations)
+   - LSP message logger (see requests/responses)
+   - Macro expansion viewer (before/after comparison)
+
+4. **Incremental Validation**
+   ```bash
+   # Test on real examples EARLY
+   ./msc compile examples/hello.ms    # Simple case
+   ./msc compile examples/macro.ms    # Complex case
+   ./msc compile examples/broken.ms   # Error case
+   ```
+
+### Example: Parser Development
+
+**BAD Approach:**
+```
+Week 1: Design parser architecture (no code)
+Week 2: Implement parser (not tested)
+Week 3: Integrate with AST (discover bugs)
+Week 4: Fix bugs, start testing
+← 4 weeks before seeing anything work!
+```
+
+**GOOD Approach (Metascript Way):**
+```
+Day 1:
+  - Parse class declaration (just header, no body)
+  - TEST: Parse "class User {}" → succeeds
+  - VISIBLE: ./msc compile → shows "Parsed 1 class"
+
+Day 2:
+  - Add property parsing
+  - TEST: Parse "name: string" → succeeds
+  - VISIBLE: ./msc compile → shows "Class User with 1 property"
+
+Day 3:
+  - Add @derive parsing
+  - TEST: Parse "@derive(Eq)" → succeeds
+  - VISIBLE: VSCode highlights @derive token
+
+Day 4:
+  - Connect to macro expander (stub)
+  - TEST: Expand @derive → returns empty (placeholder)
+  - VISIBLE: ./msc compile → shows "Expanded 1 macro"
+
+← 4 days, working pipeline (incomplete but VISIBLE)!
+```
+
+### Testing Strategy
+
+**Test Pyramid for Metascript:**
+
+```
+              /\
+             /  \
+            / E2E\ ← compile examples/*.ms, check output
+           /──────\
+          /  Inte- \
+         / gration \ ← parser + lexer + macro
+        /────────────\
+       /              \
+      /   Unit Tests   \ ← lexer, AST, Trans-am cache
+     /──────────────────\
+    /                    \
+   /   Property Tests     \ ← fuzzing, edge cases
+  /────────────────────────\
+```
+
+**Ratios:**
+- 40% Unit tests (fast, isolated)
+- 30% Integration tests (parser → AST → macro)
+- 20% E2E tests (compile real files)
+- 10% Property tests (fuzzing, stress)
+
+### Visibility Tools to Create
+
+**Must-Have Tools:**
+
+1. **AST Dumper**
+   ```bash
+   ./msc dump-ast examples/macro.ms
+   # Shows tree structure with line numbers
+   ```
+
+2. **Macro Expansion Viewer**
+   ```bash
+   ./msc expand examples/macro.ms
+   # Shows before/after for each @derive
+   ```
+
+3. **LSP Message Logger**
+   ```bash
+   ./msc lsp --log-messages
+   # Shows all JSON-RPC messages
+   ```
+
+4. **Interactive REPL** (future)
+   ```bash
+   ./msc repl
+   > @derive(Eq) class User {}
+   Expanded to:
+   class User {
+     equals(other: User): boolean { ... }
+   }
+   ```
+
+### Success Metrics
+
+**We're doing it RIGHT when:**
+- ✅ Can see compiler output at every stage (even if incomplete)
+- ✅ VSCode shows syntax highlighting (even if basic)
+- ✅ LSP responds to hover (even if just "Not implemented yet")
+- ✅ Tests run in <1 second for fast iteration
+- ✅ Every feature has at least 3 tests (happy path, error, edge case)
+- ✅ Can compile examples/*.ms and see results (even if wrong initially)
+
+**We're doing it WRONG when:**
+- ❌ Working on features for days without visible output
+- ❌ "Trust me, it'll work" without tests
+- ❌ Can't inspect intermediate state (AST, tokens, IR)
+- ❌ Tests take >10 seconds (kills iteration speed)
+- ❌ Only testing after implementation is "complete"
+
+---
+
 **What We're Building:**
 - TypeScript syntax (familiar, copy-paste friendly)
 - Compile-time macro system (bridge dynamic patterns to static code)

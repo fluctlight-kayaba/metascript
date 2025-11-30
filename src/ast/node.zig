@@ -330,6 +330,12 @@ pub const ClassDecl = struct {
     extends: ?*types.Type,
     implements: []*types.Type,
     members: []*Node, // PropertyDecl, MethodDecl, ConstructorDecl
+    decorators: []Decorator = &[_]Decorator{}, // @derive(Eq, Hash), etc.
+
+    pub const Decorator = struct {
+        name: []const u8,
+        arguments: []*Node, // Identifier nodes for traits
+    };
 };
 
 pub const InterfaceDecl = struct {

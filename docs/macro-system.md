@@ -325,4 +325,7 @@ Expansion ratio: 5x (acceptable)
 - Macros are type-safe and transparent
 - Custom macros enable domain-specific optimizations
 
-**See:** `architecture.md` (macro expander design), `lsp-architecture.md` (macro expansion in LSP)
+**See:**
+- `source-defined-macros.md` - Nim-style macros defined in `.ms` source files
+- `architecture.md` - Macro expander design
+- `lsp-implementation.md` - Trans-Am engine and macro expansion in LSP

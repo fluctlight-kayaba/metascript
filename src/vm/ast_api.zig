@@ -164,10 +164,10 @@ fn astCreateMethod(
 
     if (arg_count < 2) return null;
 
-    // Get method name
+    // Get method name - must copy since Hermes string buffer is temporary
     var name_len: usize = 0;
     const name_ptr = c.ms_value_get_string(rt, args[0], &name_len) orelse return null;
-    const name = name_ptr[0..name_len];
+    const name = ctx.arena.allocator().dupe(u8, name_ptr[0..name_len]) catch return null;
 
     // Get body (should be a block node reference)
     // For now, create empty body - will be enhanced
@@ -260,9 +260,10 @@ fn astCreateIdentifier(
 
     if (arg_count < 1) return null;
 
+    // Must copy string since Hermes buffer is temporary
     var name_len: usize = 0;
     const name_ptr = c.ms_value_get_string(rt, args[0], &name_len) orelse return null;
-    const name = name_ptr[0..name_len];
+    const name = ctx.arena.allocator().dupe(u8, name_ptr[0..name_len]) catch return null;
 
     const loc = ast.SourceLocation.dummy();
     const node = ctx.arena.createNode(
@@ -390,10 +391,10 @@ fn targetAddMethod(
     const method_ptr = @as(usize, @intFromFloat(c.ms_value_get_number(args[0])));
     const method = @as(*ast.Node, @ptrFromInt(method_ptr));
 
-    // Add to class members
+    // Add to class members (use arena allocator to avoid leaks)
     var class = &node.data.class_decl;
     const old_members = class.members;
-    const new_members = ctx.allocator.alloc(*ast.Node, old_members.len + 1) catch {
+    const new_members = ctx.arena.allocator().alloc(*ast.Node, old_members.len + 1) catch {
         return c.ms_value_bool(rt, false);
     };
 

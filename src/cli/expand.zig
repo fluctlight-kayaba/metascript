@@ -4,12 +4,13 @@
 /// Usage: msc expand <file.ms>
 ///
 /// This parses a Metascript file, expands all macros (@derive, etc.)
-/// using the Hermes VM, and prints the before/after AST.
+/// using the Hermes VM, and prints the before/after source code.
 
 const std = @import("std");
 const ast = @import("../ast/ast.zig");
 const Lexer = @import("../lexer/lexer.zig").Lexer;
 const Parser = @import("../parser/parser.zig").Parser;
+const Printer = @import("../ast/printer.zig").Printer;
 const vm_expander = @import("../macro/vm_expander.zig");
 const colors = @import("colors.zig");
 
@@ -27,10 +28,6 @@ pub fn run(allocator: std.mem.Allocator, path: []const u8) !void {
     std.debug.print("\n{s}{s}=== MACRO EXPANSION: {s} ==={s}\n\n", .{
         colors.header.code(), colors.Color.bold.code(), path, colors.Color.reset.code(),
     });
-
-    // Show source
-    std.debug.print("{s}Source:{s}\n", .{ colors.info.code(), colors.Color.reset.code() });
-    std.debug.print("{s}{s}{s}\n\n", .{ colors.dim_text.code(), source, colors.Color.reset.code() });
 
     // Create AST arena
     var arena = ast.ASTArena.init(allocator);
@@ -54,13 +51,26 @@ pub fn run(allocator: std.mem.Allocator, path: []const u8) !void {
         return;
     };
 
-    std.debug.print("{s}Parsed AST (before expansion):{s}\n", .{
+    // Pretty-print before expansion
+    var printer = Printer.init(allocator);
+    defer printer.deinit();
+
+    const before_source = printer.print(program) catch |err| {
+        std.debug.print("{s}Printer error:{s} {}\n", .{ colors.error_color.code(), colors.Color.reset.code(), err });
+        return;
+    };
+    defer allocator.free(before_source);
+
+    std.debug.print("{s}Before expansion:{s}\n", .{
         colors.info.code(), colors.Color.reset.code(),
     });
-    printAST(program, 0);
+    std.debug.print("{s}────────────────────────────────────────{s}\n", .{
+        colors.dim_text.code(), colors.Color.reset.code(),
+    });
+    std.debug.print("{s}\n", .{before_source});
 
     // Expand macros using Hermes VM
-    std.debug.print("\n{s}Expanding macros with Hermes VM...{s}\n\n", .{
+    std.debug.print("{s}Expanding macros with Hermes VM...{s}\n\n", .{
         colors.success.code(), colors.Color.reset.code(),
     });
 
@@ -71,12 +81,43 @@ pub fn run(allocator: std.mem.Allocator, path: []const u8) !void {
         return;
     };
 
-    std.debug.print("{s}Expanded AST (after expansion):{s}\n", .{
+    // Pretty-print after expansion
+    const after_source = printer.print(expanded) catch |err| {
+        std.debug.print("{s}Printer error:{s} {}\n", .{ colors.error_color.code(), colors.Color.reset.code(), err });
+        return;
+    };
+    defer allocator.free(after_source);
+
+    std.debug.print("{s}After expansion:{s}\n", .{
         colors.success.code(), colors.Color.reset.code(),
     });
-    printAST(expanded, 0);
+    std.debug.print("{s}────────────────────────────────────────{s}\n", .{
+        colors.dim_text.code(), colors.Color.reset.code(),
+    });
+    std.debug.print("{s}\n", .{after_source});
 
-    std.debug.print("\n{s}Done.{s}\n", .{ colors.success.code(), colors.Color.reset.code() });
+    // Show diff summary
+    const before_lines = countLines(before_source);
+    const after_lines = countLines(after_source);
+    const added_lines = if (after_lines > before_lines) after_lines - before_lines else 0;
+
+    std.debug.print("{s}Summary:{s} {d} lines before, {d} lines after ({s}+{d} lines generated{s})\n", .{
+        colors.info.code(),
+        colors.Color.reset.code(),
+        before_lines,
+        after_lines,
+        colors.success.code(),
+        added_lines,
+        colors.Color.reset.code(),
+    });
+}
+
+fn countLines(s: []const u8) usize {
+    var count: usize = 1;
+    for (s) |c| {
+        if (c == '\n') count += 1;
+    }
+    return count;
 }
 
 fn printAST(node: *ast.Node, indent: usize) void {

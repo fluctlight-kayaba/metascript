@@ -31,12 +31,21 @@ pub const MacroVM = struct {
         pub const derive_eq =
             \\// @derive(Eq) macro implementation
             \\(function() {
+            \\    console.log("[derive(Eq)] Starting macro expansion");
+            \\    console.log("[derive(Eq)] Target class:", target.name);
+            \\
             \\    const props = target.properties;
-            \\    if (props.length === 0) return;
+            \\    console.log("[derive(Eq)] Properties:", props.length, props);
+            \\
+            \\    if (props.length === 0) {
+            \\        console.log("[derive(Eq)] No properties, skipping");
+            \\        return;
+            \\    }
             \\
             \\    // Build: this.prop1 === other.prop1 && this.prop2 === other.prop2 ...
             \\    let expr = null;
             \\    for (const prop of props) {
+            \\        console.log("[derive(Eq)] Processing property:", prop);
             \\        const thisAccess = ast.createMemberExpr(
             \\            ast.createIdentifier("this"),
             \\            ast.createIdentifier(prop)
@@ -60,7 +69,10 @@ pub const MacroVM = struct {
             \\
             \\    // Create: equals(other: ClassName): boolean { ... }
             \\    const method = ast.createMethod("equals", body);
+            \\    console.log("[derive(Eq)] Created method: equals()");
+            \\
             \\    target.addMethod(method);
+            \\    console.log("[derive(Eq)] Added method to class");
             \\})();
         ;
 
@@ -95,6 +107,14 @@ pub const MacroVM = struct {
 
         // Register console.log for debugging
         c.ms_hermes_register_function(runtime, "console_log", consoleLog, null);
+
+        // Setup console object so console.log() works
+        _ = c.ms_hermes_eval(
+            runtime,
+            "var console = { log: console_log };",
+            35,
+            "setup.js",
+        );
 
         return .{
             .allocator = allocator,

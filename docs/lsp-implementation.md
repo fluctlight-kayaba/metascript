@@ -677,3 +677,10 @@ const SYMBOL_CACHE_SIZE = 4096;      // Deduplicated strings
 **Result:** <100ms hover, <200ms completion, <500ms full diagnostics - validated by production LSPs.
 
 **Next Step:** Implement `QueryDatabase` + `LRUCache` foundation (Week 1-2).
+
+---
+
+## Related Documentation
+
+- `source-defined-macros.md` - Nim-style macros defined in `.ms` source files, LSP integration
+- `macro-system.md` - Macro API and usage patterns

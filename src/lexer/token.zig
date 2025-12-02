@@ -80,12 +80,31 @@ pub const TokenKind = enum {
     keyword_type,
     keyword_unknown,
 
+    // Metascript sized types (C backend)
+    keyword_int8,
+    keyword_int16,
+    keyword_int32,
+    keyword_int64,
+    keyword_uint8,
+    keyword_uint16,
+    keyword_uint32,
+    keyword_uint64,
+    keyword_float32,
+    keyword_float64,
+
+    // Metascript type aliases
+    keyword_int,      // → int32
+    keyword_float,    // → float32
+    keyword_double,   // → float64
+
+    // Metascript keywords
+    keyword_defer,    // defer cleanup
+    keyword_distinct, // distinct type
+
     // ===== Macro Tokens (Metascript extensions) =====
-    at_sign,          // @ (generic)
-    at_derive,        // @derive
-    at_comptime,      // @comptime
-    at_serialize,     // @serialize
-    at_ffi,           // @ffi
+    // All macros are now user-defined in std/macros/*.ms
+    // The lexer only produces @ as a token, parser combines with identifier
+    at_sign,          // @ (all macros start with this)
 
     // ===== Operators =====
     // Arithmetic
@@ -162,8 +181,7 @@ pub const TokenKind = enum {
             .identifier => "identifier",
             .keyword_function => "function",
             .keyword_class => "class",
-            .at_derive => "@derive",
-            .at_comptime => "@comptime",
+            .at_sign => "@",
             .equals => "=",
             .semicolon => ";",
             .end_of_file => "EOF",
@@ -253,22 +271,29 @@ pub const Token = struct {
             .keyword_static,
             .keyword_type,
             .keyword_unknown,
+            .keyword_int8,
+            .keyword_int16,
+            .keyword_int32,
+            .keyword_int64,
+            .keyword_uint8,
+            .keyword_uint16,
+            .keyword_uint32,
+            .keyword_uint64,
+            .keyword_float32,
+            .keyword_float64,
+            .keyword_int,
+            .keyword_float,
+            .keyword_double,
+            .keyword_defer,
+            .keyword_distinct,
             => true,
             else => false,
         };
     }
 
-    /// Check if token is a macro token
+    /// Check if token is a macro token (just @ sign now)
     pub fn isMacro(self: Token) bool {
-        return switch (self.kind) {
-            .at_sign,
-            .at_derive,
-            .at_comptime,
-            .at_serialize,
-            .at_ffi,
-            => true,
-            else => false,
-        };
+        return self.kind == .at_sign;
     }
 };
 
@@ -344,12 +369,33 @@ pub fn initKeywordMap(allocator: std.mem.Allocator) !KeywordMap {
     try map.put("type", .keyword_type);
     try map.put("unknown", .keyword_unknown);
 
+    // Metascript sized types
+    try map.put("int8", .keyword_int8);
+    try map.put("int16", .keyword_int16);
+    try map.put("int32", .keyword_int32);
+    try map.put("int64", .keyword_int64);
+    try map.put("uint8", .keyword_uint8);
+    try map.put("uint16", .keyword_uint16);
+    try map.put("uint32", .keyword_uint32);
+    try map.put("uint64", .keyword_uint64);
+    try map.put("float32", .keyword_float32);
+    try map.put("float64", .keyword_float64);
+
+    // Metascript type aliases
+    try map.put("int", .keyword_int);
+    try map.put("float", .keyword_float);
+    try map.put("double", .keyword_double);
+
+    // Metascript keywords
+    try map.put("defer", .keyword_defer);
+    try map.put("distinct", .keyword_distinct);
+
     return map;
 }
 
 test "token kind toString" {
     try std.testing.expectEqualStrings("number", TokenKind.number.toString());
-    try std.testing.expectEqualStrings("@derive", TokenKind.at_derive.toString());
+    try std.testing.expectEqualStrings("@", TokenKind.at_sign.toString());
     try std.testing.expectEqualStrings("EOF", TokenKind.end_of_file.toString());
 }
 
@@ -366,7 +412,7 @@ test "token keyword detection" {
 test "token macro detection" {
     const loc = ast.SourceLocation.dummy();
 
-    const macro_token = Token.init(.at_derive, loc, "@derive");
+    const macro_token = Token.init(.at_sign, loc, "@");
     try std.testing.expect(macro_token.isMacro());
 
     const normal_token = Token.init(.identifier, loc, "foo");

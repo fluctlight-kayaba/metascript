@@ -11,6 +11,31 @@ Source (.ms) → Parser → AST → Macro Expander → Expanded AST → Type Che
 Typed AST → Monomorphization → Specialized AST → Unified IR → Backend Selection
 ```
 
+  ┌─────────────────────────────────────────────────┐
+  │  COMPILER (Zig)                                 │
+  │                                                 │
+  │  Lifetime Analysis (Lobster-style)              │
+  │  - When do values die?                          │
+  │  - Can we eliminate allocations?               │
+  │  - Single-use temporaries?                     │
+  │                                                 │
+  │  Output: Metadata for each backend             │
+  └────────────┬────────────────────────────────────┘
+               │
+               ├───────────────┬────────────────┐
+               ↓               ↓                ↓
+      ┌────────────────┐ ┌───────────┐ ┌──────────────┐
+      │  C Backend     │ │ JS Backend│ │Erlang Backend│
+      │                │ │           │ │              │
+      │ Uses:          │ │ Uses:     │ │ Uses:        │
+      │ • orc.h        │ │ • Analysis│ │ • Nothing    │
+      │ • string.h     │ │   only    │ │   (BEAM GC)  │
+      │ (runtime RC)   │ │ • No RC   │ │              │
+      └────────────────┘ └───────────┘ └──────────────┘
+             ↓                ↓               ↓
+         C code with      Pure JS       Pure Erlang
+         RC calls         (no RC)       (no RC)
+
 **Backends:**
 - **C**: Native perf (90%+ of C), <50ms Lambda cold start
 - **JavaScript**: Browser + npm ecosystem

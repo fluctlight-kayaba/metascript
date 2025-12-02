@@ -23,7 +23,7 @@
 
 ```bash
 # Install Metascript (requires Zig 0.15.1+)
-git clone https://github.com/metascript/metascript.git
+git clone https://github.com/fluctlight-kayaba/metascript.git
 cd metascript
 zig build
 export PATH=$PWD/zig-out/bin:$PATH
@@ -244,7 +244,7 @@ Hot reload:           Zero-downtime updates
 
 ## Community
 
-- **GitHub**: [github.com/metascript/metascript](https://github.com/metascript/metascript)
+- **GitHub**: [github.com/fluctlight-kayaba/metascript](https://github.com/fluctlight-kayaba/metascript)
 - **Discord**: [discord.gg/metascript](https://discord.gg/metascript)
 - **Forum**: [forum.metascript.dev](https://forum.metascript.dev)
 - **Blog**: [blog.metascript.dev](https://blog.metascript.dev)
@@ -257,7 +257,7 @@ We welcome contributions! See [CONTRIBUTING.md](./docs/contributing.md) for:
 - Testing requirements
 - Areas needing help
 
-**Good first issues** are tagged in our [issue tracker](https://github.com/metascript/metascript/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
+**Good first issues** are tagged in our [issue tracker](https://github.com/fluctlight-kayaba/metascript/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
 
 ## License
 

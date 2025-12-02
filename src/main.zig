@@ -10,6 +10,10 @@ pub const checker = @import("checker/typechecker.zig");
 pub const ir = @import("ir/ir.zig");
 pub const transam = @import("transam/transam.zig");
 pub const file_store = @import("lsp/file_store.zig");
+pub const module = @import("module/module.zig");
+
+// Code generation backends
+pub const jsgen = @import("codegen/js/jsgen.zig");
 
 // Import CLI commands
 const cli_dump_tokens = @import("cli/dump_tokens.zig");
@@ -78,7 +82,42 @@ pub fn main() !void {
             try printUsage();
             return;
         }
-        try cli_compile.run(allocator, args[2]);
+
+        // Parse compile options
+        var target: cli_compile.Backend = .js; // Default to JS
+        var output_path: ?[]const u8 = null;
+        var input_file: ?[]const u8 = null;
+        var enable_normalize: bool = true; // Enabled by default
+
+        for (args[2..]) |arg| {
+            if (std.mem.startsWith(u8, arg, "--target=")) {
+                const target_str = arg[9..];
+                if (std.mem.eql(u8, target_str, "js") or std.mem.eql(u8, target_str, "javascript")) {
+                    target = .js;
+                } else if (std.mem.eql(u8, target_str, "c")) {
+                    target = .c;
+                } else if (std.mem.eql(u8, target_str, "erlang") or std.mem.eql(u8, target_str, "erl")) {
+                    target = .erlang;
+                } else {
+                    std.debug.print("Error: unknown target '{s}'. Valid: js, c, erlang\n", .{target_str});
+                    return;
+                }
+            } else if (std.mem.startsWith(u8, arg, "--output=") or std.mem.startsWith(u8, arg, "-o=")) {
+                output_path = if (std.mem.startsWith(u8, arg, "--output=")) arg[9..] else arg[3..];
+            } else if (std.mem.eql(u8, arg, "--no-normalize")) {
+                enable_normalize = false;
+            } else if (!std.mem.startsWith(u8, arg, "-")) {
+                input_file = arg;
+            }
+        }
+
+        if (input_file == null) {
+            std.debug.print("Error: compile command requires input file\n", .{});
+            try printUsage();
+            return;
+        }
+
+        try cli_compile.runWithArgs(allocator, input_file.?, target, output_path, enable_normalize);
     } else if (std.mem.eql(u8, command, "run")) {
         if (args.len < 3) {
             std.debug.print("Error: run command requires input file\n", .{});
@@ -131,7 +170,8 @@ fn printUsage() !void {
     std.debug.print("  {s}-h{s}, {s}--help{s}          Display this help\n", .{ colors.Color.bright_magenta.code(), colors.Color.reset.code(), colors.Color.bright_magenta.code(), colors.Color.reset.code() });
     std.debug.print("  {s}-v{s}, {s}--version{s}       Show version\n", .{ colors.Color.bright_magenta.code(), colors.Color.reset.code(), colors.Color.bright_magenta.code(), colors.Color.reset.code() });
     std.debug.print("  {s}--target{s}=<c|js|erlang> Target backend (default: c)\n", .{ colors.Color.bright_magenta.code(), colors.Color.reset.code() });
-    std.debug.print("  {s}--output{s}=<file>        Output file path\n\n", .{ colors.Color.bright_magenta.code(), colors.Color.reset.code() });
+    std.debug.print("  {s}--output{s}=<file>        Output file path\n", .{ colors.Color.bright_magenta.code(), colors.Color.reset.code() });
+    std.debug.print("  {s}--no-normalize{s}         Disable AST normalization (for benchmarking)\n\n", .{ colors.Color.bright_magenta.code(), colors.Color.reset.code() });
 
     std.debug.print("{s}{s}EXAMPLES:{s}\n", .{ colors.success.code(), colors.Color.bold.code(), colors.Color.reset.code() });
     std.debug.print("  {s}$>{s} msc compile hello.ms\n", .{ colors.dim_text.code(), colors.Color.reset.code() });
@@ -158,4 +198,12 @@ test "basic compilation pipeline" {
     // Test that compiler initializes
     _ = allocator;
     try std.testing.expect(true);
+}
+
+// Include tests from submodules
+test {
+    // Type checker tests (includes symbol table tests)
+    std.testing.refAllDecls(checker);
+    // Trans-Am query engine tests
+    std.testing.refAllDecls(transam);
 }

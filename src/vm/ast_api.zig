@@ -54,6 +54,8 @@ fn astGetter(
     // Return appropriate function for each AST operation
     if (std.mem.eql(u8, name, "createMethod")) {
         return c.ms_hermes_create_function(rt, "createMethod", astCreateMethod, ctx);
+    } else if (std.mem.eql(u8, name, "createParam")) {
+        return c.ms_hermes_create_function(rt, "createParam", astCreateParam, ctx);
     } else if (std.mem.eql(u8, name, "createBinaryExpr")) {
         return c.ms_hermes_create_function(rt, "createBinaryExpr", astCreateBinaryExpr, ctx);
     } else if (std.mem.eql(u8, name, "createIdentifier")) {
@@ -152,7 +154,9 @@ fn getClassProperties(
 // AST Creation Functions (called from JavaScript)
 // =============================================================================
 
-/// ast.createMethod(name, params, body) -> MethodNode
+/// ast.createMethod(name, body, params?) -> MethodNode
+/// JS: ast.createMethod("equals", blockNode)
+/// JS: ast.createMethod("equals", blockNode, [otherParam])
 fn astCreateMethod(
     runtime: ?*c.MSHermesRuntime,
     context: ?*anyopaque,
@@ -169,15 +173,33 @@ fn astCreateMethod(
     const name_ptr = c.ms_value_get_string(rt, args[0], &name_len) orelse return null;
     const name = ctx.arena.allocator().dupe(u8, name_ptr[0..name_len]) catch return null;
 
-    // Get body (should be a block node reference)
-    // For now, create empty body - will be enhanced
-    const loc = ast.SourceLocation.dummy();
+    // Get body from second argument (block node pointer passed as number)
+    const body_ptr = @as(usize, @intFromFloat(c.ms_value_get_number(args[1])));
+    const body = @as(*ast.Node, @ptrFromInt(body_ptr));
 
-    const body = ctx.arena.createNode(
-        .block_stmt,
-        loc,
-        .{ .block_stmt = .{ .statements = &[_]*ast.Node{} } },
-    ) catch return null;
+    // Get params from optional third argument (array of FunctionParam pointers)
+    var params_slice: []ast.node.FunctionExpr.FunctionParam = @constCast(&[_]ast.node.FunctionExpr.FunctionParam{});
+    if (arg_count >= 3 and c.ms_value_is_array(rt, args[2])) {
+        const arr = args[2];
+        const len = c.ms_array_length(rt, arr);
+        if (len > 0) {
+            var params_list = std.ArrayList(ast.node.FunctionExpr.FunctionParam).init(ctx.allocator);
+            defer params_list.deinit();
+
+            for (0..len) |i| {
+                const elem = c.ms_array_get(rt, arr, i) orelse continue;
+                const ptr = @as(usize, @intFromFloat(c.ms_value_get_number(elem)));
+                const param_ptr = @as(*ast.node.FunctionExpr.FunctionParam, @ptrFromInt(ptr));
+                params_list.append(param_ptr.*) catch continue;
+                c.ms_value_destroy(elem);
+            }
+
+            const duped = ctx.arena.allocator().dupe(ast.node.FunctionExpr.FunctionParam, params_list.items) catch return null;
+            params_slice = @constCast(duped);
+        }
+    }
+
+    const loc = ast.SourceLocation.dummy();
 
     const method = ctx.arena.createNode(
         .method_decl,
@@ -186,7 +208,7 @@ fn astCreateMethod(
             .method_decl = .{
                 .name = name,
                 .type_params = &[_]ast.GenericParam{},
-                .params = &[_]ast.node.FunctionExpr.FunctionParam{},
+                .params = params_slice,
                 .return_type = null,
                 .body = body,
             },
@@ -194,8 +216,38 @@ fn astCreateMethod(
     ) catch return null;
 
     // Return opaque reference (store pointer as number for now)
-    // TODO: Use proper HostObject wrapping
     return c.ms_value_number(rt, @floatFromInt(@intFromPtr(method)));
+}
+
+/// ast.createParam(name) -> FunctionParam pointer
+/// JS: ast.createParam("other")
+fn astCreateParam(
+    runtime: ?*c.MSHermesRuntime,
+    context: ?*anyopaque,
+    args: [*c]?*c.MSHermesValue,
+    arg_count: usize,
+) callconv(.c) ?*c.MSHermesValue {
+    const ctx = @as(*ASTContext, @ptrCast(@alignCast(context orelse return null)));
+    const rt = runtime orelse return null;
+
+    if (arg_count < 1) return null;
+
+    // Get param name
+    var name_len: usize = 0;
+    const name_ptr = c.ms_value_get_string(rt, args[0], &name_len) orelse return null;
+    const name = ctx.arena.allocator().dupe(u8, name_ptr[0..name_len]) catch return null;
+
+    // Create FunctionParam using arena allocator (auto-freed with arena)
+    const param = ctx.arena.allocator().create(ast.node.FunctionExpr.FunctionParam) catch return null;
+    param.* = .{
+        .name = name,
+        .type = null, // Untyped for now
+        .optional = false,
+        .default_value = null,
+    };
+
+    // Return pointer as number
+    return c.ms_value_number(rt, @floatFromInt(@intFromPtr(param)));
 }
 
 /// ast.createBinaryExpr(op, left, right) -> BinaryExprNode

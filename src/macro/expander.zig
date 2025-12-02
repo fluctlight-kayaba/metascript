@@ -1,6 +1,9 @@
 const std = @import("std");
 const ast = @import("../ast/ast.zig");
 
+// Export normalize module for testing
+pub const normalize = @import("normalize.zig");
+
 /// Macro expansion context
 pub const MacroContext = struct {
     arena: *ast.ASTArena,

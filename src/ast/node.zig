@@ -23,6 +23,7 @@ pub const NodeKind = enum {
     object_expr,      // { x: 1, y: 2 }
     function_expr,    // function() {} or () => {}
     conditional_expr, // a ? b : c
+    spread_element,   // ...expr (in object/array literals)
 
     // ===== Statements =====
     block_stmt,       // { ... }
@@ -52,6 +53,7 @@ pub const NodeKind = enum {
     type_annotation,  // : Type
 
     // ===== Macro-specific nodes =====
+    macro_decl,       // @macro function derive() { ... }
     macro_invocation, // @derive(Eq, Hash)
     comptime_block,   // @comptime { ... }
     compile_error,    // @compileError("message")
@@ -62,6 +64,9 @@ pub const NodeKind = enum {
 
 /// Binary operators
 pub const BinaryOp = enum {
+    // Assignment
+    assign,   // =
+
     // Arithmetic
     add,      // +
     sub,      // -
@@ -127,6 +132,7 @@ pub const Node = struct {
         object_expr: ObjectExpr,
         function_expr: FunctionExpr,
         conditional_expr: ConditionalExpr,
+        spread_element: SpreadElement,
 
         // Statements
         block_stmt: BlockStmt,
@@ -156,6 +162,7 @@ pub const Node = struct {
         type_annotation: *types.Type,
 
         // Macros - THIS IS KEY!
+        macro_decl: MacroDecl,
         macro_invocation: MacroInvocation,
         comptime_block: ComptimeBlock,
         compile_error: []const u8,
@@ -178,6 +185,7 @@ pub const Node = struct {
             .new_expr,
             .array_expr,
             .object_expr,
+            .spread_element,
             .function_expr,
             .conditional_expr,
             => true,
@@ -240,10 +248,13 @@ pub const ArrayExpr = struct {
 pub const ObjectExpr = struct {
     properties: []ObjectProperty,
 
-    pub const ObjectProperty = struct {
-        key: *Node,
-        value: *Node,
-        shorthand: bool, // { x } vs { x: x }
+    pub const ObjectProperty = union(enum) {
+        property: struct {
+            key: *Node,
+            value: *Node,
+            shorthand: bool, // { x } vs { x: x }
+        },
+        spread: *Node, // SpreadElement node
     };
 };
 
@@ -267,6 +278,10 @@ pub const ConditionalExpr = struct {
     condition: *Node,
     consequent: *Node,
     alternate: *Node,
+};
+
+pub const SpreadElement = struct {
+    argument: *Node, // The expression being spread
 };
 
 // ===== Statement node types =====
@@ -394,6 +409,16 @@ pub const ConstructorDecl = struct {
 };
 
 // ===== Macro-specific types (CRITICAL FOR METAPROGRAMMING!) =====
+
+/// Macro definition: @macro function derive(ctx) { ... }
+/// This is a function that runs at compile-time to transform AST
+pub const MacroDecl = struct {
+    name: []const u8,
+    type_params: []types.GenericParam,
+    params: []FunctionExpr.FunctionParam,
+    return_type: ?*types.Type,
+    body: *Node, // The macro body (runs at compile-time)
+};
 
 /// Macro invocation: @derive(Eq, Hash), @comptime, etc.
 pub const MacroInvocation = struct {

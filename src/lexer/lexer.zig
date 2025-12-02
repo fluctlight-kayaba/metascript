@@ -184,15 +184,10 @@ pub const Lexer = struct {
         };
     }
 
-    /// Scan macro token (@derive, @comptime, etc.)
+    /// Scan macro token - just returns @ sign
+    /// All macros are user-defined in std/macros/*.ms
+    /// Parser combines @ with following identifier (e.g., @derive = @ + identifier("derive"))
     fn scanMacroToken(self: *Self) Token {
-        // Check for known macro keywords
-        if (self.matchWord("derive")) return self.makeToken(.at_derive);
-        if (self.matchWord("comptime")) return self.makeToken(.at_comptime);
-        if (self.matchWord("serialize")) return self.makeToken(.at_serialize);
-        if (self.matchWord("ffi")) return self.makeToken(.at_ffi);
-
-        // Generic @ sign (for user-defined macros)
         return self.makeToken(.at_sign);
     }
 
@@ -506,26 +501,32 @@ test "lexer: basic tokens" {
 }
 
 test "lexer: macro tokens" {
+    // @derive is now tokenized as @ + identifier("derive")
     const source = "@derive(Eq, Hash)";
     var lexer = try Lexer.init(std.testing.allocator, source, 1);
     defer lexer.deinit();
 
     const tok1 = try lexer.next();
-    try std.testing.expect(tok1.kind == .at_derive);
+    try std.testing.expect(tok1.kind == .at_sign);
+    try std.testing.expectEqualStrings("@", tok1.text);
 
     const tok2 = try lexer.next();
-    try std.testing.expect(tok2.kind == .left_paren);
+    try std.testing.expect(tok2.kind == .identifier);
+    try std.testing.expectEqualStrings("derive", tok2.text);
 
     const tok3 = try lexer.next();
-    try std.testing.expect(tok3.kind == .identifier);
-    try std.testing.expectEqualStrings("Eq", tok3.text);
+    try std.testing.expect(tok3.kind == .left_paren);
 
     const tok4 = try lexer.next();
-    try std.testing.expect(tok4.kind == .comma);
+    try std.testing.expect(tok4.kind == .identifier);
+    try std.testing.expectEqualStrings("Eq", tok4.text);
 
     const tok5 = try lexer.next();
-    try std.testing.expect(tok5.kind == .identifier);
-    try std.testing.expectEqualStrings("Hash", tok5.text);
+    try std.testing.expect(tok5.kind == .comma);
+
+    const tok6 = try lexer.next();
+    try std.testing.expect(tok6.kind == .identifier);
+    try std.testing.expectEqualStrings("Hash", tok6.text);
 }
 
 test "lexer: class with @derive" {
@@ -540,10 +541,14 @@ test "lexer: class with @derive" {
     defer lexer.deinit();
 
     const tok1 = try lexer.next();
-    try std.testing.expect(tok1.kind == .at_derive);
+    try std.testing.expect(tok1.kind == .at_sign);
 
     const tok2 = try lexer.next();
-    try std.testing.expect(tok2.kind == .left_paren);
+    try std.testing.expect(tok2.kind == .identifier);
+    try std.testing.expectEqualStrings("derive", tok2.text);
+
+    const tok3 = try lexer.next();
+    try std.testing.expect(tok3.kind == .left_paren);
 
     // Skip to class keyword
     _ = try lexer.next();  // Eq

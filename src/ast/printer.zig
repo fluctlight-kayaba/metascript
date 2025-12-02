@@ -307,6 +307,7 @@ pub const Printer = struct {
         try self.write(" ");
         // Convert operator enum to string
         const op_str = switch (binary.op) {
+            .assign => "=",
             .add => "+",
             .sub => "-",
             .mul => "*",
@@ -406,10 +407,18 @@ pub const Printer = struct {
         try self.write("{ ");
         for (obj.properties, 0..) |prop, i| {
             if (i > 0) try self.write(", ");
-            try self.printNode(prop.key);
-            if (!prop.shorthand) {
-                try self.write(": ");
-                try self.printNode(prop.value);
+            switch (prop) {
+                .property => |p| {
+                    try self.printNode(p.key);
+                    if (!p.shorthand) {
+                        try self.write(": ");
+                        try self.printNode(p.value);
+                    }
+                },
+                .spread => |spread_node| {
+                    try self.write("...");
+                    try self.printNode(spread_node.data.spread_element.argument);
+                },
             }
         }
         try self.write(" }");

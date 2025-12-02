@@ -90,6 +90,23 @@ pub const Parser = struct {
     // ===== Top-Level Declarations =====
 
     fn parseTopLevelDeclaration(self: *Parser) !*ast.Node {
+        // Check for @macro function (macro definition)
+        // Now @ is separate token, so check @ + identifier("macro")
+        if (self.check(.at_sign) and self.peekNextIsIdentifier("macro")) {
+            self.advance(); // consume @
+            self.advance(); // consume "macro"
+            if (self.check(.keyword_function)) {
+                return self.parseMacroDeclaration();
+            } else {
+                return self.reportError("Expected 'function' after @macro");
+            }
+        }
+
+        // Check for @comptime block at top level
+        if (self.check(.at_sign) and self.peekNextIsIdentifier("comptime")) {
+            return self.parseComptimeBlock();
+        }
+
         // Parse decorators first
         var decorators = std.ArrayList(*ast.Node).init(self.allocator);
         defer decorators.deinit();
@@ -116,8 +133,6 @@ pub const Parser = struct {
             return self.parseImportDeclaration();
         } else if (self.check(.keyword_export)) {
             return self.parseExportDeclaration();
-        } else if (self.check(.at_comptime)) {
-            return self.parseComptimeBlock();
         } else {
             // Expression statement
             return self.parseStatement();
@@ -127,31 +142,17 @@ pub const Parser = struct {
     fn parseDecorator(self: *Parser) !*ast.Node {
         const start_loc = self.current.loc;
 
-        // Consume @macro token
-        const macro_name = if (self.check(.at_derive)) blk: {
-            self.advance();
-            break :blk "derive";
-        } else if (self.check(.at_comptime)) blk: {
-            self.advance();
-            break :blk "comptime";
-        } else if (self.check(.at_serialize)) blk: {
-            self.advance();
-            break :blk "serialize";
-        } else if (self.check(.at_ffi)) blk: {
-            self.advance();
-            break :blk "ffi";
-        } else if (self.check(.at_sign)) blk: {
-            self.advance();
-            // User-defined macro: @macroName
-            if (!self.check(.identifier)) {
-                return self.reportError("Expected macro name after '@'");
-            }
-            const name = self.current.text;
-            self.advance();
-            break :blk name;
-        } else {
-            return self.reportError("Expected decorator");
-        };
+        // All macros are now @ + identifier
+        if (!self.check(.at_sign)) {
+            return self.reportError("Expected decorator starting with '@'");
+        }
+        self.advance(); // consume @
+
+        if (!self.check(.identifier)) {
+            return self.reportError("Expected macro name after '@'");
+        }
+        const macro_name = self.current.text;
+        self.advance();
 
         // Parse arguments if present: @derive(Eq, Hash)
         var args = std.ArrayList(ast.node.MacroInvocation.MacroArgument).init(self.allocator);
@@ -493,6 +494,64 @@ pub const Parser = struct {
             self.mergeLoc(start_loc, self.previous.loc),
             .{
                 .function_decl = .{
+                    .name = name,
+                    .type_params = type_params_slice,
+                    .params = params_slice,
+                    .return_type = return_type,
+                    .body = body,
+                },
+            },
+        );
+    }
+
+    /// Parse @macro function declaration
+    /// @macro function derive(ctx: MacroContext): void { ... }
+    fn parseMacroDeclaration(self: *Parser) !*ast.Node {
+        const start_loc = self.current.loc;
+
+        try self.consume(.keyword_function, "Expected 'function' after @macro");
+
+        // Macro name
+        if (!self.check(.identifier)) {
+            return self.reportError("Expected macro name");
+        }
+        const name = self.current.text;
+        self.advance();
+
+        // Type parameters
+        var type_params = std.ArrayList(ast.types.GenericParam).init(self.allocator);
+        defer type_params.deinit();
+        if (self.match(.less_than)) {
+            try self.parseTypeParameters(&type_params);
+        }
+
+        // Parameters (e.g., ctx: MacroContext)
+        try self.consume(.left_paren, "Expected '(' after macro name");
+        var params = std.ArrayList(ast.node.FunctionExpr.FunctionParam).init(self.allocator);
+        defer params.deinit();
+        try self.parseParameters(&params);
+        try self.consume(.right_paren, "Expected ')' after parameters");
+
+        // Return type
+        var return_type: ?*ast.types.Type = null;
+        if (self.match(.colon)) {
+            return_type = try self.parseTypeReference();
+        }
+
+        // Body is required for macros
+        if (!self.check(.left_brace)) {
+            return self.reportError("Macro must have a body");
+        }
+        const body = try self.parseBlock();
+
+        const type_params_slice = try self.arena.allocator().dupe(ast.types.GenericParam, type_params.items);
+        const params_slice = try self.arena.allocator().dupe(ast.node.FunctionExpr.FunctionParam, params.items);
+
+        return try self.arena.createNode(
+            .macro_decl,
+            self.mergeLoc(start_loc, self.previous.loc),
+            .{
+                .macro_decl = .{
                     .name = name,
                     .type_params = type_params_slice,
                     .params = params_slice,
@@ -885,7 +944,13 @@ pub const Parser = struct {
 
     fn parseComptimeBlock(self: *Parser) !*ast.Node {
         const start_loc = self.current.loc;
-        try self.consume(.at_comptime, "Expected '@comptime'");
+
+        // @comptime is now @ + identifier("comptime")
+        try self.consume(.at_sign, "Expected '@'");
+        if (!self.check(.identifier) or !std.mem.eql(u8, self.current.text, "comptime")) {
+            return self.reportError("Expected 'comptime' after '@'");
+        }
+        self.advance(); // consume "comptime"
 
         const body = try self.parseBlock();
 
@@ -1171,13 +1236,12 @@ pub const Parser = struct {
         {
             const value = try self.parseAssignment();
             // Create a binary expression for assignment
-            // TODO: Use proper assignment expression node
             expr = try self.arena.createNode(
                 .binary_expr,
                 self.mergeLoc(expr.location, value.location),
                 .{
                     .binary_expr = .{
-                        .op = .eq, // Using eq as placeholder for assignment
+                        .op = .assign,
                         .left = expr,
                         .right = value,
                     },
@@ -1525,6 +1589,19 @@ pub const Parser = struct {
             );
         }
 
+        // Template string literal (treat as string for now)
+        // TODO: Parse interpolations ${...} properly
+        if (self.match(.template_string)) {
+            const text = self.previous.text;
+            // Remove backticks
+            const content = if (text.len >= 2) text[1 .. text.len - 1] else text;
+            return try self.arena.createNode(
+                .string_literal,
+                loc,
+                .{ .string_literal = content },
+            );
+        }
+
         // Boolean literals
         if (self.match(.keyword_true)) {
             return try self.arena.createNode(
@@ -1636,34 +1713,49 @@ pub const Parser = struct {
         defer properties.deinit();
 
         while (!self.check(.right_brace) and !self.check(.end_of_file)) {
-            // Property name
-            if (!self.check(.identifier) and !self.check(.string)) {
-                return self.reportError("Expected property name");
-            }
-
-            const key = if (self.check(.identifier))
-                try self.arena.createNode(.identifier, self.current.loc, .{ .identifier = self.current.text })
-            else
-                try self.arena.createNode(.string_literal, self.current.loc, .{ .string_literal = self.current.text });
-            self.advance();
-
-            // Shorthand { x } or full { x: value }
-            var value: *ast.Node = undefined;
-            var shorthand = false;
-
-            if (self.match(.colon)) {
-                value = try self.parseExpression();
+            // Check for spread: ...expr
+            if (self.match(.dot_dot_dot)) {
+                const spread_loc = self.previous.loc;
+                const argument = try self.parseExpression();
+                const spread_node = try self.arena.createNode(
+                    .spread_element,
+                    self.mergeLoc(spread_loc, self.previous.loc),
+                    .{ .spread_element = .{ .argument = argument } },
+                );
+                try properties.append(.{ .spread = spread_node });
             } else {
-                // Shorthand property
-                value = key;
-                shorthand = true;
-            }
+                // Regular property
+                // Property name
+                if (!self.check(.identifier) and !self.check(.string)) {
+                    return self.reportError("Expected property name");
+                }
 
-            try properties.append(.{
-                .key = key,
-                .value = value,
-                .shorthand = shorthand,
-            });
+                const key = if (self.check(.identifier))
+                    try self.arena.createNode(.identifier, self.current.loc, .{ .identifier = self.current.text })
+                else
+                    try self.arena.createNode(.string_literal, self.current.loc, .{ .string_literal = self.current.text });
+                self.advance();
+
+                // Shorthand { x } or full { x: value }
+                var value: *ast.Node = undefined;
+                var shorthand = false;
+
+                if (self.match(.colon)) {
+                    value = try self.parseExpression();
+                } else {
+                    // Shorthand property
+                    value = key;
+                    shorthand = true;
+                }
+
+                try properties.append(.{
+                    .property = .{
+                        .key = key,
+                        .value = value,
+                        .shorthand = shorthand,
+                    },
+                });
+            }
 
             if (!self.match(.comma)) break;
         }
@@ -1832,6 +1924,51 @@ pub const Parser = struct {
             return try self.arena.createType(.unknown, loc, .{ .unknown = {} });
         }
 
+        // Sized integer types
+        if (self.match(.keyword_int8)) {
+            return try self.arena.createType(.int8, loc, .{ .int8 = {} });
+        }
+        if (self.match(.keyword_int16)) {
+            return try self.arena.createType(.int16, loc, .{ .int16 = {} });
+        }
+        if (self.match(.keyword_int32)) {
+            return try self.arena.createType(.int32, loc, .{ .int32 = {} });
+        }
+        if (self.match(.keyword_int64)) {
+            return try self.arena.createType(.int64, loc, .{ .int64 = {} });
+        }
+        if (self.match(.keyword_uint8)) {
+            return try self.arena.createType(.uint8, loc, .{ .uint8 = {} });
+        }
+        if (self.match(.keyword_uint16)) {
+            return try self.arena.createType(.uint16, loc, .{ .uint16 = {} });
+        }
+        if (self.match(.keyword_uint32)) {
+            return try self.arena.createType(.uint32, loc, .{ .uint32 = {} });
+        }
+        if (self.match(.keyword_uint64)) {
+            return try self.arena.createType(.uint64, loc, .{ .uint64 = {} });
+        }
+
+        // Sized floating-point types
+        if (self.match(.keyword_float32)) {
+            return try self.arena.createType(.float32, loc, .{ .float32 = {} });
+        }
+        if (self.match(.keyword_float64)) {
+            return try self.arena.createType(.float64, loc, .{ .float64 = {} });
+        }
+
+        // Type aliases (map to base types)
+        if (self.match(.keyword_int)) {
+            return try self.arena.createType(.int32, loc, .{ .int32 = {} });
+        }
+        if (self.match(.keyword_float)) {
+            return try self.arena.createType(.float32, loc, .{ .float32 = {} });
+        }
+        if (self.match(.keyword_double)) {
+            return try self.arena.createType(.float64, loc, .{ .float64 = {} });
+        }
+
         // Return a placeholder type for now
         const placeholder_ref = try self.arena.allocator().create(ast.types.TypeReference);
         placeholder_ref.* = .{
@@ -1942,11 +2079,42 @@ pub const Parser = struct {
     }
 
     fn checkMacro(self: *Parser) bool {
-        return self.current.kind == .at_sign or
-            self.current.kind == .at_derive or
-            self.current.kind == .at_comptime or
-            self.current.kind == .at_serialize or
-            self.current.kind == .at_ffi;
+        // All macros now start with @ sign
+        return self.current.kind == .at_sign;
+    }
+
+    /// Peek at the next token and check if it's an identifier with the given name
+    /// We do this by temporarily advancing the lexer and then backing up
+    fn peekNextIsIdentifier(self: *Parser, name: []const u8) bool {
+        // Save lexer state
+        const saved_current = self.lexer.current;
+        const saved_start = self.lexer.start;
+        const saved_line = self.lexer.line;
+        const saved_column = self.lexer.column;
+        const saved_start_column = self.lexer.start_column;
+        const saved_start_line = self.lexer.start_line;
+
+        // Peek the next token
+        const next_tok = self.lexer.next() catch {
+            // Restore on error
+            self.lexer.current = saved_current;
+            self.lexer.start = saved_start;
+            self.lexer.line = saved_line;
+            self.lexer.column = saved_column;
+            self.lexer.start_column = saved_start_column;
+            self.lexer.start_line = saved_start_line;
+            return false;
+        };
+
+        // Restore lexer state
+        self.lexer.current = saved_current;
+        self.lexer.start = saved_start;
+        self.lexer.line = saved_line;
+        self.lexer.column = saved_column;
+        self.lexer.start_column = saved_start_column;
+        self.lexer.start_line = saved_start_line;
+
+        return next_tok.kind == .identifier and std.mem.eql(u8, next_tok.text, name);
     }
 
     fn match(self: *Parser, kind: TokenKind) bool {
@@ -1979,8 +2147,7 @@ pub const Parser = struct {
         self.panic_mode = false;
 
         while (!self.check(.end_of_file)) {
-            if (self.previous.kind == .semicolon) return;
-
+            // Check if current token starts a new statement
             switch (self.current.kind) {
                 .keyword_class,
                 .keyword_function,
@@ -1996,11 +2163,19 @@ pub const Parser = struct {
                 .keyword_interface,
                 .keyword_type,
                 .keyword_enum,
-                .at_derive,
-                .at_comptime,
+                .at_sign, // All macros start with @
                 => return,
-                else => self.advance(),
+                // Skip closing braces - we've gone past the error
+                .right_brace => {
+                    self.advance();
+                    return;
+                },
+                else => {},
             }
+
+            // Advance and check if we just passed a semicolon
+            self.advance();
+            if (self.previous.kind == .semicolon) return;
         }
     }
 

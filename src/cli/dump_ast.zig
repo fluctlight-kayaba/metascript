@@ -69,6 +69,17 @@ fn printNode(node: *const ast.Node, indent: usize, index: usize) void {
         .class_decl => {
             const class = &node.data.class_decl;
             std.debug.print("ClassDecl: {s}", .{class.name});
+            if (class.decorators.len > 0) {
+                std.debug.print(" [", .{});
+                for (class.decorators, 0..) |dec, di| {
+                    if (di > 0) std.debug.print(", ", .{});
+                    std.debug.print("@{s}", .{dec.name});
+                    if (dec.arguments.len > 0) {
+                        std.debug.print("({} args)", .{dec.arguments.len});
+                    }
+                }
+                std.debug.print("]", .{});
+            }
             if (class.extends) |_| std.debug.print(" extends ...", .{});
             if (class.implements.len > 0) std.debug.print(" implements {} types", .{class.implements.len});
             std.debug.print(" ({} members)\n", .{class.members.len});
@@ -196,6 +207,13 @@ fn printNode(node: *const ast.Node, indent: usize, index: usize) void {
         .identifier => std.debug.print("Identifier: {s}\n", .{node.data.identifier}),
 
         // Macros
+        .macro_decl => {
+            const macro = &node.data.macro_decl;
+            std.debug.print("MacroDecl: @macro function {s}({} params)\n", .{ macro.name, macro.params.len });
+            printIndent(indent + 1);
+            std.debug.print("body:\n", .{});
+            printNode(macro.body, indent + 2, 0);
+        },
         .macro_invocation => {
             const macro = &node.data.macro_invocation;
             std.debug.print("MacroInvocation: @{s}({} args)\n", .{ macro.name, macro.arguments.len });

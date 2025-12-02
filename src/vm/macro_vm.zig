@@ -19,11 +19,15 @@ const ast = @import("../ast/ast.zig");
 const ast_api = @import("ast_api.zig");
 const c_api = @import("c_api.zig");
 const c = c_api.c;
+const bytecode_compiler = @import("bytecode_compiler.zig");
+const disk_cache = @import("../transam/disk_cache.zig");
 
 pub const MacroVM = struct {
     allocator: std.mem.Allocator,
     runtime: *c.MSHermesRuntime,
     ast_ctx: *ast_api.ASTContext,
+    /// Optional bytecode cache for faster execution
+    bytecode_cache: ?*disk_cache.BytecodeCache = null,
 
     /// Built-in macro implementations (TypeScript source)
     const BUILTIN_MACROS = struct {
@@ -67,9 +71,12 @@ pub const MacroVM = struct {
             \\    const returnStmt = ast.createReturnStmt(expr);
             \\    const body = ast.createBlock([returnStmt]);
             \\
-            \\    // Create: equals(other: ClassName): boolean { ... }
-            \\    const method = ast.createMethod("equals", body);
-            \\    console.log("[derive(Eq)] Created method: equals()");
+            \\    // Create param: other
+            \\    const otherParam = ast.createParam("other");
+            \\
+            \\    // Create: equals(other): boolean { ... }
+            \\    const method = ast.createMethod("equals", body, [otherParam]);
+            \\    console.log("[derive(Eq)] Created method: equals(other)");
             \\
             \\    target.addMethod(method);
             \\    console.log("[derive(Eq)] Added method to class");
@@ -89,6 +96,15 @@ pub const MacroVM = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, arena: *ast.ASTArena) !MacroVM {
+        return initWithCache(allocator, arena, null);
+    }
+
+    /// Initialize with optional bytecode cache for faster macro execution
+    pub fn initWithCache(
+        allocator: std.mem.Allocator,
+        arena: *ast.ASTArena,
+        cache: ?*disk_cache.BytecodeCache,
+    ) !MacroVM {
         // Create Hermes runtime
         const runtime = c.ms_hermes_create() orelse {
             return error.HermesInitFailed;
@@ -120,6 +136,7 @@ pub const MacroVM = struct {
             .allocator = allocator,
             .runtime = runtime,
             .ast_ctx = ast_ctx,
+            .bytecode_cache = cache,
         };
     }
 
@@ -163,7 +180,72 @@ pub const MacroVM = struct {
             return;
         };
 
-        // Execute the macro code
+        // Compute source hash for cache key
+        const source_hash = disk_cache.hashMacroSource(trait, source);
+
+        // Try bytecode execution (fast path: ~0.2ms vs ~45ms for source)
+        if (self.bytecode_cache) |cache| {
+            if (cache.getBytecode(source_hash)) |bytecode| {
+                // PE4 FIX: bytecode is now owned, must free after use
+                defer self.allocator.free(bytecode);
+                std.log.debug("[MacroVM] Using cached bytecode for @derive({s})", .{trait});
+                try self.executeBytecodeDirect(bytecode);
+                return;
+            }
+
+            // Cache miss: compile source to bytecode
+            if (bytecode_compiler.isHermescAvailable()) {
+                const bytecode = bytecode_compiler.compileToBytescode(
+                    self.allocator,
+                    source,
+                    trait,
+                ) catch |err| {
+                    std.log.debug("[MacroVM] Bytecode compilation failed: {}, using source", .{err});
+                    try self.executeSourceDirect(source);
+                    return;
+                };
+                defer self.allocator.free(bytecode);
+
+                // Store in cache for next time
+                cache.storeBytecode(source_hash, bytecode) catch |err| {
+                    std.log.debug("[MacroVM] Failed to cache bytecode: {}", .{err});
+                };
+
+                std.log.debug("[MacroVM] Compiled and cached bytecode for @derive({s})", .{trait});
+                try self.executeBytecodeDirect(bytecode);
+                return;
+            }
+        }
+
+        // Fallback: execute source directly
+        try self.executeSourceDirect(source);
+    }
+
+    /// Execute bytecode directly (internal helper)
+    fn executeBytecodeDirect(self: *MacroVM, bytecode: []const u8) !void {
+        const result = c.ms_hermes_eval_bytecode(
+            self.runtime,
+            bytecode.ptr,
+            bytecode.len,
+            "macro.hbc",
+        );
+
+        if (c.ms_hermes_has_exception(self.runtime)) {
+            const msg = c.ms_hermes_get_exception(self.runtime);
+            if (msg) |m| {
+                std.log.err("Macro bytecode error: {s}", .{std.mem.span(m)});
+            }
+            c.ms_hermes_clear_exception(self.runtime);
+            return error.MacroExecutionFailed;
+        }
+
+        if (result) |r| {
+            c.ms_value_destroy(r);
+        }
+    }
+
+    /// Execute source directly (internal helper)
+    fn executeSourceDirect(self: *MacroVM, source: []const u8) !void {
         const result = c.ms_hermes_eval(
             self.runtime,
             source.ptr,
@@ -202,6 +284,48 @@ pub const MacroVM = struct {
             const msg = c.ms_hermes_get_exception(self.runtime);
             if (msg) |m| {
                 std.log.err("Macro error: {s}", .{std.mem.span(m)});
+            }
+            c.ms_hermes_clear_exception(self.runtime);
+            return error.MacroExecutionFailed;
+        }
+
+        if (result) |r| {
+            c.ms_value_destroy(r);
+        }
+    }
+
+    /// Execute a source-defined macro (transpiled from @macro function)
+    ///
+    /// The macro_fn should be a JavaScript function like:
+    ///   (function myMacro(target) { ... })
+    ///
+    /// This wraps it in an IIFE that passes the target object.
+    pub fn executeSourceMacro(self: *MacroVM, macro_fn: []const u8, target: *ast.Node) !void {
+        self.ast_ctx.current_node = target;
+        defer self.ast_ctx.current_node = null;
+
+        // Build wrapper: macro_fn(target)
+        // The macro_fn is like (function name(target) {...})
+        // We call it with the global 'target' object
+        var full_code = std.ArrayList(u8).init(self.allocator);
+        defer full_code.deinit();
+
+        try full_code.appendSlice(macro_fn);
+        try full_code.appendSlice("(target);");
+
+        std.log.debug("[VM] Executing source macro:\n{s}", .{full_code.items});
+
+        const result = c.ms_hermes_eval(
+            self.runtime,
+            full_code.items.ptr,
+            full_code.items.len,
+            "source_macro.js",
+        );
+
+        if (c.ms_hermes_has_exception(self.runtime)) {
+            const msg = c.ms_hermes_get_exception(self.runtime);
+            if (msg) |m| {
+                std.log.err("Source macro error: {s}", .{std.mem.span(m)});
             }
             c.ms_hermes_clear_exception(self.runtime);
             return error.MacroExecutionFailed;

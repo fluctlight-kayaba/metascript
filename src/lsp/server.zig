@@ -10,6 +10,14 @@ const lexer_mod = @import("../lexer/lexer.zig");
 const token_mod = @import("../lexer/token.zig");
 const ast_loc = @import("../ast/location.zig");
 
+// Trans-Am query engine for incremental computation
+const transam = @import("../transam/transam.zig");
+
+// Type checker for symbol lookup
+const checker = @import("../checker/typechecker.zig");
+const symbol_mod = @import("../checker/symbol.zig");
+const types_mod = @import("../ast/types.zig");
+
 // ============================================================================
 // LSP Types - Structured JSON serialization
 // ============================================================================
@@ -239,6 +247,8 @@ fn tokenKindToSemanticType(kind: token_mod.TokenKind) ?SemanticTokenType {
         .keyword_of,
         .keyword_is,
         .keyword_keyof,
+        .keyword_defer,    // Metascript: defer cleanup
+        .keyword_distinct, // Metascript: distinct types
         => .keyword,
 
         // Type-related keywords
@@ -247,6 +257,22 @@ fn tokenKindToSemanticType(kind: token_mod.TokenKind) ?SemanticTokenType {
         .keyword_enum => .@"enum",
         .keyword_type => .type,
         .keyword_namespace => .namespace,
+
+        // Sized type keywords
+        .keyword_int8,
+        .keyword_int16,
+        .keyword_int32,
+        .keyword_int64,
+        .keyword_uint8,
+        .keyword_uint16,
+        .keyword_uint32,
+        .keyword_uint64,
+        .keyword_float32,
+        .keyword_float64,
+        .keyword_int,
+        .keyword_float,
+        .keyword_double,
+        => .type,
 
         // Function-related
         .keyword_function => .function,
@@ -293,13 +319,8 @@ fn tokenKindToSemanticType(kind: token_mod.TokenKind) ?SemanticTokenType {
         .string, .template_string => .string,
         .regex => .regexp,
 
-        // Macros
-        .at_sign,
-        .at_derive,
-        .at_comptime,
-        .at_serialize,
-        .at_ffi,
-        => .macro,
+        // Macros - only @ sign now, macro name is separate identifier
+        .at_sign => .macro,
 
         // Operators
         .plus,
@@ -366,16 +387,8 @@ fn tokenKindToSemanticType(kind: token_mod.TokenKind) ?SemanticTokenType {
 fn getHoverContent(kind: token_mod.TokenKind, text: []const u8) ?[]const u8 {
     _ = text;
     return switch (kind) {
-        // Macros - provide detailed descriptions
-        .at_derive => "**@derive** - Compile-time macro\n\nAutomatically generates trait implementations.\n\n```typescript\n@derive(Eq, Hash, Serialize)\nclass User { name: string; }\n```\n\nGenerates `equals()`, `hashCode()`, and serialization methods.",
-
-        .at_comptime => "**@comptime** - Compile-time execution\n\nExecutes code at compile time for metaprogramming.\n\n```typescript\nconst config = @comptime loadConfig();\n```",
-
-        .at_serialize => "**@serialize** - Serialization macro\n\nGenerates JSON/binary serialization code.\n\n```typescript\n@serialize\nclass Message { data: string; }\n```",
-
-        .at_ffi => "**@ffi** - Foreign Function Interface\n\nBinds to native C libraries.\n\n```typescript\nconst libc = @ffi bindC('./libc.h');\n```",
-
-        .at_sign => "**@** - Macro prefix\n\nUsed to invoke compile-time macros.",
+        // @ sign - macro prefix (actual macro name is in following identifier)
+        .at_sign => "**@** - Macro prefix\n\nUsed to invoke compile-time macros from `std/macros/*.ms`.\n\nCommon macros: `@derive`, `@comptime`, `@serialize`, `@ffi`",
 
         // Keywords with descriptions
         .keyword_class => "**class** - Class declaration\n\nDefines a class with properties and methods.",
@@ -440,6 +453,407 @@ fn getHoverContent(kind: token_mod.TokenKind, text: []const u8) ?[]const u8 {
 }
 
 // ============================================================================
+// Type Formatting for Hover
+// ============================================================================
+
+/// Format a type for hover display
+fn formatType(allocator: std.mem.Allocator, typ: ?*types_mod.Type) ![]const u8 {
+    if (typ == null) return try allocator.dupe(u8, "unknown");
+
+    const t = typ.?;
+    return switch (t.kind) {
+        .number => try allocator.dupe(u8, "number"),
+        .string => try allocator.dupe(u8, "string"),
+        .boolean => try allocator.dupe(u8, "boolean"),
+        .void => try allocator.dupe(u8, "void"),
+        .unknown => try allocator.dupe(u8, "unknown"),
+        .never => try allocator.dupe(u8, "never"),
+        .int8 => try allocator.dupe(u8, "int8"),
+        .int16 => try allocator.dupe(u8, "int16"),
+        .int32 => try allocator.dupe(u8, "int32"),
+        .int64 => try allocator.dupe(u8, "int64"),
+        .uint8 => try allocator.dupe(u8, "uint8"),
+        .uint16 => try allocator.dupe(u8, "uint16"),
+        .uint32 => try allocator.dupe(u8, "uint32"),
+        .uint64 => try allocator.dupe(u8, "uint64"),
+        .float32 => try allocator.dupe(u8, "float32"),
+        .float64 => try allocator.dupe(u8, "float64"),
+        .ref => blk: {
+            const inner_type = try formatType(allocator, t.data.ref);
+            defer allocator.free(inner_type);
+            break :blk try std.fmt.allocPrint(allocator, "ref {s}", .{inner_type});
+        },
+        .lent => blk: {
+            const inner_type = try formatType(allocator, t.data.lent);
+            defer allocator.free(inner_type);
+            break :blk try std.fmt.allocPrint(allocator, "lent {s}", .{inner_type});
+        },
+        .array => blk: {
+            const elem_type = try formatType(allocator, t.data.array);
+            defer allocator.free(elem_type);
+            break :blk try std.fmt.allocPrint(allocator, "{s}[]", .{elem_type});
+        },
+        .function => blk: {
+            const func = t.data.function;
+            var params_buf = std.ArrayList(u8).init(allocator);
+            defer params_buf.deinit();
+
+            for (func.params, 0..) |param, i| {
+                if (i > 0) try params_buf.appendSlice(", ");
+                try params_buf.appendSlice(param.name);
+                try params_buf.appendSlice(": ");
+                const param_type = try formatType(allocator, param.type);
+                defer allocator.free(param_type);
+                try params_buf.appendSlice(param_type);
+            }
+
+            const ret_type = try formatType(allocator, func.return_type);
+            defer allocator.free(ret_type);
+
+            break :blk try std.fmt.allocPrint(allocator, "({s}) => {s}", .{ params_buf.items, ret_type });
+        },
+        .type_reference => blk: {
+            const ref = t.data.type_reference;
+            if (ref.type_args.len == 0) {
+                break :blk try allocator.dupe(u8, ref.name);
+            }
+            // Format generic type args
+            var args_buf = std.ArrayList(u8).init(allocator);
+            defer args_buf.deinit();
+            try args_buf.appendSlice(ref.name);
+            try args_buf.append('<');
+            for (ref.type_args, 0..) |arg, i| {
+                if (i > 0) try args_buf.appendSlice(", ");
+                const arg_type = try formatType(allocator, arg);
+                defer allocator.free(arg_type);
+                try args_buf.appendSlice(arg_type);
+            }
+            try args_buf.append('>');
+            break :blk try args_buf.toOwnedSlice();
+        },
+        .@"union" => blk: {
+            const u = t.data.@"union";
+            var buf = std.ArrayList(u8).init(allocator);
+            defer buf.deinit();
+            for (u.types, 0..) |member, i| {
+                if (i > 0) try buf.appendSlice(" | ");
+                const member_type = try formatType(allocator, member);
+                defer allocator.free(member_type);
+                try buf.appendSlice(member_type);
+            }
+            break :blk try buf.toOwnedSlice();
+        },
+        .object => try allocator.dupe(u8, "object"),
+        .tuple => try allocator.dupe(u8, "tuple"),
+        .generic_param => blk: {
+            break :blk try allocator.dupe(u8, t.data.generic_param.name);
+        },
+        .generic_instance => try allocator.dupe(u8, "generic"),
+        .intersection => try allocator.dupe(u8, "intersection"),
+    };
+}
+
+/// Format a symbol for hover display (returns allocated markdown string)
+fn formatSymbolHover(allocator: std.mem.Allocator, symbol: symbol_mod.Symbol) ![]const u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+
+    // Format based on symbol kind
+    switch (symbol.kind) {
+        .variable => {
+            const modifier = if (symbol.mutable) "let" else "const";
+            const type_str = try formatType(allocator, symbol.type);
+            defer allocator.free(type_str);
+            try buf.writer().print("```typescript\n{s} {s}: {s}\n```", .{ modifier, symbol.name, type_str });
+        },
+        .function => {
+            if (symbol.type) |t| {
+                if (t.kind == .function) {
+                    const func = t.data.function;
+                    try buf.appendSlice("```typescript\nfunction ");
+                    try buf.appendSlice(symbol.name);
+                    try buf.append('(');
+                    for (func.params, 0..) |param, i| {
+                        if (i > 0) try buf.appendSlice(", ");
+                        try buf.appendSlice(param.name);
+                        try buf.appendSlice(": ");
+                        const param_type = try formatType(allocator, param.type);
+                        defer allocator.free(param_type);
+                        try buf.appendSlice(param_type);
+                    }
+                    try buf.appendSlice("): ");
+                    const ret_type = try formatType(allocator, func.return_type);
+                    defer allocator.free(ret_type);
+                    try buf.appendSlice(ret_type);
+                    try buf.appendSlice("\n```");
+                } else {
+                    try buf.writer().print("```typescript\nfunction {s}\n```", .{symbol.name});
+                }
+            } else {
+                try buf.writer().print("```typescript\nfunction {s}\n```", .{symbol.name});
+            }
+        },
+        .class => {
+            try buf.writer().print("```typescript\nclass {s}\n```", .{symbol.name});
+        },
+        .interface => {
+            try buf.writer().print("```typescript\ninterface {s}\n```", .{symbol.name});
+        },
+        .type_alias => {
+            const type_str = try formatType(allocator, symbol.type);
+            defer allocator.free(type_str);
+            try buf.writer().print("```typescript\ntype {s} = {s}\n```", .{ symbol.name, type_str });
+        },
+        .parameter => {
+            const type_str = try formatType(allocator, symbol.type);
+            defer allocator.free(type_str);
+            try buf.writer().print("```typescript\n(parameter) {s}: {s}\n```", .{ symbol.name, type_str });
+        },
+        .property => {
+            const type_str = try formatType(allocator, symbol.type);
+            defer allocator.free(type_str);
+            const readonly = if (!symbol.mutable) "readonly " else "";
+            try buf.writer().print("```typescript\n{s}(property) {s}: {s}\n```", .{ readonly, symbol.name, type_str });
+        },
+        .method => {
+            if (symbol.type) |t| {
+                if (t.kind == .function) {
+                    const func = t.data.function;
+                    try buf.appendSlice("```typescript\n(method) ");
+                    try buf.appendSlice(symbol.name);
+                    try buf.append('(');
+                    for (func.params, 0..) |param, i| {
+                        if (i > 0) try buf.appendSlice(", ");
+                        try buf.appendSlice(param.name);
+                        try buf.appendSlice(": ");
+                        const param_type = try formatType(allocator, param.type);
+                        defer allocator.free(param_type);
+                        try buf.appendSlice(param_type);
+                    }
+                    try buf.appendSlice("): ");
+                    const ret_type = try formatType(allocator, func.return_type);
+                    defer allocator.free(ret_type);
+                    try buf.appendSlice(ret_type);
+                    try buf.appendSlice("\n```");
+                } else {
+                    try buf.writer().print("```typescript\n(method) {s}\n```", .{symbol.name});
+                }
+            } else {
+                try buf.writer().print("```typescript\n(method) {s}\n```", .{symbol.name});
+            }
+        },
+    }
+
+    return buf.toOwnedSlice();
+}
+
+/// Format generated AST nodes for macro expansion preview
+fn formatMacroExpansion(allocator: std.mem.Allocator, nodes: []*ast.Node, macro_name: []const u8, arguments: []const []const u8) ![]const u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+
+    const writer = buf.writer();
+
+    // Header with macro info
+    try writer.print("**@{s}(", .{macro_name});
+    for (arguments, 0..) |arg, i| {
+        if (i > 0) try writer.writeAll(", ");
+        try writer.writeAll(arg);
+    }
+    try writer.writeAll(")** - Macro expansion preview\n\n");
+
+    if (nodes.len == 0) {
+        try writer.writeAll("*No code generated*");
+        return buf.toOwnedSlice();
+    }
+
+    try writer.writeAll("```typescript\n");
+    try writer.writeAll("// Generated methods:\n");
+
+    for (nodes) |node| {
+        try formatAstNode(writer, node);
+        try writer.writeAll("\n");
+    }
+
+    try writer.writeAll("```");
+    return buf.toOwnedSlice();
+}
+
+/// Format a single AST node as code
+fn formatAstNode(writer: anytype, node: *ast.Node) !void {
+    switch (node.kind) {
+        .function_decl => {
+            const func = node.data.function_decl;
+            try writer.print("{s}(", .{func.name});
+
+            // Format parameters
+            for (func.params, 0..) |param, i| {
+                if (i > 0) try writer.writeAll(", ");
+                try writer.writeAll(param.name);
+                if (param.type) |param_type| {
+                    try writer.writeAll(": ");
+                    try formatTypePtr(writer, param_type);
+                }
+            }
+
+            try writer.writeAll(")");
+
+            // Return type
+            if (func.return_type) |ret_type| {
+                try writer.writeAll(": ");
+                try formatTypePtr(writer, ret_type);
+            }
+
+            try writer.writeAll(" { ... }");
+        },
+        .method_decl => {
+            const method = node.data.method_decl;
+            try writer.print("{s}(", .{method.name});
+
+            for (method.params, 0..) |param, i| {
+                if (i > 0) try writer.writeAll(", ");
+                try writer.writeAll(param.name);
+                if (param.type) |param_type| {
+                    try writer.writeAll(": ");
+                    try formatTypePtr(writer, param_type);
+                }
+            }
+
+            try writer.writeAll(")");
+
+            if (method.return_type) |ret_type| {
+                try writer.writeAll(": ");
+                try formatTypePtr(writer, ret_type);
+            }
+
+            // Format actual body if present
+            if (method.body) |body| {
+                try writer.writeAll(" {\n");
+                try formatMethodBody(writer, body, 1);
+                try writer.writeAll("}");
+            } else {
+                try writer.writeAll(" { }");
+            }
+        },
+        .property_decl => {
+            const prop = node.data.property_decl;
+            if (prop.readonly) try writer.writeAll("readonly ");
+            try writer.print("{s}", .{prop.name});
+            if (prop.type) |prop_type| {
+                try writer.writeAll(": ");
+                try formatTypePtr(writer, prop_type);
+            }
+            try writer.writeAll(";");
+        },
+        else => {
+            try writer.writeAll("// (generated code)");
+        },
+    }
+}
+
+/// Format method body (block statement) recursively
+fn formatMethodBody(writer: anytype, body: *ast.Node, indent: usize) !void {
+    if (body.kind != .block_stmt) {
+        try formatExpr(writer, body);
+        return;
+    }
+
+    const block = body.data.block_stmt;
+    for (block.statements) |stmt| {
+        // Write indent
+        for (0..indent) |_| {
+            try writer.writeAll("  ");
+        }
+        try formatStatement(writer, stmt, indent);
+        try writer.writeAll("\n");
+    }
+}
+
+/// Format a statement
+fn formatStatement(writer: anytype, stmt: *ast.Node, indent: usize) !void {
+    _ = indent;
+    switch (stmt.kind) {
+        .return_stmt => {
+            try writer.writeAll("return ");
+            if (stmt.data.return_stmt.argument) |arg| {
+                try formatExpr(writer, arg);
+            }
+            try writer.writeAll(";");
+        },
+        else => {
+            try formatExpr(writer, stmt);
+            try writer.writeAll(";");
+        },
+    }
+}
+
+/// Format an expression
+fn formatExpr(writer: anytype, expr: *ast.Node) !void {
+    switch (expr.kind) {
+        .identifier => {
+            try writer.writeAll(expr.data.identifier);
+        },
+        .binary_expr => {
+            const bin = expr.data.binary_expr;
+            try formatExpr(writer, bin.left);
+            const op_str = switch (bin.op) {
+                .eq => " === ",
+                .@"and" => " && ",
+                .@"or" => " || ",
+                .add => " + ",
+                .sub => " - ",
+                .mul => " * ",
+                .div => " / ",
+                else => " ? ",
+            };
+            try writer.writeAll(op_str);
+            try formatExpr(writer, bin.right);
+        },
+        .member_expr => {
+            const mem = expr.data.member_expr;
+            try formatExpr(writer, mem.object);
+            try writer.writeAll(".");
+            try formatExpr(writer, mem.property);
+        },
+        else => {
+            try writer.writeAll("...");
+        },
+    }
+}
+
+/// Format a types.Type pointer as code
+fn formatTypePtr(writer: anytype, typ: *types_mod.Type) !void {
+    switch (typ.kind) {
+        .number => try writer.writeAll("number"),
+        .string => try writer.writeAll("string"),
+        .boolean => try writer.writeAll("boolean"),
+        .void => try writer.writeAll("void"),
+        .unknown => try writer.writeAll("unknown"),
+        .never => try writer.writeAll("never"),
+        .array => {
+            try formatTypePtr(writer, typ.data.array);
+            try writer.writeAll("[]");
+        },
+        .type_reference => {
+            const ref = typ.data.type_reference;
+            try writer.writeAll(ref.name);
+            if (ref.type_args.len > 0) {
+                try writer.writeAll("<");
+                for (ref.type_args, 0..) |arg, i| {
+                    if (i > 0) try writer.writeAll(", ");
+                    try formatTypePtr(writer, arg);
+                }
+                try writer.writeAll(">");
+            }
+        },
+        else => try writer.writeAll("any"),
+    }
+}
+
+// Import AST for formatting
+const ast = @import("../ast/ast.zig");
+
+// ============================================================================
 // Server
 // ============================================================================
 
@@ -449,14 +863,28 @@ pub const Server = struct {
     shutdown_requested: bool = false,
     documents: file_store.FileStore,
 
+    // Trans-Am query engine for incremental computation
+    transam_db: ?transam.TransAmDatabase = null,
+
     pub fn init(allocator: std.mem.Allocator) Server {
         return .{
             .allocator = allocator,
             .documents = file_store.FileStore.init(allocator),
+            .transam_db = null,
         };
     }
 
+    /// Initialize Trans-Am database (called after LSP initialize)
+    pub fn initTransAm(self: *Server) !void {
+        if (self.transam_db == null) {
+            self.transam_db = try transam.TransAmDatabase.init(self.allocator);
+        }
+    }
+
     pub fn deinit(self: *Server) void {
+        if (self.transam_db) |*db| {
+            db.deinit();
+        }
         self.documents.deinit();
     }
 
@@ -596,7 +1024,11 @@ pub const Server = struct {
     ) !void {
         if (std.mem.eql(u8, method, "initialized")) {
             self.initialized = true;
-            try stderr.writeAll("[mls] Client initialized\n");
+            // Initialize Trans-Am query engine
+            self.initTransAm() catch |err| {
+                try stderr.print("[mls] Warning: Failed to init Trans-Am: {}\n", .{err});
+            };
+            try stderr.writeAll("[mls] Client initialized (Trans-Am ready)\n");
         } else if (std.mem.eql(u8, method, "exit")) {
             try stderr.writeAll("[mls] Exit notification received\n");
             const exit_code: u8 = if (self.shutdown_requested) 0 else 1;
@@ -682,6 +1114,14 @@ pub const Server = struct {
             @intCast(version.integer),
         );
 
+        // Feed into Trans-Am for incremental computation
+        if (self.transam_db) |*db| {
+            const changed = db.setFileText(uri.string, text.string) catch false;
+            if (changed) {
+                try stderr.print("[mls] Trans-Am: file registered (revision {d})\n", .{db.getRevision().value});
+            }
+        }
+
         try stderr.print("[mls] Opened: {s} (version {d}, {d} bytes)\n", .{
             uri.string,
             version.integer,
@@ -737,6 +1177,17 @@ pub const Server = struct {
         }
 
         const content_len = if (entry.text) |t| t.len else 0;
+
+        // Feed updated content into Trans-Am for incremental recomputation
+        if (self.transam_db) |*db| {
+            if (entry.text) |current_text| {
+                const changed = db.setFileText(uri.string, current_text) catch false;
+                if (changed) {
+                    try stderr.print("[mls] Trans-Am: revision {d}\n", .{db.getRevision().value});
+                }
+            }
+        }
+
         try stderr.print("[mls] Changed: {s} (now {d} bytes)\n", .{
             uri.string,
             content_len,
@@ -770,6 +1221,8 @@ pub const Server = struct {
         stdout: anytype,
         stderr: anytype,
     ) !void {
+        const start_time = std.time.milliTimestamp();
+
         const params = msg.get("params") orelse {
             try self.sendResponse(Response.nullResult(id), stdout, stderr);
             return;
@@ -825,15 +1278,243 @@ pub const Server = struct {
         }
 
         if (found_token) |tok| {
+            // Check for user-defined macro: @ sign followed by identifier
+            // Re-lex to find if we're on @macroName pattern
+            var is_user_macro = false;
+            var macro_name: ?[]const u8 = null;
+
+            if (tok.kind == .at_sign or tok.kind == .identifier) {
+                var lexer2 = lexer_mod.Lexer.init(self.allocator, text, 1) catch {
+                    try self.sendResponse(Response.nullResult(id), stdout, stderr);
+                    return;
+                };
+                defer lexer2.deinit();
+
+                var prev_tok2: ?token_mod.Token = null;
+                while (true) {
+                    const tok2 = lexer2.next() catch break;
+                    if (tok2.kind == .end_of_file) break;
+
+                    if (tok2.kind == .identifier and prev_tok2 != null and prev_tok2.?.kind == .at_sign) {
+                        // Check if either @ or identifier is at our position
+                        const at_line = if (prev_tok2.?.loc.start.line > 0) prev_tok2.?.loc.start.line - 1 else 0;
+                        const id_line = if (tok2.loc.start.line > 0) tok2.loc.start.line - 1 else 0;
+
+                        if ((at_line == line and character >= prev_tok2.?.loc.start.column and character < prev_tok2.?.loc.end.column) or
+                            (id_line == line and character >= tok2.loc.start.column and character < tok2.loc.end.column))
+                        {
+                            is_user_macro = true;
+                            macro_name = tok2.text;
+                            break;
+                        }
+                    }
+                    prev_tok2 = tok2;
+                }
+            }
+
+            // If it's a user-defined macro, try to expand and show preview
+            if (is_user_macro and macro_name != null) {
+                // Try Trans-Am macro expansion first
+                if (self.transam_db) |*db| {
+                    const expansion_hover = self.getMacroExpansionHover(db, uri.string, macro_name.?, line) catch null;
+                    if (expansion_hover) |content| {
+                        defer self.allocator.free(content);
+                        const elapsed_ms = std.time.milliTimestamp() - start_time;
+                        try stderr.print("[mls] Hover: macro expansion '{s}' ({d}ms)\n", .{ macro_name.?, elapsed_ms });
+                        try self.sendHoverResponse(id, content, tok, stdout, stderr);
+                        return;
+                    }
+                }
+                // Fallback to docs from source file
+                if (try self.getMacroHoverDocs(macro_name.?)) |docs| {
+                    const elapsed_ms = std.time.milliTimestamp() - start_time;
+                    try stderr.print("[mls] Hover: macro '{s}' ({d}ms)\n", .{ macro_name.?, elapsed_ms });
+                    try self.sendHoverResponse(id, docs, tok, stdout, stderr);
+                    self.allocator.free(docs);
+                    return;
+                }
+            }
+
+            // All macros are now @ + identifier, handled above via is_user_macro path
+
             const hover_content = getHoverContent(tok.kind, tok.text);
             if (hover_content) |content| {
+                const elapsed_ms = std.time.milliTimestamp() - start_time;
+                try stderr.print("[mls] Hover: '{s}' ({d}ms)\n", .{ tok.text, elapsed_ms });
                 try self.sendHoverResponse(id, content, tok, stdout, stderr);
                 return;
+            }
+
+            // For identifiers, try to look up type information via Trans-Am
+            if (tok.kind == .identifier) {
+                if (self.transam_db) |*db| {
+                    // Look up the symbol in the type checker's symbol table
+                    const symbol_result = db.lookupSymbol(uri.string, tok.text) catch null;
+                    if (symbol_result) |symbol| {
+                        const hover_text = formatSymbolHover(self.allocator, symbol) catch null;
+                        if (hover_text) |content| {
+                            defer self.allocator.free(content);
+                            const elapsed_ms = std.time.milliTimestamp() - start_time;
+                            try stderr.print("[mls] Hover: type info for '{s}' ({d}ms)\n", .{ tok.text, elapsed_ms });
+                            try self.sendHoverResponse(id, content, tok, stdout, stderr);
+                            return;
+                        }
+                    }
+                }
             }
         }
 
         // No hover info available
+        const elapsed_ms = std.time.milliTimestamp() - start_time;
+        try stderr.print("[mls] Hover: no info at {d}:{d} ({d}ms)\n", .{ line, character, elapsed_ms });
         try self.sendResponse(Response.nullResult(id), stdout, stderr);
+    }
+
+    /// Get hover documentation for a macro from its source file
+    fn getMacroHoverDocs(self: *Server, macro_name: []const u8) !?[]const u8 {
+        // Map macro names to potential source files
+        var target_file: ?[]const u8 = null;
+
+        if (std.mem.startsWith(u8, macro_name, "derive")) {
+            target_file = "std/macros/derive.ms";
+        }
+
+        if (target_file) |file_path| {
+            if (std.fs.cwd().access(file_path, .{})) |_| {
+                const file = std.fs.cwd().openFile(file_path, .{}) catch return null;
+                defer file.close();
+
+                const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch return null;
+                defer self.allocator.free(content);
+
+                // Search for the macro definition and preceding comments
+                const search_pattern = try std.fmt.allocPrint(
+                    self.allocator,
+                    "@macro function {s}",
+                    .{macro_name},
+                );
+                defer self.allocator.free(search_pattern);
+
+                if (std.mem.indexOf(u8, content, search_pattern)) |def_pos| {
+                    // Look backwards for comments
+                    var comment_start: usize = def_pos;
+                    var i = def_pos;
+                    while (i > 0) {
+                        i -= 1;
+                        if (content[i] == '\n') {
+                            // Check if previous line is a comment
+                            var line_start = i + 1;
+                            while (line_start < def_pos and (content[line_start] == ' ' or content[line_start] == '\t')) {
+                                line_start += 1;
+                            }
+                            if (line_start + 2 < def_pos and content[line_start] == '/' and content[line_start + 1] == '/') {
+                                comment_start = line_start;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+
+                    // Extract comments
+                    var docs = std.ArrayList(u8).init(self.allocator);
+                    errdefer docs.deinit();
+
+                    try docs.appendSlice("**@");
+                    try docs.appendSlice(macro_name);
+                    try docs.appendSlice("** - Source-defined macro\n\n");
+
+                    // Parse comment lines
+                    var line_start: usize = comment_start;
+                    for (content[comment_start..def_pos], 0..) |c, idx| {
+                        if (c == '\n') {
+                            const line = content[line_start .. comment_start + idx];
+                            // Strip leading whitespace and //
+                            var trimmed = line;
+                            while (trimmed.len > 0 and (trimmed[0] == ' ' or trimmed[0] == '\t')) {
+                                trimmed = trimmed[1..];
+                            }
+                            if (trimmed.len >= 2 and trimmed[0] == '/' and trimmed[1] == '/') {
+                                trimmed = trimmed[2..];
+                                if (trimmed.len > 0 and trimmed[0] == ' ') {
+                                    trimmed = trimmed[1..];
+                                }
+                                try docs.appendSlice(trimmed);
+                                try docs.append('\n');
+                            }
+                            line_start = comment_start + idx + 1;
+                        }
+                    }
+
+                    try docs.appendSlice("\n```typescript\n@");
+                    try docs.appendSlice(macro_name);
+                    try docs.appendSlice("\nclass YourClass { ... }\n```\n\n");
+                    try docs.appendSlice("*Defined in: ");
+                    try docs.appendSlice(file_path);
+                    try docs.appendSlice("*");
+
+                    return try docs.toOwnedSlice();
+                }
+            } else |_| {}
+        }
+
+        return null;
+    }
+
+    /// Get macro expansion hover content using Trans-Am
+    fn getMacroExpansionHover(
+        self: *Server,
+        db: *transam.TransAmDatabase,
+        file_uri: []const u8,
+        macro_name: []const u8,
+        hover_line: u32,
+    ) !?[]const u8 {
+        // Get all macro call sites in the file
+        const call_sites = db.getMacroCallSites(file_uri) catch return null;
+        defer {
+            for (call_sites) |site| {
+                self.allocator.free(site.arguments);
+            }
+            self.allocator.free(call_sites);
+        }
+
+        // Find the macro call site at the hover line
+        var target_site: ?transam.MacroCallSite = null;
+        for (call_sites) |site| {
+            // Check if macro name matches and line is close
+            if (std.mem.eql(u8, site.macro_name, macro_name)) {
+                // Line comparison: site.line is from AST (1-indexed, points to class)
+                // hover_line is from LSP (0-indexed, points to @derive decorator)
+                // Decorators are typically on lines before the class
+                // So check if hover_line+1 is at or before site.line (within a few lines)
+                const hover_line_1indexed = hover_line + 1;
+                if (hover_line_1indexed <= site.line and site.line - hover_line_1indexed <= 3) {
+                    target_site = site;
+                    break;
+                }
+            }
+        }
+
+        if (target_site == null) return null;
+        const site = target_site.?;
+
+        // Debug: Check if target_node is available for MacroVM
+        std.debug.print("[mls] Macro site: {s}, target_node: {?}\n", .{ site.macro_name, site.target_node });
+
+        // Expand the macro
+        const expansion_result = db.expandMacroCallSite(file_uri, site) catch |err| {
+            std.debug.print("[mls] expandMacroCallSite failed: {}\n", .{err});
+            return null;
+        };
+
+        // Format the expansion for display
+        const hover_content = formatMacroExpansion(
+            self.allocator,
+            expansion_result.generated_nodes,
+            site.macro_name,
+            site.arguments,
+        ) catch return null;
+
+        return hover_content;
     }
 
     fn sendHoverResponse(
@@ -1052,7 +1733,7 @@ pub const Server = struct {
             return;
         };
 
-        // First pass: find the identifier at cursor position
+        // First pass: find the identifier or macro at cursor position
         var lexer = lexer_mod.Lexer.init(self.allocator, text, 1) catch {
             try self.sendResponse(Response.nullResult(id), stdout, stderr);
             return;
@@ -1060,23 +1741,52 @@ pub const Server = struct {
         defer lexer.deinit();
 
         var target_name: ?[]const u8 = null;
+        var is_macro: bool = false;
+        var prev_tok: ?token_mod.Token = null;
 
         while (true) {
             const tok = lexer.next() catch break;
             if (tok.kind == .end_of_file) break;
 
+            const tok_line = if (tok.loc.start.line > 0) tok.loc.start.line - 1 else 0;
+
+            // All macros are now @ followed by identifier
             if (tok.kind == .identifier) {
-                const tok_line = if (tok.loc.start.line > 0) tok.loc.start.line - 1 else 0;
+                // Check if previous token was @
+                if (prev_tok) |prev| {
+                    if (prev.kind == .at_sign) {
+                        // This is @macroName - check if cursor is on either @ or the name
+                        const at_line = if (prev.loc.start.line > 0) prev.loc.start.line - 1 else 0;
+                        if ((at_line == line and character >= prev.loc.start.column and character < prev.loc.end.column) or
+                            (tok_line == line and character >= tok.loc.start.column and character < tok.loc.end.column))
+                        {
+                            target_name = tok.text;
+                            is_macro = true;
+                            break;
+                        }
+                    }
+                }
+
+                // Check regular identifier
                 if (tok_line == line and character >= tok.loc.start.column and character < tok.loc.end.column) {
                     target_name = tok.text;
                     break;
                 }
             }
+
+            prev_tok = tok;
         }
 
         if (target_name == null) {
             try self.sendResponse(Response.nullResult(id), stdout, stderr);
             return;
+        }
+
+        // If it's a macro, try to find it in std/macros
+        if (is_macro) {
+            if (try self.findMacroDefinition(target_name.?, id, stdout, stderr)) {
+                return;
+            }
         }
 
         // Second pass: find the definition of this name
@@ -1142,6 +1852,127 @@ pub const Server = struct {
 
         // No definition found
         try self.sendResponse(Response.nullResult(id), stdout, stderr);
+    }
+
+    /// Find macro definition in std/macros or source files
+    fn findMacroDefinition(
+        self: *Server,
+        macro_name: []const u8,
+        id: std.json.Value,
+        stdout: anytype,
+        stderr: anytype,
+    ) !bool {
+        try stderr.print("[mls] Looking for macro definition: @{s}\n", .{macro_name});
+
+        // Map macro names to file locations
+        // Built-in derive macros are in std/macros/derive.ms
+        const macro_files = [_]struct { prefix: []const u8, file: []const u8 }{
+            .{ .prefix = "derive", .file = "std/macros/derive.ms" },
+            .{ .prefix = "Eq", .file = "std/macros/derive.ms" },
+            .{ .prefix = "Hash", .file = "std/macros/derive.ms" },
+            .{ .prefix = "Clone", .file = "std/macros/derive.ms" },
+            .{ .prefix = "Debug", .file = "std/macros/derive.ms" },
+        };
+
+        var target_file: ?[]const u8 = null;
+
+        // Check if macro name matches known macros
+        for (macro_files) |mapping| {
+            if (std.mem.eql(u8, macro_name, mapping.prefix)) {
+                target_file = mapping.file;
+                break;
+            }
+        }
+
+        // Also check for deriveX pattern
+        if (target_file == null and std.mem.startsWith(u8, macro_name, "derive")) {
+            target_file = "std/macros/derive.ms";
+        }
+
+        if (target_file) |file_path| {
+            // Try to access the file
+            if (std.fs.cwd().access(file_path, .{})) |_| {
+                // Read and find the exact function definition
+                const file = std.fs.cwd().openFile(file_path, .{}) catch {
+                    return false;
+                };
+                defer file.close();
+
+                const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch {
+                    return false;
+                };
+                defer self.allocator.free(content);
+
+                // Search for @macro function macroName or function macroName
+                var line_num: u32 = 0;
+                var line_start: usize = 0;
+
+                for (content, 0..) |c, i| {
+                    if (c == '\n') {
+                        const line = content[line_start..i];
+
+                        // Look for @macro function macroName
+                        const search_pattern = try std.fmt.allocPrint(
+                            self.allocator,
+                            "@macro function {s}",
+                            .{macro_name},
+                        );
+                        defer self.allocator.free(search_pattern);
+
+                        if (std.mem.indexOf(u8, line, search_pattern)) |col| {
+                            // Found it! Calculate the column where the name starts
+                            const name_col = col + "@macro function ".len;
+
+                            // Get absolute path
+                            var abs_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                            const abs_path = std.fs.cwd().realpath(file_path, &abs_path_buf) catch {
+                                return false;
+                            };
+
+                            // Build file URI
+                            const file_uri = try std.fmt.allocPrint(
+                                self.allocator,
+                                "file://{s}",
+                                .{abs_path},
+                            );
+                            defer self.allocator.free(file_uri);
+
+                            // Send location response
+                            var buf = std.ArrayList(u8).init(self.allocator);
+                            defer buf.deinit();
+
+                            const writer = buf.writer();
+                            try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+                            try std.json.stringify(id, .{}, writer);
+                            try writer.writeAll(",\"result\":{\"uri\":");
+                            try std.json.stringify(file_uri, .{}, writer);
+                            try writer.writeAll(",\"range\":{\"start\":{\"line\":");
+                            try writer.print("{d}", .{line_num});
+                            try writer.writeAll(",\"character\":");
+                            try writer.print("{d}", .{name_col});
+                            try writer.writeAll("},\"end\":{\"line\":");
+                            try writer.print("{d}", .{line_num});
+                            try writer.writeAll(",\"character\":");
+                            try writer.print("{d}", .{name_col + macro_name.len});
+                            try writer.writeAll("}}}}");
+
+                            try jsonrpc.writeMessage(stdout, buf.items);
+                            try stderr.print("[mls] Found macro @{s} in {s}:{d}\n", .{
+                                macro_name,
+                                file_path,
+                                line_num + 1,
+                            });
+                            return true;
+                        }
+
+                        line_num += 1;
+                        line_start = i + 1;
+                    }
+                }
+            } else |_| {}
+        }
+
+        return false;
     }
 
     // =========================================================================
@@ -1277,6 +2108,8 @@ pub const Server = struct {
         stdout: anytype,
         stderr: anytype,
     ) !void {
+        const start_time = std.time.milliTimestamp();
+
         const params = msg.get("params") orelse {
             try self.sendResponse(Response.nullResult(id), stdout, stderr);
             return;
@@ -1290,67 +2123,102 @@ pub const Server = struct {
             return;
         };
 
-        const entry = self.documents.getEntry(uri.string) orelse {
-            try self.sendResponse(Response.nullResult(id), stdout, stderr);
-            return;
-        };
-        const text = entry.text orelse {
-            try self.sendResponse(Response.nullResult(id), stdout, stderr);
-            return;
-        };
-
-        // Run lexer to collect all tokens
-        var lexer = lexer_mod.Lexer.init(self.allocator, text, 1) catch {
-            try stderr.writeAll("[mls] Failed to initialize lexer for semantic tokens\n");
-            try self.sendResponse(Response.nullResult(id), stdout, stderr);
-            return;
-        };
-        defer lexer.deinit();
-
-        // Collect tokens
-        var tokens = std.ArrayList(token_mod.Token).init(self.allocator);
-        defer tokens.deinit();
-
-        while (true) {
-            const tok = lexer.next() catch break;
-            if (tok.kind == .end_of_file) break;
-            try tokens.append(tok);
-        }
-
         // Convert to semantic token data
         // Each token is 5 integers: deltaLine, deltaStart, length, tokenType, tokenModifiers
         var data = std.ArrayList(u32).init(self.allocator);
         defer data.deinit();
 
-        var prev_line: u32 = 0;
-        var prev_char: u32 = 0;
+        // Try Trans-Am first (fast path with caching)
+        const used_transam = if (self.transam_db) |*db| blk: {
+            const syntax_tokens = db.getSyntaxTokens(uri.string) catch {
+                break :blk false;
+            };
+            defer self.allocator.free(syntax_tokens);
 
-        for (tokens.items) |tok| {
-            const sem_type = tokenKindToSemanticType(tok.kind) orelse continue;
+            var prev_line: u32 = 0;
+            var prev_char: u32 = 0;
 
-            // LSP uses 0-indexed lines, lexer uses 1-indexed
-            const line: u32 = if (tok.loc.start.line > 0) tok.loc.start.line - 1 else 0;
-            const char: u32 = tok.loc.start.column;
-            const length: u32 = @intCast(tok.text.len);
+            for (syntax_tokens) |tok| {
+                const sem_type = syntaxTokenTypeToSemanticType(tok.token_type);
 
-            // Skip zero-length tokens
-            if (length == 0) continue;
+                // Skip zero-length tokens
+                if (tok.length == 0) continue;
 
-            // Calculate deltas
-            const delta_line = line - prev_line;
-            const delta_start = if (delta_line == 0) char - prev_char else char;
+                // Calculate deltas
+                const delta_line = tok.line -| prev_line;
+                const delta_start = if (delta_line == 0) tok.column -| prev_char else tok.column;
 
-            try data.append(delta_line);
-            try data.append(delta_start);
-            try data.append(length);
-            try data.append(@intFromEnum(sem_type));
-            try data.append(0); // No modifiers for now
+                try data.append(delta_line);
+                try data.append(delta_start);
+                try data.append(tok.length);
+                try data.append(@intFromEnum(sem_type));
+                try data.append(tok.modifiers);
 
-            prev_line = line;
-            prev_char = char;
+                prev_line = tok.line;
+                prev_char = tok.column;
+            }
+            break :blk true;
+        } else false;
+
+        // Fallback to direct lexer if Trans-Am not available
+        if (!used_transam) {
+            const entry = self.documents.getEntry(uri.string) orelse {
+                try self.sendResponse(Response.nullResult(id), stdout, stderr);
+                return;
+            };
+            const text = entry.text orelse {
+                try self.sendResponse(Response.nullResult(id), stdout, stderr);
+                return;
+            };
+
+            // Run lexer to collect all tokens
+            var lexer = lexer_mod.Lexer.init(self.allocator, text, 1) catch {
+                try stderr.writeAll("[mls] Failed to initialize lexer for semantic tokens\n");
+                try self.sendResponse(Response.nullResult(id), stdout, stderr);
+                return;
+            };
+            defer lexer.deinit();
+
+            var prev_line: u32 = 0;
+            var prev_char: u32 = 0;
+
+            while (true) {
+                const tok = lexer.next() catch break;
+                if (tok.kind == .end_of_file) break;
+
+                const sem_type = tokenKindToSemanticType(tok.kind) orelse continue;
+
+                // LSP uses 0-indexed lines, lexer uses 1-indexed
+                const line: u32 = if (tok.loc.start.line > 0) tok.loc.start.line - 1 else 0;
+                const char: u32 = tok.loc.start.column;
+                const length: u32 = @intCast(tok.text.len);
+
+                // Skip zero-length tokens
+                if (length == 0) continue;
+
+                // Calculate deltas
+                const delta_line = line - prev_line;
+                const delta_start = if (delta_line == 0) char - prev_char else char;
+
+                try data.append(delta_line);
+                try data.append(delta_start);
+                try data.append(length);
+                try data.append(@intFromEnum(sem_type));
+                try data.append(0); // No modifiers for now
+
+                prev_line = line;
+                prev_char = char;
+            }
         }
 
-        try stderr.print("[mls] Returning {d} semantic tokens for {s}\n", .{ data.items.len / 5, uri.string });
+        const elapsed_ms = std.time.milliTimestamp() - start_time;
+        const source = if (used_transam) "Trans-Am" else "lexer";
+        try stderr.print("[mls] Returning {d} semantic tokens for {s} ({s}, {d}ms)\n", .{
+            data.items.len / 5,
+            uri.string,
+            source,
+            elapsed_ms,
+        });
 
         // Build response
         var buf = std.ArrayList(u8).init(self.allocator);
@@ -1370,6 +2238,24 @@ pub const Server = struct {
 
         try jsonrpc.writeMessage(stdout, buf.items);
         try stderr.print("[mls] Sent semantic tokens response\n", .{});
+    }
+
+    /// Convert Trans-Am SyntaxTokenType to LSP SemanticTokenType
+    fn syntaxTokenTypeToSemanticType(syntax_type: transam.SyntaxTokenType) SemanticTokenType {
+        return switch (syntax_type) {
+            .keyword => .keyword,
+            .identifier => .variable,
+            .string => .string,
+            .number => .number,
+            .comment => .comment,
+            .operator => .operator,
+            .punctuation => .operator, // LSP doesn't have punctuation
+            .macro => .macro,
+            .type_name => .type,
+            .function_name => .function,
+            .parameter => .parameter,
+            .property => .property,
+        };
     }
 
     fn sendResponse(
@@ -1437,48 +2323,84 @@ pub const Server = struct {
 
     /// Run lexer on document and publish diagnostics
     pub fn runDiagnostics(self: *Server, uri: []const u8, stdout: anytype, stderr: anytype) !void {
-        const entry = self.documents.getEntry(uri) orelse return;
-        const text = entry.text orelse return;
+        const start_time = std.time.milliTimestamp();
 
-        // Run lexer
-        var lexer = lexer_mod.Lexer.init(self.allocator, text, 1) catch {
-            try stderr.writeAll("[mls] Failed to initialize lexer\n");
-            return;
-        };
-        defer lexer.deinit();
-
-        // Consume all tokens, collecting errors
-        while (true) {
-            const tok = lexer.next() catch break;
-            if (tok.kind == .end_of_file) break;
-        }
-
-        // Convert lexer errors to LSP diagnostics
         var diagnostics = std.ArrayList(Diagnostic).init(self.allocator);
         defer diagnostics.deinit();
 
-        for (lexer.errors.items) |err| {
-            // Convert ast.SourceLocation to LSP Range
-            // Note: Lexer uses 1-indexed lines, LSP uses 0-indexed
-            const diag = Diagnostic{
-                .range = .{
-                    .start = .{
-                        .line = if (err.loc.start.line > 0) err.loc.start.line - 1 else 0,
-                        .character = err.loc.start.column,
-                    },
-                    .end = .{
-                        .line = if (err.loc.end.line > 0) err.loc.end.line - 1 else 0,
-                        .character = err.loc.end.column,
-                    },
-                },
-                .severity = .@"error",
-                .source = "mls",
-                .message = err.message,
+        // Try Trans-Am first (fast path with caching)
+        const used_transam = if (self.transam_db) |*db| blk: {
+            const transam_diags = db.getDiagnostics(uri) catch {
+                break :blk false;
             };
-            try diagnostics.append(diag);
+            defer db.freeDiagnostics(transam_diags);
+
+            for (transam_diags) |td| {
+                try diagnostics.append(.{
+                    .range = .{
+                        .start = .{ .line = td.start_line, .character = td.start_col },
+                        .end = .{ .line = td.end_line, .character = td.end_col },
+                    },
+                    .severity = switch (td.severity) {
+                        .@"error" => .@"error",
+                        .warning => .warning,
+                        .information => .information,
+                        .hint => .hint,
+                    },
+                    .source = "mls",
+                    .message = td.message,
+                });
+            }
+            break :blk true;
+        } else false;
+
+        // Fallback to direct lexer if Trans-Am not available
+        if (!used_transam) {
+            const entry = self.documents.getEntry(uri) orelse return;
+            const text = entry.text orelse return;
+
+            // Run lexer
+            var lexer = lexer_mod.Lexer.init(self.allocator, text, 1) catch {
+                try stderr.writeAll("[mls] Failed to initialize lexer\n");
+                return;
+            };
+            defer lexer.deinit();
+
+            // Consume all tokens, collecting errors
+            while (true) {
+                const tok = lexer.next() catch break;
+                if (tok.kind == .end_of_file) break;
+            }
+
+            // Convert lexer errors to LSP diagnostics
+            for (lexer.errors.items) |err| {
+                const diag = Diagnostic{
+                    .range = .{
+                        .start = .{
+                            .line = if (err.loc.start.line > 0) err.loc.start.line - 1 else 0,
+                            .character = err.loc.start.column,
+                        },
+                        .end = .{
+                            .line = if (err.loc.end.line > 0) err.loc.end.line - 1 else 0,
+                            .character = err.loc.end.column,
+                        },
+                    },
+                    .severity = .@"error",
+                    .source = "mls",
+                    .message = err.message,
+                };
+                try diagnostics.append(diag);
+            }
         }
 
-        try stderr.print("[mls] Publishing {d} diagnostics for {s}\n", .{ diagnostics.items.len, uri });
+        const elapsed_ms = std.time.milliTimestamp() - start_time;
+        const source = if (used_transam) "Trans-Am" else "lexer";
+        try stderr.print("[mls] Publishing {d} diagnostics for {s} ({s}, {d}ms)\n", .{
+            diagnostics.items.len,
+            uri,
+            source,
+            elapsed_ms,
+        });
 
         // Send publishDiagnostics notification
         try self.publishDiagnostics(uri, diagnostics.items, stdout);

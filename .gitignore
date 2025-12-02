@@ -1,5 +1,6 @@
 # Zig build artifacts
 .zig-cache/
+.metascript-cache/
 zig-out/
 
 # IDE
@@ -20,6 +21,11 @@ metascript
 *.out
 *.app
 
+# Runtime test/bench binaries
+src/runtime/*_test
+src/runtime/*_bench
+src/runtime/*_benchmark
+
 # Test outputs
 *.test
 
@@ -29,3 +35,46 @@ metascript
 
 # Generated code (from tests)
 /examples/output/
+
+# Generated C/JS files from .ms sources
+examples/*.c
+examples/*.js
+!examples/README.md
+
+# Session notes and temporary documentation
+.backend-status.md
+.claude-notes.md
+.rename-summary.md
+.zig-lsp-research.md
+C_BACKEND_WORKING.md
+C_COMPILES_AND_RUNS.md
+FINAL_STATUS.md
+HOW_TO_TEST_SPREADS.md
+LSP_POC_COMPLETE.md
+PHASE*.md
+PRINCIPAL_ENGINEER_REVIEW*.md
+PROGRESS.md
+PROJECT_STATUS.md
+QUICK_REFERENCE.md
+SESSION_*.md
+SPREAD_*.md
+TESTING_*.md
+TEST_COVERAGE.md
+TYPE_CHECKER_DIAGNOSIS.md
+VICTORY.md
+VISIBILITY.md
+
+# Temporary build scripts
+Makefile
+Makefile.hermes
+
+# Test files at root (should be in tests/ directory)
+/test_*.zig
+/test_*.sh
+
+# Tree-sitter generated files
+tree-sitter-metascript/src/parser.c
+tree-sitter-metascript/src/grammar.json
+tree-sitter-metascript/src/node-types.json
+tree-sitter-metascript/src/tokens-generated.js
+tree-sitter-metascript/tokens.json

@@ -2,6 +2,7 @@
 
 ; Keywords
 [
+  ; JavaScript/TypeScript core
   "class"
   "function"
   "const"
@@ -15,6 +16,12 @@
   "new"
   "extends"
   "implements"
+  ; TypeScript
+  "type"
+  "async"
+  ; Metascript
+  "defer"
+  "distinct"
 ] @keyword
 
 ; Metascript-specific: Macro decorators
@@ -26,6 +33,7 @@
 
 ; Types
 (primitive_type) @type.builtin
+(metascript_type) @type.builtin
 
 (type_annotation
   (type

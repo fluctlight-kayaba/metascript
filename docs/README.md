@@ -11,6 +11,7 @@ Welcome to the Metascript documentation! Metascript is a systems programming lan
 - [**Migration from TypeScript**](./migration-from-typescript.md) - Transition guide for TS developers
 
 ### Language Reference
+- [**Language Design**](./language-design.md) - Core language design decisions
 - [**Type System**](./type-system.md) - Static types, generics, and type inference
 - [**Macro System**](./macro-system.md) - Compile-time metaprogramming guide
 - [**Syntax Reference**](./syntax-reference.md) - Complete language syntax

@@ -31,6 +31,13 @@ pub const SourceLocation = struct {
         };
     }
 
+    /// Check if this is a dummy/synthetic location (from macro-generated code)
+    pub fn isDummy(self: SourceLocation) bool {
+        return self.file_id == 0 and
+            self.start.line == 0 and self.start.column == 0 and
+            self.end.line == 0 and self.end.column == 0;
+    }
+
     pub fn format(
         self: SourceLocation,
         comptime fmt: []const u8,

@@ -6,6 +6,7 @@ const std = @import("std");
 const transam = @import("../transam/transam.zig");
 const jsgen = @import("../codegen/js/jsgen.zig");
 const cgen = @import("../codegen/c/cgen.zig");
+const erlgen = @import("../codegen/erlang/erlgen.zig");
 const checker = @import("../checker/typechecker.zig");
 const vm_expander = @import("../macro/vm_expander.zig");
 const normalize = @import("../macro/normalize.zig");
@@ -417,22 +418,72 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
             });
         },
         .erlang => {
-            std.debug.print("{s}[5/5]{s} Erlang backend {s}(pending){s}\n", .{
-                colors.warning.code(),
+            var gen = erlgen.ErlangGenerator.init(allocator);
+            defer gen.deinit();
+
+            const erl_code = gen.generate(final_ast) catch |err| {
+                std.debug.print("{s}error:{s} Erlang generation failed: {s}\n", .{
+                    colors.error_color.code(),
+                    colors.Color.reset.code(),
+                    @errorName(err),
+                });
+                return;
+            };
+            defer allocator.free(erl_code);
+
+            // Determine output path
+            const out_path = output_path orelse blk: {
+                // Replace .ms extension with .erl
+                if (std.mem.endsWith(u8, input_file, ".ms")) {
+                    const base = input_file[0 .. input_file.len - 3];
+                    break :blk std.fmt.allocPrint(allocator, "{s}.erl", .{base}) catch {
+                        std.debug.print("{s}error:{s} Failed to allocate output path\n", .{
+                            colors.error_color.code(),
+                            colors.Color.reset.code(),
+                        });
+                        return;
+                    };
+                } else {
+                    break :blk std.fmt.allocPrint(allocator, "{s}.erl", .{input_file}) catch {
+                        std.debug.print("{s}error:{s} Failed to allocate output path\n", .{
+                            colors.error_color.code(),
+                            colors.Color.reset.code(),
+                        });
+                        return;
+                    };
+                }
+            };
+            defer if (output_path == null) allocator.free(out_path);
+
+            // Write output file
+            std.fs.cwd().writeFile(.{ .sub_path = out_path, .data = erl_code }) catch |err| {
+                std.debug.print("{s}error:{s} Failed to write {s}: {s}\n", .{
+                    colors.error_color.code(),
+                    colors.Color.reset.code(),
+                    out_path,
+                    @errorName(err),
+                });
+                return;
+            };
+
+            std.debug.print("{s}[5/5]{s} Generated {s} {s}✓{s}\n", .{
+                colors.success.code(),
                 colors.Color.reset.code(),
-                colors.dim_text.code(),
+                out_path,
+                colors.Color.bright_green.code(),
                 colors.Color.reset.code(),
             });
 
             const elapsed = std.time.milliTimestamp() - start_time;
-            std.debug.print("\n{s}✓{s} Parse complete ({d}ms)\n", .{
+            std.debug.print("\n{s}✓{s} Compilation complete ({d}ms)\n", .{
                 colors.success.code(),
                 colors.Color.reset.code(),
                 elapsed,
             });
-            std.debug.print("{s}  Note: Erlang backend pending implementation{s}\n", .{
+            std.debug.print("  {s}Output:{s} {s}\n", .{
                 colors.dim_text.code(),
                 colors.Color.reset.code(),
+                out_path,
             });
         },
     }

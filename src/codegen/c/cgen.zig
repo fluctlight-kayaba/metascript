@@ -142,7 +142,10 @@ pub const CGenerator = struct {
             .block_stmt => try self.emitBlockStmt(node),
             .if_stmt => try self.emitIfStmt(node),
             .while_stmt => try self.emitWhileStmt(node),
+            .for_stmt => try self.emitForStmt(node),
             .return_stmt => try self.emitReturnStmt(node),
+            .break_stmt => try self.emitBreakStmt(),
+            .continue_stmt => try self.emitContinueStmt(),
 
             // Skip type-only declarations
             .interface_decl, .type_alias_decl => {},
@@ -302,11 +305,58 @@ pub const CGenerator = struct {
                 // Declare variable, then assign fields separately
                 if (decl.type) |typ| {
                     try self.emitType(typ);
+                } else if (decl.init) |init_expr| {
+                    // Try to use the inferred type from the initializer
+                    if (init_expr.type) |inferred_type| {
+                        try self.emitType(inferred_type);
+                    } else if (init_expr.kind == .array_expr) {
+                        try self.emit("double");
+                    } else if (init_expr.kind == .number_literal) {
+                        // Heuristic: if it's an integer literal, use int; otherwise double
+                        const num = init_expr.data.number_literal;
+                        if (@floor(num) == num and num >= -2147483648 and num <= 2147483647) {
+                            try self.emit("int");
+                        } else {
+                            try self.emit("double");
+                        }
+                    } else if (init_expr.kind == .member_expr) {
+                        // Member access or array indexing - default to double
+                        try self.emit("double");
+                    } else {
+                        try self.emit("void*");
+                    }
                 } else {
                     try self.emit("void*");
                 }
                 try self.emit(" ");
                 try self.emit(decl.name);
+
+                // Emit array brackets if type is array
+                if (decl.type) |typ| {
+                    if (typ.kind == .array) {
+                        if (decl.init) |init_expr| {
+                            if (init_expr.kind == .array_expr) {
+                                const array = &init_expr.data.array_expr;
+                                const len_str = try std.fmt.allocPrint(self.allocator, "{d}", .{array.elements.len});
+                                defer self.allocator.free(len_str);
+                                try self.emit("[");
+                                try self.emit(len_str);
+                                try self.emit("]");
+                            }
+                        } else {
+                            try self.emit("[]");
+                        }
+                    }
+                } else if (decl.init) |init_expr| {
+                    if (init_expr.kind == .array_expr) {
+                        const array = &init_expr.data.array_expr;
+                        const len_str = try std.fmt.allocPrint(self.allocator, "{d}", .{array.elements.len});
+                        defer self.allocator.free(len_str);
+                        try self.emit("[");
+                        try self.emit(len_str);
+                        try self.emit("]");
+                    }
+                }
                 try self.emit(";\n");
 
                 // Emit field assignments
@@ -333,12 +383,59 @@ pub const CGenerator = struct {
                 // Normal initialization (constants only)
                 if (decl.type) |typ| {
                     try self.emitType(typ);
+                } else if (decl.init) |init_expr| {
+                    // Try to use the inferred type from the initializer
+                    if (init_expr.type) |inferred_type| {
+                        try self.emitType(inferred_type);
+                    } else if (init_expr.kind == .array_expr) {
+                        try self.emit("double");
+                    } else if (init_expr.kind == .number_literal) {
+                        // Heuristic: if it's an integer literal, use int; otherwise double
+                        const num = init_expr.data.number_literal;
+                        if (@floor(num) == num and num >= -2147483648 and num <= 2147483647) {
+                            try self.emit("int");
+                        } else {
+                            try self.emit("double");
+                        }
+                    } else if (init_expr.kind == .member_expr) {
+                        // Member access or array indexing - default to double
+                        try self.emit("double");
+                    } else {
+                        try self.emit("void*");
+                    }
                 } else {
                     try self.emit("void*");
                 }
 
                 try self.emit(" ");
                 try self.emit(decl.name);
+
+                // Emit array brackets if type is array
+                if (decl.type) |typ| {
+                    if (typ.kind == .array) {
+                        if (decl.init) |init_expr| {
+                            if (init_expr.kind == .array_expr) {
+                                const array = &init_expr.data.array_expr;
+                                const len_str = try std.fmt.allocPrint(self.allocator, "{d}", .{array.elements.len});
+                                defer self.allocator.free(len_str);
+                                try self.emit("[");
+                                try self.emit(len_str);
+                                try self.emit("]");
+                            }
+                        } else {
+                            try self.emit("[]");
+                        }
+                    }
+                } else if (decl.init) |init_expr| {
+                    if (init_expr.kind == .array_expr) {
+                        const array = &init_expr.data.array_expr;
+                        const len_str = try std.fmt.allocPrint(self.allocator, "{d}", .{array.elements.len});
+                        defer self.allocator.free(len_str);
+                        try self.emit("[");
+                        try self.emit(len_str);
+                        try self.emit("]");
+                    }
+                }
 
                 // Emit initializer if present
                 if (decl.init) |init_expr| {
@@ -472,6 +569,105 @@ pub const CGenerator = struct {
         }
     }
 
+    /// Emit a for loop
+    fn emitForStmt(self: *Self, node: *ast.Node) !void {
+        const for_stmt = &node.data.for_stmt;
+
+        try self.emit("for (");
+
+        // Init clause
+        if (for_stmt.init) |init_node| {
+            // For init, we emit the variable declaration or expression without trailing semicolon/newline
+            if (init_node.kind == .variable_stmt) {
+                const var_stmt = &init_node.data.variable_stmt;
+                for (var_stmt.declarations, 0..) |decl, i| {
+                    if (i > 0) try self.emit(", ");
+
+                    // Emit type - refine generic 'number' type for integer literals
+                    if (decl.type) |typ| {
+                        // If type is generic 'number' and init is integer literal, use int
+                        if (typ.kind == .number and decl.init != null) {
+                            const init_expr = decl.init.?;
+                            if (init_expr.kind == .number_literal) {
+                                const num = init_expr.data.number_literal;
+                                if (@floor(num) == num and num >= -2147483648 and num <= 2147483647) {
+                                    try self.emit("int");
+                                } else {
+                                    try self.emit("double");
+                                }
+                            } else {
+                                try self.emitType(typ);
+                            }
+                        } else {
+                            try self.emitType(typ);
+                        }
+                    } else if (decl.init) |init_expr| {
+                        // No explicit type - try to infer from initializer
+                        if (init_expr.type) |inferred_type| {
+                            try self.emitType(inferred_type);
+                        } else if (init_expr.kind == .number_literal) {
+                            const num = init_expr.data.number_literal;
+                            if (@floor(num) == num and num >= -2147483648 and num <= 2147483647) {
+                                try self.emit("int");
+                            } else {
+                                try self.emit("double");
+                            }
+                        } else {
+                            try self.emit("double");
+                        }
+                    } else {
+                        try self.emit("double");
+                    }
+
+                    try self.emit(" ");
+                    try self.emit(decl.name);
+                    if (decl.init) |init_expr| {
+                        try self.emit(" = ");
+                        try self.emitExpression(init_expr);
+                    }
+                }
+            } else {
+                try self.emitExpression(init_node);
+            }
+        }
+        try self.emit("; ");
+
+        // Condition clause
+        if (for_stmt.condition) |cond| {
+            try self.emitExpression(cond);
+        }
+        try self.emit("; ");
+
+        // Update clause
+        if (for_stmt.update) |update| {
+            try self.emitExpression(update);
+        }
+        try self.emit(") ");
+
+        // Body
+        if (for_stmt.body.kind == .block_stmt) {
+            try self.emitBlockStmt(for_stmt.body);
+        } else {
+            try self.emit("{\n");
+            self.indent_level += 1;
+            try self.emitIndent();
+            try self.emitNode(for_stmt.body);
+            self.indent_level -= 1;
+            try self.emitIndent();
+            try self.emit("}\n");
+        }
+    }
+
+    /// Emit a break statement
+    fn emitBreakStmt(self: *Self) !void {
+        try self.emit("break;\n");
+    }
+
+    /// Emit a continue statement
+    fn emitContinueStmt(self: *Self) !void {
+        try self.emit("continue;\n");
+    }
+
     /// Emit a return statement
     fn emitReturnStmt(self: *Self, node: *ast.Node) !void {
         const ret = &node.data.return_stmt;
@@ -504,8 +700,23 @@ pub const CGenerator = struct {
                     .string => try format_parts.appendSlice("%s"),
                     .boolean => try format_parts.appendSlice("%d"),
                     .object => {
-                        // For objects, print pointer for now (TODO: proper struct printing)
-                        try format_parts.appendSlice("{object}");
+                        // For objects, we'll print field by field
+                        const obj_type = arg_type.data.object;
+                        try format_parts.appendSlice("{");
+                        for (obj_type.properties, 0..) |prop, j| {
+                            if (j > 0) try format_parts.appendSlice(", ");
+                            try format_parts.appendSlice(prop.name);
+                            try format_parts.appendSlice(": ");
+                            // Add format specifier based on property type
+                            switch (prop.type.kind) {
+                                .number, .float32, .float64 => try format_parts.appendSlice("%g"),
+                                .int32, .int64 => try format_parts.appendSlice("%ld"),
+                                .string => try format_parts.appendSlice("%s"),
+                                .boolean => try format_parts.appendSlice("%d"),
+                                else => try format_parts.appendSlice("%g"),
+                            }
+                        }
+                        try format_parts.appendSlice("}");
                     },
                     else => try format_parts.appendSlice("%p"),
                 }
@@ -520,13 +731,36 @@ pub const CGenerator = struct {
         try self.emit("printf(");
         try self.emit(format_parts.items);
 
-        // Emit arguments (skip objects for now)
+        // Emit arguments
         for (call.arguments) |arg| {
             if (arg.type) |arg_type| {
                 if (arg_type.kind == .object) {
-                    // Skip object arguments for now
+                    // For objects, emit each property value
+                    const obj_type = arg_type.data.object;
+                    for (obj_type.properties) |prop| {
+                        try self.emit(", ");
+                        try self.emitExpression(arg);
+                        try self.emit(".");
+                        try self.emit(prop.name);
+                    }
                     continue;
                 }
+                // For generic 'number' type, cast to double to ensure correct printf behavior
+                // This handles the case where we emitted 'int' in C but printf expects 'double' for %g
+                if (arg_type.kind == .number) {
+                    try self.emit(", (double)(");
+                    try self.emitExpression(arg);
+                    try self.emit(")");
+                    continue;
+                }
+            }
+            // Even if type is unknown, cast identifiers to double for safety with %g format
+            // This prevents undefined behavior when int loop vars are printed with %g
+            if (arg.kind == .identifier) {
+                try self.emit(", (double)(");
+                try self.emitExpression(arg);
+                try self.emit(")");
+                continue;
             }
             try self.emit(", ");
             try self.emitExpression(arg);
@@ -601,6 +835,15 @@ pub const CGenerator = struct {
                     try self.emitExpression(arg);
                 }
                 try self.emit(")");
+            },
+            .array_expr => {
+                const array = &node.data.array_expr;
+                try self.emit("{");
+                for (array.elements, 0..) |elem, i| {
+                    if (i > 0) try self.emit(", ");
+                    try self.emitExpression(elem);
+                }
+                try self.emit("}");
             },
             else => {
                 // Unsupported expression type
@@ -730,6 +973,12 @@ pub const CGenerator = struct {
                 }
 
                 try self.emit("}");
+            },
+            .array => {
+                // For arrays, emit just the element type
+                // The array brackets will be emitted in variable declaration
+                const elem_type = t.data.array;
+                try self.emitType(elem_type);
             },
             else => try self.emit("void*"), // Fallback
         }

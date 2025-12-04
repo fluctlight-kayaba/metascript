@@ -639,6 +639,359 @@ pub const ERLANG_BUG_EARLY_RETURN =
 ;
 
 // ============================================================================
+// Advanced TypeScript Concepts (Boundary Testing)
+// ============================================================================
+
+// Generics - basic
+pub const GENERICS_BASIC =
+    \\function identity<T>(x: T): T {
+    \\    return x;
+    \\}
+    \\
+    \\function swap<T, U>(a: T, b: U): [U, T] {
+    \\    return [b, a];
+    \\}
+;
+
+// Generics with constraints
+pub const GENERICS_CONSTRAINTS =
+    \\interface Lengthwise {
+    \\    length: number;
+    \\}
+    \\
+    \\function loggingIdentity<T extends Lengthwise>(arg: T): T {
+    \\    console.log(arg.length);
+    \\    return arg;
+    \\}
+;
+
+// Generic class
+pub const GENERIC_CLASS =
+    \\class Container<T> {
+    \\    value: T;
+    \\
+    \\    getValue(): T {
+    \\        return this.value;
+    \\    }
+    \\
+    \\    setValue(val: T): void {
+    \\        this.value = val;
+    \\    }
+    \\}
+    \\
+    \\class Pair<K, V> {
+    \\    key: K;
+    \\    value: V;
+    \\
+    \\    constructor(key: K, value: V) {
+    \\        this.key = key;
+    \\        this.value = value;
+    \\    }
+    \\}
+;
+
+// Union types
+pub const UNION_TYPES =
+    \\function formatValue(value: string | number): string {
+    \\    if (typeof value === "string") {
+    \\        return value.toUpperCase();
+    \\    }
+    \\    return value.toString();
+    \\}
+    \\
+    \\function processInput(input: string | number | boolean): void {
+    \\    console.log(input);
+    \\}
+;
+
+// Intersection types
+pub const INTERSECTION_TYPES =
+    \\interface Printable {
+    \\    print(): void;
+    \\}
+    \\
+    \\interface Loggable {
+    \\    log(): void;
+    \\}
+    \\
+    \\class Report implements Printable, Loggable {
+    \\    content: string;
+    \\
+    \\    print(): void {
+    \\        console.log("Printing: " + this.content);
+    \\    }
+    \\
+    \\    log(): void {
+    \\        console.log("Logging: " + this.content);
+    \\    }
+    \\}
+    \\
+    \\function processReport(item: Printable & Loggable): void {
+    \\    item.print();
+    \\    item.log();
+    \\}
+;
+
+// Optional chaining
+pub const OPTIONAL_CHAINING =
+    \\interface Address {
+    \\    street: string;
+    \\    city: string;
+    \\}
+    \\
+    \\interface Person {
+    \\    name: string;
+    \\    address?: Address;
+    \\}
+    \\
+    \\function getCity(person: Person): string | undefined {
+    \\    return person.address?.city;
+    \\}
+;
+
+// Nullish coalescing
+pub const NULLISH_COALESCING =
+    \\function getDefault(value: string | null | undefined): string {
+    \\    return value ?? "default";
+    \\}
+    \\
+    \\function getCount(count: number | null): number {
+    \\    return count ?? 0;
+    \\}
+;
+
+// Type guards
+pub const TYPE_GUARDS =
+    \\interface Fish {
+    \\    swim(): void;
+    \\}
+    \\
+    \\interface Bird {
+    \\    fly(): void;
+    \\}
+    \\
+    \\function isFish(pet: Fish | Bird): boolean {
+    \\    return (pet as Fish).swim !== undefined;
+    \\}
+    \\
+    \\function move(pet: Fish | Bird): void {
+    \\    if (isFish(pet)) {
+    \\        (pet as Fish).swim();
+    \\    } else {
+    \\        (pet as Bird).fly();
+    \\    }
+    \\}
+;
+
+// Closures
+pub const CLOSURES =
+    \\function createCounter(): () => number {
+    \\    let count = 0;
+    \\    return function(): number {
+    \\        count = count + 1;
+    \\        return count;
+    \\    };
+    \\}
+    \\
+    \\function createAdder(x: number): (y: number) => number {
+    \\    return function(y: number): number {
+    \\        return x + y;
+    \\    };
+    \\}
+;
+
+// Higher-order functions
+pub const HIGHER_ORDER_FUNCTIONS =
+    \\function map<T, U>(arr: T[], fn: (item: T) => U): U[] {
+    \\    const result: U[] = [];
+    \\    for (let i = 0; i < arr.length; i = i + 1) {
+    \\        result.push(fn(arr[i]));
+    \\    }
+    \\    return result;
+    \\}
+    \\
+    \\function filter<T>(arr: T[], predicate: (item: T) => boolean): T[] {
+    \\    const result: T[] = [];
+    \\    for (let i = 0; i < arr.length; i = i + 1) {
+    \\        if (predicate(arr[i])) {
+    \\            result.push(arr[i]);
+    \\        }
+    \\    }
+    \\    return result;
+    \\}
+    \\
+    \\function reduce<T, U>(arr: T[], fn: (acc: U, item: T) => U, initial: U): U {
+    \\    let acc = initial;
+    \\    for (let i = 0; i < arr.length; i = i + 1) {
+    \\        acc = fn(acc, arr[i]);
+    \\    }
+    \\    return acc;
+    \\}
+;
+
+// Arrow functions
+pub const ARROW_FUNCTIONS =
+    \\const double = (x: number): number => x * 2;
+    \\const add = (a: number, b: number): number => a + b;
+    \\const greet = (name: string): string => "Hello, " + name;
+    \\
+    \\function processArray(arr: number[]): number[] {
+    \\    return arr.map((x: number): number => x * x);
+    \\}
+;
+
+// Spread operator
+pub const SPREAD_OPERATOR =
+    \\function mergeArrays(a: number[], b: number[]): number[] {
+    \\    return [...a, ...b];
+    \\}
+    \\
+    \\function cloneObject(obj: {x: number, y: number}): {x: number, y: number, z: number} {
+    \\    return {...obj, z: 0};
+    \\}
+    \\
+    \\function sum(...numbers: number[]): number {
+    \\    let total = 0;
+    \\    for (let i = 0; i < numbers.length; i = i + 1) {
+    \\        total = total + numbers[i];
+    \\    }
+    \\    return total;
+    \\}
+;
+
+// Destructuring
+pub const DESTRUCTURING =
+    \\function getCoordinates(): {x: number, y: number} {
+    \\    return {x: 10, y: 20};
+    \\}
+    \\
+    \\function processPoint(): number {
+    \\    const {x, y} = getCoordinates();
+    \\    return x + y;
+    \\}
+    \\
+    \\function swapValues(arr: number[]): number[] {
+    \\    const [a, b] = arr;
+    \\    return [b, a];
+    \\}
+;
+
+// Async/Await (complex - may not compile)
+pub const ASYNC_AWAIT =
+    \\async function fetchData(url: string): Promise<string> {
+    \\    const response = await fetch(url);
+    \\    const data = await response.text();
+    \\    return data;
+    \\}
+    \\
+    \\async function processAll(urls: string[]): Promise<string[]> {
+    \\    const results: string[] = [];
+    \\    for (let i = 0; i < urls.length; i = i + 1) {
+    \\        const data = await fetchData(urls[i]);
+    \\        results.push(data);
+    \\    }
+    \\    return results;
+    \\}
+;
+
+// Recursive types
+pub const RECURSIVE_TYPES =
+    \\interface TreeNode {
+    \\    value: number;
+    \\    children: TreeNode[];
+    \\}
+    \\
+    \\function countNodes(node: TreeNode): number {
+    \\    let count = 1;
+    \\    for (let i = 0; i < node.children.length; i = i + 1) {
+    \\        count = count + countNodes(node.children[i]);
+    \\    }
+    \\    return count;
+    \\}
+    \\
+    \\function findMax(node: TreeNode): number {
+    \\    let max = node.value;
+    \\    for (let i = 0; i < node.children.length; i = i + 1) {
+    \\        const childMax = findMax(node.children[i]);
+    \\        if (childMax > max) {
+    \\            max = childMax;
+    \\        }
+    \\    }
+    \\    return max;
+    \\}
+;
+
+// Enums
+pub const ENUMS =
+    \\enum Direction {
+    \\    Up,
+    \\    Down,
+    \\    Left,
+    \\    Right
+    \\}
+    \\
+    \\enum Status {
+    \\    Pending = "PENDING",
+    \\    Active = "ACTIVE",
+    \\    Completed = "COMPLETED"
+    \\}
+    \\
+    \\function move(direction: Direction): void {
+    \\    switch (direction) {
+    \\        case Direction.Up:
+    \\            console.log("Moving up");
+    \\            break;
+    \\        case Direction.Down:
+    \\            console.log("Moving down");
+    \\            break;
+    \\        default:
+    \\            console.log("Moving sideways");
+    \\    }
+    \\}
+;
+
+// Tuple types
+pub const TUPLE_TYPES =
+    \\function getPoint(): [number, number] {
+    \\    return [10, 20];
+    \\}
+    \\
+    \\function getNamedPoint(): [number, number, string] {
+    \\    return [10, 20, "origin"];
+    \\}
+    \\
+    \\function processPoint(point: [number, number]): number {
+    \\    return point[0] + point[1];
+    \\}
+;
+
+// Mapped types (complex)
+pub const MAPPED_TYPES =
+    \\interface User {
+    \\    id: number;
+    \\    name: string;
+    \\    email: string;
+    \\}
+    \\
+    \\type ReadonlyUser = Readonly<User>;
+    \\type PartialUser = Partial<User>;
+    \\type UserKeys = keyof User;
+;
+
+// Conditional types (complex)
+pub const CONDITIONAL_TYPES =
+    \\type IsString<T> = T extends string ? true : false;
+    \\type IsNumber<T> = T extends number ? true : false;
+    \\
+    \\function processValue<T>(value: T): T extends string ? number : string {
+    \\    if (typeof value === "string") {
+    \\        return value.length as any;
+    \\    }
+    \\    return String(value) as any;
+    \\}
+;
+
+// ============================================================================
 // Comprehensive Demo
 // ============================================================================
 

@@ -112,7 +112,7 @@ pub const JSGenerator = struct {
             .property_decl, .method_decl, .constructor_decl => {},
 
             // Macro nodes should be expanded before codegen
-            .macro_decl, .macro_invocation, .comptime_block, .compile_error => {},
+            .macro_decl, .macro_invocation, .comptime_block, .compile_error, .quote_expr => {},
 
             // Program handled at top level
             .program => unreachable,

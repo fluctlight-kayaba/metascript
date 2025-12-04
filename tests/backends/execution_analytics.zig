@@ -214,6 +214,11 @@ fn testFixtureEnhanced(
             result.c_compiles = exec_result.compiled;
             result.c_executes = exec_result.success();
 
+            // Capture gcc error if compilation failed
+            if (!exec_result.compiled and exec_result.stderr.len > 0) {
+                result.c_error = allocator.dupe(u8, exec_result.stderr) catch null;
+            }
+
             // Phase 1.5: Quality check
             if (c_code_opt) |c_code| {
                 quality_helpers.expectCHasMain(c_code) catch {};
@@ -336,6 +341,9 @@ fn runEnhancedAnalytics(allocator: std.mem.Allocator) !EnhancedAnalyticsSummary 
             std.debug.print("⚠️  COMPILE OK, EXECUTE FAIL\n", .{});
         } else if (r.c_generates) {
             std.debug.print("⚠️  GENERATE OK, COMPILE FAIL\n", .{});
+            if (r.c_error) |err| {
+                std.debug.print("      Error: {s}\n", .{err[0..@min(err.len, 200)]});
+            }
         } else {
             std.debug.print("❌ FAIL (generation)\n", .{});
         }

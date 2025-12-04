@@ -282,6 +282,7 @@ pub const CGenerator = struct {
         try self.emit("#include <stdbool.h>\n");
         try self.emit("#include <string.h>\n");
         try self.emit("#include <stdlib.h>\n");
+        try self.emit("#include <math.h>\n");
         try self.emit("\n// Metascript ORC Runtime (compile with: -I<metascript>/src/runtime)\n");
         try self.emit("#define MS_ORC_IMPLEMENTATION\n");
         try self.emit("#include \"orc.h\"\n");
@@ -358,6 +359,13 @@ pub const CGenerator = struct {
 
         // ORC Integration: Emit trace function and TypeInfo for cycle detection
         try self.emitClassOrcSupport(class.name, class.members);
+
+        // Emit method implementations (full function bodies)
+        for (class.members) |member| {
+            if (member.kind == .method_decl) {
+                try self.emitMethodImplementation(class.name, member);
+            }
+        }
     }
 
     /// Check if a type is a reference type (needs ORC tracing)
@@ -494,6 +502,61 @@ pub const CGenerator = struct {
 
         // For now, just semicolon (no body)
         try self.emit(";\n");
+    }
+
+    /// Emit method implementation: full function body
+    fn emitMethodImplementation(self: *Self, class_name: []const u8, node: *ast.Node) !void {
+        const method = &node.data.method_decl;
+
+        // Return type
+        if (method.return_type) |ret| {
+            try self.emitType(ret);
+        } else {
+            try self.emit("void");
+        }
+        try self.emit(" ");
+
+        // ClassName_methodName
+        try self.emit(class_name);
+        try self.emit("_");
+        try self.emit(method.name);
+        try self.emit("(");
+
+        // First param: ClassName* this
+        try self.emit(class_name);
+        try self.emit("* this");
+
+        // Other params
+        for (method.params) |param| {
+            try self.emit(", ");
+            if (param.type) |ptype| {
+                try self.emitType(ptype);
+            } else {
+                try self.emit("void*");
+            }
+            try self.emit(" ");
+            try self.emit(param.name);
+        }
+
+        try self.emit(") ");
+
+        // Emit method body
+        if (method.body) |body| {
+            if (body.kind == .block_stmt) {
+                try self.emitBlockStmt(body);
+            } else {
+                // Single expression body - wrap in block
+                try self.emit("{\n");
+                self.indent_level += 1;
+                try self.emitIndent();
+                try self.emitNode(body);
+                self.indent_level -= 1;
+                try self.emit("}\n");
+            }
+        } else {
+            try self.emit("{ }\n");
+        }
+        try self.emit("\n");
     }
 
     /// Emit function declaration (placeholder)
@@ -1141,6 +1204,67 @@ pub const CGenerator = struct {
             },
             .binary_expr => {
                 const binary = &node.data.binary_expr;
+
+                // Check for string concatenation (+ with string operands)
+                if (binary.op == .add) {
+                    const left_is_string = if (binary.left.type) |t| t.kind == .string else false;
+                    const right_is_string = if (binary.right.type) |t| t.kind == .string else false;
+                    const left_is_number = if (binary.left.type) |t|
+                        (t.kind == .number or t.kind == .float64 or t.kind == .float32 or
+                            t.kind == .int32 or t.kind == .int64)
+                    else
+                        false;
+                    const right_is_number = if (binary.right.type) |t|
+                        (t.kind == .number or t.kind == .float64 or t.kind == .float32 or
+                            t.kind == .int32 or t.kind == .int64)
+                    else
+                        false;
+
+                    if (left_is_string and right_is_string) {
+                        // string + string → ms_cstr_concat
+                        try self.emit("ms_cstr_concat(");
+                        try self.emitExpression(binary.left);
+                        try self.emit(", ");
+                        try self.emitExpression(binary.right);
+                        try self.emit(")");
+                        return;
+                    } else if (left_is_string and right_is_number) {
+                        // string + number → ms_cstr_concat_num
+                        try self.emit("ms_cstr_concat_num(");
+                        try self.emitExpression(binary.left);
+                        try self.emit(", ");
+                        try self.emitExpression(binary.right);
+                        try self.emit(")");
+                        return;
+                    } else if (left_is_number and right_is_string) {
+                        // number + string → ms_num_concat_cstr
+                        try self.emit("ms_num_concat_cstr(");
+                        try self.emitExpression(binary.left);
+                        try self.emit(", ");
+                        try self.emitExpression(binary.right);
+                        try self.emit(")");
+                        return;
+                    }
+                }
+
+                // Special case: modulo with floating-point types needs fmod()
+                if (binary.op == .mod) {
+                    const left_is_float = if (binary.left.type) |t|
+                        (t.kind == .number or t.kind == .float64 or t.kind == .float32)
+                    else
+                        true; // Default to float for number type in MetaScript
+
+                    if (left_is_float) {
+                        try self.emit("fmod(");
+                        try self.emitExpression(binary.left);
+                        try self.emit(", ");
+                        try self.emitExpression(binary.right);
+                        try self.emit(")");
+                        return;
+                    }
+                }
+
+                // Default: regular binary expression
                 try self.emit("(");
                 try self.emitExpression(binary.left);
                 try self.emit(" ");
@@ -1166,11 +1290,25 @@ pub const CGenerator = struct {
                     try self.emit("]");
                 } else {
                     // Use -> for pointer types (class instances allocated with ms_alloc)
-                    // Note: .object literals are stack-allocated value types, only .type_reference are pointers
-                    const is_pointer = if (member.object.type) |obj_type|
-                        obj_type.kind == .type_reference
-                    else
-                        false;
+                    // Use . for stack-allocated value types (object literals)
+                    const is_pointer = if (member.object.type) |obj_type| blk: {
+                        // type_reference means it's a named type (like Point)
+                        if (obj_type.kind == .type_reference) {
+                            break :blk true;
+                        }
+                        // ref type (explicit ref annotation)
+                        if (obj_type.kind == .ref) {
+                            break :blk true;
+                        }
+                        // object type with a name = class instance (heap pointer)
+                        // object type without name = object literal (stack value)
+                        if (obj_type.kind == .object) {
+                            if (obj_type.data.object.name != null) {
+                                break :blk true; // Class instance -> pointer
+                            }
+                        }
+                        break :blk false;
+                    } else false;
                     if (is_pointer) {
                         try self.emit("->");
                     } else {
@@ -1181,6 +1319,33 @@ pub const CGenerator = struct {
             },
             .call_expr => {
                 const call = &node.data.call_expr;
+
+                // Check for method call on class instance: obj.method(args) → ClassName_method(obj, args)
+                if (call.callee.kind == .member_expr) {
+                    const member = &call.callee.data.member_expr;
+                    // Check if the object has a named object type (class instance)
+                    if (member.object.type) |obj_type| {
+                        if (obj_type.kind == .object) {
+                            if (obj_type.data.object.name) |class_name| {
+                                // This is a method call on a class instance
+                                // Emit: ClassName_methodName(instance, args...)
+                                try self.emit(class_name);
+                                try self.emit("_");
+                                try self.emitExpression(member.property);
+                                try self.emit("(");
+                                try self.emitExpression(member.object);
+                                for (call.arguments) |arg| {
+                                    try self.emit(", ");
+                                    try self.emitExpression(arg);
+                                }
+                                try self.emit(")");
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                // Default: regular function call
                 try self.emitExpression(call.callee);
                 try self.emit("(");
                 for (call.arguments, 0..) |arg, i| {

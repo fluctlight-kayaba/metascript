@@ -90,16 +90,10 @@ pub const Parser = struct {
     // ===== Top-Level Declarations =====
 
     fn parseTopLevelDeclaration(self: *Parser) !*ast.Node {
-        // Check for @macro function (macro definition)
-        // Now @ is separate token, so check @ + identifier("macro")
-        if (self.check(.at_sign) and self.peekNextIsIdentifier("macro")) {
-            self.advance(); // consume @
-            self.advance(); // consume "macro"
-            if (self.check(.keyword_function)) {
-                return self.parseMacroDeclaration();
-            } else {
-                return self.reportError("Expected 'function' after @macro");
-            }
+        // Check for macro keyword (Nim-style: macro derive(ctx) { ... })
+        if (self.check(.keyword_macro)) {
+            self.advance(); // consume 'macro'
+            return self.parseMacroDeclaration();
         }
 
         // Check for @comptime block at top level
@@ -504,12 +498,10 @@ pub const Parser = struct {
         );
     }
 
-    /// Parse @macro function declaration
-    /// @macro function derive(ctx: MacroContext): void { ... }
+    /// Parse macro declaration (Nim-style)
+    /// macro derive(ctx: MacroContext): void { ... }
     fn parseMacroDeclaration(self: *Parser) !*ast.Node {
         const start_loc = self.current.loc;
-
-        try self.consume(.keyword_function, "Expected 'function' after @macro");
 
         // Macro name
         if (!self.check(.identifier)) {
@@ -960,6 +952,44 @@ pub const Parser = struct {
             .{
                 .comptime_block = .{
                     .body = body,
+                },
+            },
+        );
+    }
+
+    /// Parse quote expression: quote { ... }
+    /// Used inside macros to generate AST from code templates
+    ///
+    /// CURRENT LIMITATION: Interpolation (${...}) is NOT YET IMPLEMENTED.
+    /// The quote block is parsed as a regular block statement.
+    /// To use dynamic values in quoted code, you must use the AST API directly:
+    ///
+    ///   // Instead of: quote { return ${expr}; }
+    ///   // Use: ast.createReturnStmt(expr)
+    ///
+    /// TODO: Implement interpolation scanning:
+    /// 1. Scan block for ${...} patterns during parsing
+    /// 2. Replace with placeholder identifiers (__ms_interp_0, etc.)
+    /// 3. Record mapping in interpolations array
+    /// 4. Macro expander substitutes placeholders with actual expressions
+    ///
+    fn parseQuoteExpr(self: *Parser) !*ast.Node {
+        const start_loc = self.current.loc;
+
+        // 'quote' keyword already consumed by caller
+        const body = try self.parseBlock();
+
+        // FIXME: Interpolation not implemented - always empty
+        // When implemented, this should scan body for ${...} patterns
+        const empty_interpolations = try self.arena.allocator().alloc(ast.QuoteExpr.Interpolation, 0);
+
+        return try self.arena.createNode(
+            .quote_expr,
+            self.mergeLoc(start_loc, self.previous.loc),
+            .{
+                .quote_expr = .{
+                    .body = body,
+                    .interpolations = empty_interpolations,
                 },
             },
         );
@@ -1679,6 +1709,11 @@ pub const Parser = struct {
         // function expression
         if (self.check(.keyword_function) or self.check(.keyword_async)) {
             return self.parseFunctionExpression();
+        }
+
+        // quote expression (used inside macros): quote { ... }
+        if (self.match(.keyword_quote)) {
+            return self.parseQuoteExpr();
         }
 
         return self.reportError("Expected expression");

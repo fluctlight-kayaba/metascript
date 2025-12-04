@@ -254,6 +254,37 @@ static inline msString* ms_string_clone(msString* str) {
 }
 
 /*
+ * String concatenation helpers for codegen
+ * These return heap-allocated C strings (caller must free)
+ */
+
+// Concatenate two C strings
+static inline char* ms_cstr_concat(const char* a, const char* b) {
+    size_t len_a = strlen(a);
+    size_t len_b = strlen(b);
+    char* result = (char*)malloc(len_a + len_b + 1);
+    if (result) {
+        memcpy(result, a, len_a);
+        memcpy(result + len_a, b, len_b + 1);
+    }
+    return result;
+}
+
+// Concatenate C string + number
+static inline char* ms_cstr_concat_num(const char* str, double num) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%g", num);
+    return ms_cstr_concat(str, buf);
+}
+
+// Concatenate number + C string
+static inline char* ms_num_concat_cstr(double num, const char* str) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%g", num);
+    return ms_cstr_concat(buf, str);
+}
+
+/*
  * Sink: transfer ownership (no RC change, just return ptr)
  */
 static inline msString* ms_string_sink(msString* str) {

@@ -53,10 +53,11 @@ pub const NodeKind = enum {
     type_annotation,  // : Type
 
     // ===== Macro-specific nodes =====
-    macro_decl,       // @macro function derive() { ... }
+    macro_decl,       // macro derive(ctx) { ... }
     macro_invocation, // @derive(Eq, Hash)
     comptime_block,   // @comptime { ... }
     compile_error,    // @compileError("message")
+    quote_expr,       // quote { ... } - AST quotation in macros
 
     // ===== Program root =====
     program,          // Top-level module
@@ -166,6 +167,7 @@ pub const Node = struct {
         macro_invocation: MacroInvocation,
         comptime_block: ComptimeBlock,
         compile_error: []const u8,
+        quote_expr: QuoteExpr,
 
         // Program
         program: Program,
@@ -410,7 +412,7 @@ pub const ConstructorDecl = struct {
 
 // ===== Macro-specific types (CRITICAL FOR METAPROGRAMMING!) =====
 
-/// Macro definition: @macro function derive(ctx) { ... }
+/// Macro definition (Nim-style): macro derive(ctx) { ... }
 /// This is a function that runs at compile-time to transform AST
 pub const MacroDecl = struct {
     name: []const u8,
@@ -436,6 +438,21 @@ pub const MacroInvocation = struct {
 /// Compile-time block: @comptime { ... }
 pub const ComptimeBlock = struct {
     body: *Node, // Executed at compile-time, result embedded in binary
+};
+
+/// Quote expression: quote { ... }
+/// Used inside macros to generate AST from code templates
+/// ${expr} inside quote blocks interpolates values into the quoted AST
+pub const QuoteExpr = struct {
+    body: *Node, // The quoted code (becomes AST at compile-time)
+    interpolations: []Interpolation, // ${...} expressions to splice in
+
+    pub const Interpolation = struct {
+        placeholder: []const u8, // e.g., "field.name"
+        expression: *Node, // The expression to evaluate and splice
+        start_offset: usize, // Position in the quoted source
+        end_offset: usize,
+    };
 };
 
 // ===== Program root =====

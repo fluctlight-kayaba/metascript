@@ -254,6 +254,8 @@ fn tokenKindToSemanticType(kind: token_mod.TokenKind) ?SemanticTokenType {
         .keyword_keyof,
         .keyword_defer,    // Metascript: defer cleanup
         .keyword_distinct, // Metascript: distinct types
+        .keyword_macro,    // Metascript: macro definition
+        .keyword_quote,    // Metascript: quote expression
         => .keyword,
 
         // Type-related keywords

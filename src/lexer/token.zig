@@ -101,6 +101,10 @@ pub const TokenKind = enum {
     keyword_defer,    // defer cleanup
     keyword_distinct, // distinct type
 
+    // Metascript macro keywords (Nim-style)
+    keyword_macro,    // macro definition: macro derive(ctx) { }
+    keyword_quote,    // AST quotation: quote { ... }
+
     // ===== Macro Tokens (Metascript extensions) =====
     // All macros are now user-defined in std/macros/*.ms
     // The lexer only produces @ as a token, parser combines with identifier
@@ -286,6 +290,8 @@ pub const Token = struct {
             .keyword_double,
             .keyword_defer,
             .keyword_distinct,
+            .keyword_macro,
+            .keyword_quote,
             => true,
             else => false,
         };
@@ -389,6 +395,10 @@ pub fn initKeywordMap(allocator: std.mem.Allocator) !KeywordMap {
     // Metascript keywords
     try map.put("defer", .keyword_defer);
     try map.put("distinct", .keyword_distinct);
+
+    // Metascript macro keywords (Nim-style)
+    try map.put("macro", .keyword_macro);
+    try map.put("quote", .keyword_quote);
 
     return map;
 }

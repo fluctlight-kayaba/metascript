@@ -44,7 +44,10 @@ pub fn compileAndRunC(
 
     // Step 2: Write to temp file
     const temp_dir = "/tmp/metascript_exec_test";
-    try std.fs.makeDirAbsolute(temp_dir);
+    std.fs.makeDirAbsolute(temp_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {}, // Directory exists, that's fine
+        else => return err,
+    };
 
     const c_file = try std.fmt.allocPrint(allocator, "{s}/test.c", .{temp_dir});
     defer allocator.free(c_file);
@@ -59,9 +62,10 @@ pub fn compileAndRunC(
     }
 
     // Step 3: Compile with gcc
+    // Include path for ORC runtime headers (orc.h, ms_string.h)
     const gcc_result = try std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &[_][]const u8{ "gcc", c_file, "-o", out_file, "-lm" },
+        .argv = &[_][]const u8{ "gcc", "-I", "src/runtime", c_file, "-o", out_file, "-lm" },
     });
     defer allocator.free(gcc_result.stdout);
     defer allocator.free(gcc_result.stderr);
@@ -108,7 +112,10 @@ pub fn compileAndRunJS(
 
     // Step 2: Write to temp file
     const temp_dir = "/tmp/metascript_exec_test";
-    try std.fs.makeDirAbsolute(temp_dir);
+    std.fs.makeDirAbsolute(temp_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {}, // Directory exists, that's fine
+        else => return err,
+    };
 
     const js_file = try std.fmt.allocPrint(allocator, "{s}/test.js", .{temp_dir});
     defer allocator.free(js_file);
@@ -169,7 +176,10 @@ pub fn compileAndRunErlang(
 
     // Step 2: Write to temp file
     const temp_dir = "/tmp/metascript_exec_test";
-    try std.fs.makeDirAbsolute(temp_dir);
+    std.fs.makeDirAbsolute(temp_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {}, // Directory exists, that's fine
+        else => return err,
+    };
 
     const erl_file = try std.fmt.allocPrint(allocator, "{s}/test.erl", .{temp_dir});
     defer allocator.free(erl_file);

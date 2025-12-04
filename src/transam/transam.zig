@@ -1066,6 +1066,7 @@ pub const TransAmDatabase = struct {
             .keyword_float32, .keyword_float64,
             .keyword_int, .keyword_float, .keyword_double,
             .keyword_defer, .keyword_distinct,
+            .keyword_macro, .keyword_quote,
             => .keyword,
 
             // Macros - only @ sign now

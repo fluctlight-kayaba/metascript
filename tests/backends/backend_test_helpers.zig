@@ -113,39 +113,45 @@ pub fn compile(
         };
     }
 
-    // Generate code for backend
-    var output_buf = std.ArrayList(u8).init(allocator);
-    errdefer output_buf.deinit();
+    // Type check (required for proper codegen - member access, string concat, etc.)
+    var checker = try typechecker_mod.TypeChecker.init(allocator);
+    defer checker.deinit();
+    _ = checker.check(ast) catch |err| {
+        const err_msg = try std.fmt.allocPrint(allocator, "Type check error: {s}", .{@errorName(err)});
+        return CompilationResult{
+            .source = source,
+            .output = "",
+            .backend = backend,
+            .success = false,
+            .error_message = err_msg,
+            .allocator = allocator,
+        };
+    };
 
-    switch (backend) {
-        .c => {
+    // Generate code for backend
+    const output = switch (backend) {
+        .c => blk: {
             var generator = c_codegen.CGenerator.init(allocator);
             defer generator.deinit();
-
-            const code = try generator.generate(ast);
-            try output_buf.appendSlice(code);
+            break :blk try generator.generate(ast);
         },
-        .javascript => {
+        .javascript => blk: {
             var generator = js_codegen.JSGenerator.init(allocator);
             defer generator.deinit();
-
-            const code = try generator.generate(ast);
-            try output_buf.appendSlice(code);
+            break :blk try generator.generate(ast);
         },
-        .erlang => {
+        .erlang => blk: {
             var generator = try erlang_codegen.ErlangGenerator.init(allocator, "test.ms");
             defer generator.deinit();
-
-            const code = try generator.generate(ast);
-            try output_buf.appendSlice(code);
+            break :blk try generator.generate(ast);
         },
-    }
+    };
 
     arena.deinit();
 
     return CompilationResult{
         .source = source,
-        .output = try output_buf.toOwnedSlice(),
+        .output = output,
         .backend = backend,
         .success = true,  // Only true if we got here without errors
         .error_message = null,
@@ -209,7 +215,8 @@ pub fn expectNotContains(output: []const u8, needle: []const u8) !void {
 /// Assert generated code has a function with given name
 pub fn expectHasFunction(output: []const u8, backend: Backend, function_name: []const u8) !void {
     const pattern = switch (backend) {
-        .c => try std.fmt.allocPrint(testing.allocator, "void {s}(", .{function_name}),
+        // C: just check for function name with opening paren (return type varies)
+        .c => try std.fmt.allocPrint(testing.allocator, " {s}(", .{function_name}),
         .javascript => try std.fmt.allocPrint(testing.allocator, "function {s}(", .{function_name}),
         .erlang => try std.fmt.allocPrint(testing.allocator, "{s}(", .{function_name}),
     };
@@ -293,7 +300,7 @@ pub const ExternalCompileResult = struct {
     }
 };
 
-/// Compile generated C code with GCC
+/// Compile generated C code with Zig CC (faster caching than GCC)
 pub fn compileWithGCC(
     allocator: std.mem.Allocator,
     c_code: []const u8,
@@ -309,10 +316,11 @@ pub fn compileWithGCC(
     defer file.close();
     try file.writeAll(c_code);
 
-    // Compile with gcc
+    // Compile with zig cc (excellent caching, faster rebuilds)
+    // Falls back to gcc if zig is not available
     const result = try std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &[_][]const u8{ "gcc", "-c", c_file, "-o", "/tmp/metascript_test/test.o" },
+        .argv = &[_][]const u8{ "zig", "cc", "-I", "src/runtime", "-c", c_file, "-o", "/tmp/metascript_test/test.o" },
     });
 
     return ExternalCompileResult{

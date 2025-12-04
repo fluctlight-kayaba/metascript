@@ -22,6 +22,7 @@ pub const BinaryOp = node.BinaryOp;
 pub const UnaryOp = node.UnaryOp;
 pub const MacroInvocation = node.MacroInvocation;
 pub const ComptimeBlock = node.ComptimeBlock;
+pub const QuoteExpr = node.QuoteExpr;
 pub const Program = node.Program;
 
 /// AST Arena - manages memory for AST nodes
@@ -534,6 +535,17 @@ fn hashAstNodeImpl(hasher: *std.hash.Wyhash, n: *const Node) void {
         // Compile error
         .compile_error => {
             hasher.update(n.data.compile_error);
+        },
+
+        // Quote expression
+        .quote_expr => {
+            const quote = &n.data.quote_expr;
+            hashAstNodeImpl(hasher, quote.body);
+            std.hash.autoHash(hasher, quote.interpolations.len);
+            for (quote.interpolations) |interp| {
+                hasher.update(interp.placeholder);
+                hashAstNodeImpl(hasher, interp.expression);
+            }
         },
 
         // Program

@@ -286,6 +286,7 @@ pub const TypeResolver = struct {
             .macro_invocation,
             .comptime_block,
             .compile_error,
+            .quote_expr,
             .type_annotation,
             => {},
         }

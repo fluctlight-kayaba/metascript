@@ -17,6 +17,7 @@ const source_registry = @import("source_registry.zig");
 const Lexer = @import("../lexer/lexer.zig").Lexer;
 const Parser = @import("../parser/parser.zig").Parser;
 const disk_cache = @import("../transam/disk_cache.zig");
+const network_cache = @import("../transam/network_cache.zig");
 const bytecode_compiler = @import("../vm/bytecode_compiler.zig");
 
 /// Error set for macro expansion
@@ -50,8 +51,11 @@ pub const VMMacroContext = struct {
     /// Optional bytecode cache for faster macro execution
     bytecode_cache: ?*disk_cache.BytecodeCache,
 
+    /// Optional network cache for @comptime fetch() responses
+    net_cache: ?*network_cache.NetworkCache,
+
     pub fn init(arena: *ast.ASTArena, allocator: std.mem.Allocator) !VMMacroContext {
-        return initWithCache(arena, allocator, null);
+        return initWithCaches(arena, allocator, null, null);
     }
 
     /// Initialize with optional bytecode cache for faster execution
@@ -60,8 +64,18 @@ pub const VMMacroContext = struct {
         allocator: std.mem.Allocator,
         cache: ?*disk_cache.BytecodeCache,
     ) !VMMacroContext {
+        return initWithCaches(arena, allocator, cache, null);
+    }
+
+    /// Initialize with both bytecode and network caches
+    pub fn initWithCaches(
+        arena: *ast.ASTArena,
+        allocator: std.mem.Allocator,
+        bytecode_cache_ptr: ?*disk_cache.BytecodeCache,
+        net_cache_ptr: ?*network_cache.NetworkCache,
+    ) !VMMacroContext {
         const vm_instance = try allocator.create(vm.MacroVM);
-        vm_instance.* = try vm.MacroVM.initWithCache(allocator, arena, cache);
+        vm_instance.* = try vm.MacroVM.initWithCaches(allocator, arena, bytecode_cache_ptr, net_cache_ptr);
 
         return .{
             .arena = arena,
@@ -71,7 +85,8 @@ pub const VMMacroContext = struct {
             .errors = std.ArrayList(MacroErrorInfo).init(allocator),
             .source_buffers = std.ArrayList([]const u8).init(allocator),
             .allocated_paths = std.ArrayList([]const u8).init(allocator),
-            .bytecode_cache = cache,
+            .bytecode_cache = bytecode_cache_ptr,
+            .net_cache = net_cache_ptr,
         };
     }
 
@@ -394,7 +409,7 @@ pub fn expandAllMacros(
     allocator: std.mem.Allocator,
     program: *ast.Node,
 ) !*ast.Node {
-    return expandAllMacrosWithCache(arena, allocator, program, null);
+    return expandAllMacrosWithCaches(arena, allocator, program, null, null);
 }
 
 /// Expand all macros with optional bytecode cache for faster execution
@@ -404,7 +419,19 @@ pub fn expandAllMacrosWithCache(
     program: *ast.Node,
     cache: ?*disk_cache.BytecodeCache,
 ) !*ast.Node {
-    var ctx = try VMMacroContext.initWithCache(arena, allocator, cache);
+    return expandAllMacrosWithCaches(arena, allocator, program, cache, null);
+}
+
+/// Expand all macros with both bytecode and network caches
+/// Network cache enables @comptime fetch() to cache responses across compilations
+pub fn expandAllMacrosWithCaches(
+    arena: *ast.ASTArena,
+    allocator: std.mem.Allocator,
+    program: *ast.Node,
+    bytecode_cache_ptr: ?*disk_cache.BytecodeCache,
+    net_cache_ptr: ?*network_cache.NetworkCache,
+) !*ast.Node {
+    var ctx = try VMMacroContext.initWithCaches(arena, allocator, bytecode_cache_ptr, net_cache_ptr);
     defer ctx.deinit();
 
     var exp = VMMacroExpander.init(&ctx);

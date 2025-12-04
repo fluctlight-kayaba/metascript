@@ -267,8 +267,30 @@ pub fn setup(
     const test_should_fail_step = b.step("test-should-fail", "Test that unsupported features actually fail");
     test_should_fail_step.dependOn(&run_test_should_fail_tests.step);
 
-    // Backend test step
-    const test_backends_step = b.step("test-backends", "Run backend code generation tests (Phase 1 TDD)");
+    // C backend execution tests (compile + run + verify output)
+    const c_execution_tests = b.addTest(.{
+        .root_source_file = b.path("tests/backends/c_execution_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    c_execution_tests.root_module.addImport("src", src_module);
+    const run_c_execution_tests = b.addRunArtifact(c_execution_tests);
+
+    // Individual backend test steps (focus on one backend at a time)
+    const test_c_step = b.step("test-backend-c", "Run C backend tests only");
+    test_c_step.dependOn(&run_c_backend_tests.step);
+
+    const test_c_exec_step = b.step("test-c-exec", "Run C backend execution tests (compile + run + verify output)");
+    test_c_exec_step.dependOn(&run_c_execution_tests.step);
+
+    const test_erlang_step = b.step("test-backend-erlang", "Run Erlang backend tests only");
+    test_erlang_step.dependOn(&run_erlang_backend_tests.step);
+
+    const test_cross_step = b.step("test-backend-cross", "Run cross-backend parity tests");
+    test_cross_step.dependOn(&run_cross_backend_tests.step);
+
+    // Combined backend test step (all backends)
+    const test_backends_step = b.step("test-backends", "Run ALL backend code generation tests (Phase 1 TDD)");
     test_backends_step.dependOn(&run_erlang_backend_tests.step);
     test_backends_step.dependOn(&run_c_backend_tests.step);
     test_backends_step.dependOn(&run_cross_backend_tests.step);

@@ -550,7 +550,13 @@ fn formatType(allocator: std.mem.Allocator, typ: ?*types_mod.Type) ![]const u8 {
             }
             break :blk try buf.toOwnedSlice();
         },
-        .object => try allocator.dupe(u8, "object"),
+        .object => blk: {
+            // Use the class name if available, otherwise "object"
+            if (t.data.object.name) |class_name| {
+                break :blk try allocator.dupe(u8, class_name);
+            }
+            break :blk try allocator.dupe(u8, "object");
+        },
         .tuple => try allocator.dupe(u8, "tuple"),
         .generic_param => blk: {
             break :blk try allocator.dupe(u8, t.data.generic_param.name);

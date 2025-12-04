@@ -107,9 +107,11 @@ pub const CGenerator = struct {
         var scope = self.scope_stack.pop().?;
         defer scope.deinit();
 
-        // If DRC is used, cleanup happens before return statements
-        // Don't emit here to avoid unreachable code after return
-        if (self.drc != null) return;
+        // If DRC is used, emit DRC ops for current line (scope exit ops)
+        if (self.drc) |drc| {
+            try self.emitDrcOpsForLine(drc, self.current_line);
+            return;
+        }
 
         // Legacy mode: emit decrefs in reverse order (LIFO)
         var i: usize = scope.vars.items.len;
@@ -123,6 +125,13 @@ pub const CGenerator = struct {
             try self.emit(v.type_name);
             try self.emit("_type);\n");
         }
+    }
+
+    /// Pop scope WITHOUT emitting cleanup (used when control flow already handled it)
+    fn popScopeNoCleanup(self: *Self) !void {
+        if (self.scope_stack.items.len == 0) return;
+        var scope = self.scope_stack.pop().?;
+        scope.deinit();
     }
 
     /// Emit RC operations from DRC analysis for a specific line
@@ -462,6 +471,34 @@ pub const CGenerator = struct {
 
         self.indent_level -= 1;
         try self.emit("};\n\n");
+
+        // Emit portable _new() constructor function
+        // This replaces GCC statement expressions with standard C
+        try self.emit("static inline ");
+        try self.emit(class_name);
+        try self.emit("* ");
+        try self.emit(class_name);
+        try self.emit("_new(void) {\n");
+        self.indent_level += 1;
+
+        try self.emitIndent();
+        try self.emit(class_name);
+        try self.emit("* _t = (");
+        try self.emit(class_name);
+        try self.emit("*)ms_alloc(sizeof(");
+        try self.emit(class_name);
+        try self.emit("));\n");
+
+        try self.emitIndent();
+        try self.emit("ms_set_type(_t, &");
+        try self.emit(class_name);
+        try self.emit("_type);\n");
+
+        try self.emitIndent();
+        try self.emit("return _t;\n");
+
+        self.indent_level -= 1;
+        try self.emit("}\n\n");
     }
 
     /// Emit method prototype: returnType ClassName_methodName(ClassName* this, params...)
@@ -855,8 +892,23 @@ pub const CGenerator = struct {
             self.current_line = block.statements[block.statements.len - 1].location.start.line;
         }
 
-        // Emit ORC cleanup (decrefs) before closing scope
-        try self.popScopeWithCleanup();
+        // Check if block ends with return/break/continue (control flow exit)
+        // If so, skip cleanup - it was already emitted by the return statement
+        const ends_with_control_flow = if (block.statements.len > 0)
+            switch (block.statements[block.statements.len - 1].kind) {
+                .return_stmt, .break_stmt, .continue_stmt => true,
+                else => false,
+            }
+        else
+            false;
+
+        // Emit ORC cleanup (decrefs) before closing scope - but only if we didn't already
+        if (!ends_with_control_flow) {
+            try self.popScopeWithCleanup();
+        } else {
+            // Still need to pop scope, just skip the cleanup emission
+            try self.popScopeNoCleanup();
+        }
 
         self.indent_level -= 1;
         try self.emitIndent();
@@ -1030,8 +1082,16 @@ pub const CGenerator = struct {
     fn emitReturnStmt(self: *Self, node: *ast.Node) !void {
         const ret = &node.data.return_stmt;
 
-        // Emit cleanup for all scopes before return (early exit)
-        try self.emitAllScopeCleanup();
+        // Check if we have any cleanup to emit
+        const has_cleanup = self.hasAnyCleanup();
+
+        if (has_cleanup) {
+            // Emit cleanup for all scopes before return (early exit)
+            // Note: caller already emitted indent for this line, so cleanup goes on next line
+            try self.emit("\n"); // End the current (empty) line
+            try self.emitAllScopeCleanup();
+            try self.emitIndent(); // Indent for the return statement
+        }
 
         try self.emit("return");
         if (ret.argument) |arg| {
@@ -1039,6 +1099,20 @@ pub const CGenerator = struct {
             try self.emitExpression(arg);
         }
         try self.emit(";\n");
+    }
+
+    /// Check if any scope has variables that need cleanup
+    fn hasAnyCleanup(self: *Self) bool {
+        // In DRC mode, check if there are ops for current line
+        if (self.drc) |drc| {
+            const ops = drc.getOpsForLine(self.current_line);
+            return ops.len > 0;
+        }
+        // Legacy mode: check scope stack
+        for (self.scope_stack.items) |scope| {
+            if (scope.vars.items.len > 0) return true;
+        }
+        return false;
     }
 
     /// Emit cleanup for all scopes (used for early return)
@@ -1084,7 +1158,8 @@ pub const CGenerator = struct {
             if (arg.type) |arg_type| {
                 switch (arg_type.kind) {
                     .number, .float32, .float64 => try format_parts.appendSlice("%g"),
-                    .int32, .int64 => try format_parts.appendSlice("%ld"),
+                    .int32 => try format_parts.appendSlice("%d"),
+                    .int64 => try format_parts.appendSlice("%lld"),
                     .string => try format_parts.appendSlice("%s"),
                     .boolean => try format_parts.appendSlice("%d"),
                     .object => {
@@ -1098,7 +1173,8 @@ pub const CGenerator = struct {
                             // Add format specifier based on property type
                             switch (prop.type.kind) {
                                 .number, .float32, .float64 => try format_parts.appendSlice("%g"),
-                                .int32, .int64 => try format_parts.appendSlice("%ld"),
+                                .int32 => try format_parts.appendSlice("%d"),
+                                .int64 => try format_parts.appendSlice("%lld"),
                                 .string => try format_parts.appendSlice("%s"),
                                 .boolean => try format_parts.appendSlice("%d"),
                                 else => try format_parts.appendSlice("%g"),
@@ -1149,11 +1225,14 @@ pub const CGenerator = struct {
                     try self.emitExpression(arg);
                     continue;
                 }
-                // For numeric types, cast to double to ensure correct printf behavior
-                // This handles the case where we emitted 'int' in C but printf expects 'double' for %g
-                if (arg_type.kind == .number or arg_type.kind == .float32 or arg_type.kind == .float64 or
-                    arg_type.kind == .int32 or arg_type.kind == .int64)
-                {
+                // Integers: emit directly (format string uses %d/%lld)
+                if (arg_type.kind == .int32 or arg_type.kind == .int64) {
+                    try self.emit(", ");
+                    try self.emitExpression(arg);
+                    continue;
+                }
+                // Floats/number: cast to double for %g format
+                if (arg_type.kind == .number or arg_type.kind == .float32 or arg_type.kind == .float64) {
                     try self.emit(", (double)(");
                     try self.emitExpression(arg);
                     try self.emit(")");
@@ -1204,6 +1283,34 @@ pub const CGenerator = struct {
             },
             .binary_expr => {
                 const binary = &node.data.binary_expr;
+
+                // Try constant folding: if both operands are number literals, evaluate at compile time
+                if (binary.left.kind == .number_literal and binary.right.kind == .number_literal) {
+                    const left_val = binary.left.data.number_literal;
+                    const right_val = binary.right.data.number_literal;
+                    const result: ?f64 = switch (binary.op) {
+                        .add => left_val + right_val,
+                        .sub => left_val - right_val,
+                        .mul => left_val * right_val,
+                        .div => if (right_val != 0) left_val / right_val else null,
+                        .mod => if (right_val != 0) @mod(left_val, right_val) else null,
+                        else => null, // Comparison ops, etc. - not folded
+                    };
+                    if (result) |val| {
+                        // Emit the constant value directly
+                        var buf: [64]u8 = undefined;
+                        // Check if result is integer
+                        if (@floor(val) == val and val >= -2147483648 and val <= 2147483647) {
+                            const int_val: i64 = @intFromFloat(val);
+                            const s = std.fmt.bufPrint(&buf, "{d}", .{int_val}) catch "0";
+                            try self.emit(s);
+                        } else {
+                            const s = std.fmt.bufPrint(&buf, "{d}", .{val}) catch "0";
+                            try self.emit(s);
+                        }
+                        return;
+                    }
+                }
 
                 // Check for string concatenation (+ with string operands)
                 if (binary.op == .add) {
@@ -1265,13 +1372,15 @@ pub const CGenerator = struct {
                 }
 
                 // Default: regular binary expression
-                try self.emit("(");
+                // Skip outer parens for assignment operators (already lowest precedence)
+                const is_assign = binary.op == .assign;
+                if (!is_assign) try self.emit("(");
                 try self.emitExpression(binary.left);
                 try self.emit(" ");
                 try self.emit(binaryOpToString(binary.op));
                 try self.emit(" ");
                 try self.emitExpression(binary.right);
-                try self.emit(")");
+                if (!is_assign) try self.emit(")");
             },
             .unary_expr => {
                 const unary = &node.data.unary_expr;
@@ -1364,20 +1473,13 @@ pub const CGenerator = struct {
                 try self.emit("}");
             },
             .new_expr => {
-                // Emit: ({ ClassName* _t = (ClassName*)ms_alloc(sizeof(ClassName)); ms_set_type(_t, &ClassName_type); _t; })
-                // Uses GCC statement expression to allocate + register with ORC in one expression
+                // Emit: ClassName_new() - calls the generated constructor function
+                // Uses standard C99 instead of GCC statement expressions
                 const new_e = &node.data.new_expr;
                 if (new_e.callee.kind == .identifier) {
                     const class_name = new_e.callee.data.identifier;
-                    try self.emit("({ ");
                     try self.emit(class_name);
-                    try self.emit("* _t = (");
-                    try self.emit(class_name);
-                    try self.emit("*)ms_alloc(sizeof(");
-                    try self.emit(class_name);
-                    try self.emit(")); ms_set_type(_t, &");
-                    try self.emit(class_name);
-                    try self.emit("_type); _t; })");
+                    try self.emit("_new()");
                 } else {
                     try self.emit("/* unsupported: new with non-identifier */");
                 }

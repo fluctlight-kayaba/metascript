@@ -4,6 +4,18 @@
 
 ---
 
+## Syntax Design (Nim-Inspired)
+
+**The Rule:**
+| Action | Syntax | Example |
+|--------|--------|---------|
+| **Define** | Keyword only | `macro derive(...)` |
+| **Use** | Always `@` prefix | `@derive(Eq)`, `@comptime { }` |
+
+**Rationale:** Nim's simplicity + TypeScript's `@` familiarity for usage sites.
+
+---
+
 ## Core Concept
 
 Macros run at **compile-time** to generate code:
@@ -233,16 +245,25 @@ function add(a: number, b: number): number { return a + b; }
 
 ## Custom Macro Development
 
+**Defining a macro** (use `macro` keyword, Nim-style):
 ```typescript
-// macros/my-macro.ts
-export function myMacro(target: ClassDeclaration): void {
-    const methods = target.fields.map(field => `
-        get${capitalize(field.name)}() { return this.${field.name}; }
-        set${capitalize(field.name)}(value: ${field.type}) { this.${field.name} = value; }
-    `);
-    target.addMethods(methods);
+// macros/my-macro.ms
+macro myMacro(ctx: MacroContext) {
+    for field in ctx.target.fields {
+        quote {
+            get${capitalize(field.name)}(): ${field.type} {
+                return this.${field.name};
+            }
+            set${capitalize(field.name)}(value: ${field.type}) {
+                this.${field.name} = value;
+            }
+        }
+    }
 }
+```
 
+**Using a macro** (always `@` prefix):
+```typescript
 @myMacro
 class User {
     name: string;
@@ -251,18 +272,29 @@ class User {
 // Auto-generates getName(), setName(), getAge(), setAge()
 ```
 
+**The `quote` block:**
+- Code inside `quote { }` becomes AST at compile-time
+- `${expr}` interpolates values into the quoted AST
+- No manual `ast.createMethod()` calls needed!
+
 **Macro API:**
 ```typescript
-interface TypeInfo {
-    name: string;
-    fields: Field[];
-    methods: Method[];
-    parent: TypeInfo | null;
+interface MacroContext {
+    target: TargetInfo;      // The decorated class/function
+    args: any[];             // Arguments passed to @macro(...)
 }
 
+interface TargetInfo {
+    name: string;
+    kind: "class" | "function" | "property";
+    fields: Field[];
+    methods: Method[];
+}
+
+// Compile-time I/O (available in macro bodies and @comptime blocks)
 function readFile(path: string): string;
 function exec(command: string): string;
-function getTypeInfo<T>(): TypeInfo;
+function fetch(url: string): Response;
 function readEnv(key: string): string;
 ```
 

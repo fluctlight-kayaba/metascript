@@ -4,30 +4,42 @@
 
 ---
 
+## Syntax Design
+
+**The Rule:**
+| Action | Syntax | Example |
+|--------|--------|---------|
+| **Define** | `macro` keyword (no @) | `macro derive(ctx) { }` |
+| **Use** | Always `@` prefix | `@derive(Eq)`, `@comptime { }` |
+
+**Rationale:** Nim's clean `macro` keyword for definitions + TypeScript's `@` familiarity for usage.
+
+---
+
 ## Overview
 
-Like Nim, macros are regular functions marked with `@macro`. They:
+Like Nim, macros use the `macro` keyword. They:
 1. Live in normal `.ms` source files
 2. Get parsed/cached by Trans-Am engine
 3. Execute at compile-time to generate AST
 4. Integrate with LSP for real-time feedback
 
 ```typescript
-// macros.ms - macro definitions as normal code
-@macro
-function derive(ctx: MacroContext): void {
-    const { target, traits } = ctx;
-
-    for (const trait of traits) {
-        if (trait === "Eq") {
-            // AST manipulation runs at compile-time
-            const method = ast.createMethod("equals", ...);
-            target.addMethod(method);
+// macros.ms - macro definitions using `macro` keyword
+macro derive(ctx: MacroContext) {
+    for trait in ctx.traits {
+        if trait == "Eq" {
+            // quote block generates AST at compile-time
+            quote {
+                equals(other: ${ctx.target.name}): boolean {
+                    return ${generateFieldComparison(ctx.target.fields)};
+                }
+            }
         }
     }
 }
 
-// user.ms - macro usage
+// user.ms - macro usage (always @ prefix)
 @derive(Eq, Hash)
 class User {
     name: string;
@@ -48,9 +60,9 @@ class User {
 │  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐                │
 │  │ macros.ms    │     │ utils.ms     │     │ user.ms      │                │
 │  │              │     │              │     │              │                │
-│  │ @macro       │     │ function     │     │ @derive(Eq)  │                │
-│  │ function     │     │ helper()     │     │ class User   │                │
-│  │ derive()     │     │ { ... }      │     │ { ... }      │                │
+│  │ macro        │     │ function     │     │ @derive(Eq)  │                │
+│  │ derive(ctx)  │     │ helper()     │     │ class User   │                │
+│  │ { ... }      │     │ { ... }      │     │ { ... }      │                │
 │  └──────┬───────┘     └──────────────┘     └──────┬───────┘                │
 │         │                                         │                         │
 │         ▼                                         ▼                         │
@@ -58,7 +70,7 @@ class User {
 │  │                      LEXER + PARSER                          │          │
 │  │  - Tokenize all source files                                 │          │
 │  │  - Build AST for each file                                   │          │
-│  │  - Identify @macro function declarations                     │          │
+│  │  - Identify `macro` keyword declarations                     │          │
 │  │  - Identify @macroName usage sites                           │          │
 │  └──────────────────────────────────────────────────────────────┘          │
 │                                │                                            │
@@ -95,9 +107,9 @@ class User {
 │  │ Macro AST      │───▶│ Metascript     │───▶│ JavaScript     │            │
 │  │ (Zig *Node)    │    │ Printer        │    │ Source         │            │
 │  │                │    │                │    │                │            │
-│  │ @macro         │    │ function       │    │ function       │            │
-│  │ function       │    │ derive(ctx)    │    │ derive(ctx)    │            │
-│  │ derive(...)    │    │ { ... }        │    │ { ... }        │            │
+│  │ macro          │    │ macro          │    │ function       │            │
+│  │ derive(ctx)    │    │ derive(ctx)    │    │ derive(ctx)    │            │
+│  │ { ... }        │    │ { ... }        │    │ { ... }        │            │
 │  └────────────────┘    └────────────────┘    └────────────────┘            │
 │                                                     │                       │
 │                                                     ▼                       │
@@ -173,27 +185,39 @@ class User {
 
 ## Phase 1: Macro Discovery
 
-### 1.1 Syntax: `@macro` Decorator
+### 1.1 Syntax: `macro` Keyword (FINAL DESIGN)
 
 ```typescript
-// Option A: Decorator style (TypeScript-like)
-@macro
-function derive(ctx: MacroContext): void {
-    // ...
+// FINAL: Nim-style keyword for definition, @ for usage
+macro derive(ctx: MacroContext) {
+    for trait in ctx.traits {
+        if trait == "Eq" {
+            quote {
+                equals(other: ${ctx.target.name}): boolean {
+                    return ${generateFieldComparison(ctx.target.fields)};
+                }
+            }
+        }
+    }
 }
 
-// Option B: Keyword style (Nim-like)
-macro function derive(ctx: MacroContext): void {
-    // ...
+// Usage always uses @ prefix
+@derive(Eq, Hash)
+class User {
+    name: string;
+    age: number;
 }
 
-// Option C: Type annotation style
-function derive(ctx: MacroContext): void @comptime {
-    // ...
-}
+// @comptime for inline compile-time blocks
+const version = @comptime {
+    exec("git rev-parse --short HEAD")
+};
 ```
 
-**Recommended: Option A** - Decorator style is consistent with `@derive` usage.
+**Design Rationale:**
+- `macro` keyword (no @) for definitions - clean, Nim-inspired
+- `@name(...)` for usage - familiar TypeScript decorator syntax
+- `@comptime { }` for inline compile-time blocks - consistent with usage pattern
 
 ### 1.2 Parser Changes
 
@@ -201,8 +225,8 @@ function derive(ctx: MacroContext): void @comptime {
 // src/parser/parser.zig
 
 fn parseDeclaration(self: *Parser) !*Node {
-    // Check for @macro decorator
-    if (self.checkDecorator("macro")) {
+    // Check for `macro` keyword (Nim-style, no @ prefix)
+    if (self.check(.keyword_macro)) {
         return self.parseMacroDefinition();
     }
 
@@ -210,19 +234,40 @@ fn parseDeclaration(self: *Parser) !*Node {
 }
 
 fn parseMacroDefinition(self: *Parser) !*Node {
-    _ = try self.consumeDecorator("macro");
+    _ = try self.consume(.keyword_macro, "Expected 'macro' keyword");
 
-    // Parse the function normally
-    const func = try self.parseFunctionDeclaration();
+    // Parse macro name
+    const name = try self.consume(.identifier, "Expected macro name");
 
-    // Mark it as a macro (different node kind or flag)
-    return self.arena.createNode(.macro_decl, func.loc, .{
+    // Parse parameters
+    _ = try self.consume(.left_paren, "Expected '(' after macro name");
+    const params = try self.parseParameterList();
+    _ = try self.consume(.right_paren, "Expected ')' after parameters");
+
+    // Parse body (may contain `quote { }` blocks)
+    const body = try self.parseBlock();
+
+    return self.arena.createNode(.macro_decl, name.loc, .{
         .macro_decl = .{
-            .name = func.data.function_decl.name,
-            .params = func.data.function_decl.params,
-            .body = func.data.function_decl.body,
-            .return_type = func.data.function_decl.return_type,
+            .name = name.lexeme,
+            .params = params,
+            .body = body,
         },
+    });
+}
+
+fn parseQuoteBlock(self: *Parser) !*Node {
+    // Parse `quote { ... }` - AST quotation
+    _ = try self.consume(.keyword_quote, "Expected 'quote' keyword");
+    _ = try self.consume(.left_brace, "Expected '{' after quote");
+
+    // Parse quoted code (becomes AST at compile-time)
+    const quoted_stmts = try self.parseStatementList();
+
+    _ = try self.consume(.right_brace, "Expected '}' to close quote block");
+
+    return self.arena.createNode(.quote_expr, self.previous().loc, .{
+        .quote_expr = .{ .body = quoted_stmts },
     });
 }
 ```
@@ -450,10 +495,11 @@ fn handleCompletion(db: *QueryDatabase, params: CompletionParams) ![]CompletionI
 
 pub const SemanticTokenType = enum {
     // ... existing types ...
-    macro,           // @macro function definitions
+    macro,           // `macro` keyword definitions
+    quote,           // `quote` blocks
     macroUsage,      // @derive, @comptime, etc.
     macroParameter,  // Parameters inside macro body
-    comptimeCode,    // Code inside macro body (different color)
+    comptimeCode,    // Code inside macro/quote body (different color)
 };
 
 fn computeSemanticTokens(db: *QueryDatabase, file_id: FileId) ![]SemanticToken {
@@ -532,7 +578,7 @@ fn highlightMacroBody(self: *SemanticTokenizer, tokens: *std.ArrayList(SemanticT
 │                                                                  │
 │  macros.ms                                                       │
 │  ┌─────────────────┐                                            │
-│  │ @macro derive() │─────────────────┐                          │
+│  │ macro derive()  │─────────────────┐                          │
 │  └─────────────────┘                 │                          │
 │           │                          │                          │
 │           │ defines                  │ defines                  │
@@ -601,10 +647,18 @@ module.exports = grammar({
   rules: {
     // ... existing rules ...
 
-    // Macro definition
+    // Macro definition (keyword-based, no @)
     macro_definition: $ => seq(
-      '@macro',
-      $.function_declaration
+      'macro',
+      $.identifier,
+      $.parameter_list,
+      $.block
+    ),
+
+    // Quote block for AST generation
+    quote_block: $ => seq(
+      'quote',
+      $.block
     ),
 
     // Decorator (including macro usage)
@@ -631,11 +685,14 @@ module.exports = grammar({
 ```scm
 ; tree-sitter-metascript/queries/highlights.scm
 
-; Macro definition
+; Macro definition (keyword-based)
 (macro_definition
-  "@macro" @keyword.macro
-  (function_declaration
-    name: (identifier) @function.macro))
+  "macro" @keyword.macro
+  (identifier) @function.macro)
+
+; Quote block
+(quote_block
+  "quote" @keyword.quote)
 
 ; Macro usage (decorator)
 (decorator
@@ -656,7 +713,7 @@ module.exports = grammar({
 Tree-sitter provides static highlighting. LSP semantic tokens provide **dynamic** highlighting based on:
 
 1. **Macro expansion state** - Is this macro successfully expanded?
-2. **Macro body context** - Code inside `@macro` functions is compile-time
+2. **Macro body context** - Code inside `macro` functions and `quote` blocks is compile-time
 3. **Generated code preview** - Inline hints showing what's generated
 
 ### 5.1 VSCode Theme Extension
@@ -865,8 +922,9 @@ If LSP doesn't understand macros, users will:
 ## Implementation Roadmap
 
 ### Week 1-2: Parser & AST
-- [ ] Add `@macro` decorator support in parser
-- [ ] Add `macro_decl` node kind
+- [ ] Add `macro` keyword support in lexer
+- [ ] Add `quote` keyword support in lexer
+- [ ] Add `macro_decl` and `quote_expr` node kinds
 - [ ] Create `MacroRegistry` for tracking definitions/usages
 - [ ] Test: Parse macro definitions and usages
 
@@ -906,12 +964,21 @@ If LSP doesn't understand macros, users will:
 
 ## Summary
 
+**Syntax Design:**
+```
+DEFINE:  macro name(ctx) { quote { ... } }
+USE:     @name(...)
+INLINE:  @comptime { ... }
+```
+
 **Source-defined macros combine:**
 
-1. **Nim-style definition** - `@macro function` in regular `.ms` files
-2. **Trans-Am caching** - Bytecode cached, smart invalidation
-3. **LSP integration** - Hover preview, go-to-definition, completion
-4. **Semantic highlighting** - Different colors for compile-time code
+1. **Nim-style definition** - `macro` keyword (no @) in regular `.ms` files
+2. **Quote blocks** - `quote { }` for AST generation (no manual ast.createX calls)
+3. **@ for usage** - `@derive(Eq)`, `@comptime { }` - familiar TypeScript style
+4. **Trans-Am caching** - Bytecode cached, smart invalidation
+5. **LSP integration** - Hover preview, go-to-definition, completion
+6. **Semantic highlighting** - Different colors for compile-time code
 
 **Key insight:** The macro body is regular Metascript code that happens to run at compile-time. This means:
 - Same parser, same AST

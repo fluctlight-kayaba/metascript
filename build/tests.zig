@@ -311,6 +311,28 @@ pub fn setup(
     const test_execution_step = b.step("test-execution", "Run enhanced execution analytics (compile + run generated code)");
     test_execution_step.dependOn(&run_execution_analytics_tests.step);
 
+    // Score Codegen - Comprehensive quality scoring (uses zig cc for fast C compilation)
+    const score_codegen_tests = b.addTest(.{
+        .root_source_file = b.path("tests/backends/score_codegen.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    score_codegen_tests.root_module.addImport("src", src_module);
+    const run_score_codegen_tests = b.addRunArtifact(score_codegen_tests);
+
+    const test_score_codegen_step = b.step("test-score-codegen", "Run comprehensive codegen quality scoring (compile + quality + component attribution)");
+    test_score_codegen_step.dependOn(&run_score_codegen_tests.step);
+
+    // Convenience aliases for score-codegen
+    const score_c_step = b.step("score-c", "Score C backend only");
+    score_c_step.dependOn(&run_score_codegen_tests.step);
+
+    const score_js_step = b.step("score-js", "Score JavaScript backend only");
+    score_js_step.dependOn(&run_score_codegen_tests.step);
+
+    const score_erl_step = b.step("score-erl", "Score Erlang backend only");
+    score_erl_step.dependOn(&run_score_codegen_tests.step);
+
     // =========================================================================
     // Aggregate Test Steps
     // =========================================================================

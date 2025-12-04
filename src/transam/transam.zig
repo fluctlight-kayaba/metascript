@@ -931,9 +931,10 @@ pub const TransAmDatabase = struct {
     }
 
     /// Look up a symbol by name in a file's symbol table
+    /// Uses lookupAll to search ALL scopes (including function-local variables)
     pub fn lookupSymbol(self: *Self, file_id: []const u8, name: []const u8) !?checker.symbol.Symbol {
         const symbols = try self.getSymbols(file_id);
-        return symbols.lookup(name);
+        return symbols.lookupAll(name);
     }
 
     /// Invalidate type checker cache for a file (called when file changes)

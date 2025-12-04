@@ -471,7 +471,18 @@ pub fn typeToString(allocator: std.mem.Allocator, t: ?*Type) ![]const u8 {
         },
         .type_reference => try allocator.dupe(u8, typ.data.type_reference.name),
         .function => try allocator.dupe(u8, "function"),
-        else => try allocator.dupe(u8, "<complex>"),
+        .object => blk: {
+            // Use class name if available, otherwise "object"
+            if (typ.data.object.name) |class_name| {
+                break :blk try allocator.dupe(u8, class_name);
+            }
+            break :blk try allocator.dupe(u8, "object");
+        },
+        .tuple => try allocator.dupe(u8, "tuple"),
+        .generic_param => try allocator.dupe(u8, typ.data.generic_param.name),
+        .generic_instance => try allocator.dupe(u8, "generic"),
+        .intersection => try allocator.dupe(u8, "intersection"),
+        .@"union" => try allocator.dupe(u8, "union"),
     };
 }
 

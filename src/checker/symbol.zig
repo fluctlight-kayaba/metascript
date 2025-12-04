@@ -228,6 +228,21 @@ pub const SymbolTable = struct {
     pub fn updateType(self: *SymbolTable, name: []const u8, new_type: *types.Type) !void {
         try self.current.updateType(name, new_type);
     }
+
+    /// Look up a symbol in ALL scopes (not just current and parents)
+    /// This is used by LSP for hover - after type checking, current scope
+    /// is back to global, but we need to find symbols in child scopes.
+    pub fn lookupAll(self: *SymbolTable, name: []const u8) ?Symbol {
+        // Search all scopes in reverse order (most recent first = inner scopes)
+        var i: usize = self.scopes.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.scopes.items[i].lookupLocal(name)) |sym| {
+                return sym;
+            }
+        }
+        return null;
+    }
 };
 
 /// Define built-in types and functions

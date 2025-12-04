@@ -266,7 +266,8 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
             colors.Color.reset.code(),
         });
 
-        // Disable move optimization - isLastUse is broken for single-pass analysis
+        // Move optimization disabled - causes memory leaks (marks vars as moved prematurely)
+        // TODO: Fix move optimization to only move when ownership is actually transferred
         drc_storage = Drc.initWithConfig(allocator, .{
             .enable_move_optimization = false,
             .enable_cycle_detection = true,

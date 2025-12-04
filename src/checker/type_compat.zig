@@ -85,13 +85,19 @@ pub fn typesCompatible(target: *types.Type, source: *types.Type) bool {
         return std.mem.eql(u8, target.data.type_reference.name, source.data.type_reference.name);
     }
 
-    // type_reference to a builtin primitive
+    // type_reference to a builtin primitive or class type
     if (target.kind == .type_reference) {
         const target_name = target.data.type_reference.name;
         // Check if source matches the referenced type
         if (std.mem.eql(u8, target_name, "number") and isNumericTypeResolved(source)) return true;
         if (std.mem.eql(u8, target_name, "string") and isStringType(source)) return true;
         if (std.mem.eql(u8, target_name, "boolean") and isBooleanType(source)) return true;
+        // Check if source is an object type with matching class name
+        if (source.kind == .object) {
+            if (source.data.object.name) |source_class_name| {
+                if (std.mem.eql(u8, target_name, source_class_name)) return true;
+            }
+        }
     }
     if (source.kind == .type_reference) {
         const source_name = source.data.type_reference.name;
@@ -99,6 +105,12 @@ pub fn typesCompatible(target: *types.Type, source: *types.Type) bool {
         if (std.mem.eql(u8, source_name, "number") and isNumericTypeResolved(target)) return true;
         if (std.mem.eql(u8, source_name, "string") and isStringType(target)) return true;
         if (std.mem.eql(u8, source_name, "boolean") and isBooleanType(target)) return true;
+        // Check if target is an object type with matching class name
+        if (target.kind == .object) {
+            if (target.data.object.name) |target_class_name| {
+                if (std.mem.eql(u8, source_name, target_class_name)) return true;
+            }
+        }
     }
 
     // Same kind is often compatible, but need deeper checks for complex types
@@ -159,6 +171,14 @@ pub fn typesCompatible(target: *types.Type, source: *types.Type) bool {
 /// Check if an object type is compatible with another (structural typing)
 /// Source must have all required properties of target with compatible types
 pub fn objectTypesCompatible(target: *types.ObjectType, source: *types.ObjectType) bool {
+    // Fast path: if both have the same class name, they're compatible (nominal typing for classes)
+    if (target.name != null and source.name != null) {
+        if (std.mem.eql(u8, target.name.?, source.name.?)) {
+            return true;
+        }
+    }
+
+    // Fall back to structural typing for anonymous objects or different class names
     // For each property in target, source must have a compatible property
     for (target.properties) |target_prop| {
         var found = false;

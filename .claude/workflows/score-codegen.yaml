@@ -1,0 +1,382 @@
+# Score-Codegen Workflow
+# Comprehensive code generation quality scoring for Metascript compiler
+# Version: 1.0.0
+
+name: score-codegen
+version: 1.0.0
+description: |
+  Evaluates compilation, execution, and code quality across C, JS, and Erlang backends.
+  Maps issues to compiler infrastructure components for targeted improvements.
+
+trigger:
+  command: /score-codegen
+  args:
+    backends:
+      type: string
+      default: "c,js,erl"
+      description: "Comma-separated backends (c, js, erl)"
+    fixtures:
+      type: string
+      default: "all"
+      description: "Fixture categories to test"
+    verbose:
+      type: boolean
+      default: false
+
+constants:
+  fixture_base: /Users/le/projects/metascript/tests/fixtures
+  backend_tests: /Users/le/projects/metascript/tests/backends
+  output_dir: /Users/le/projects/metascript/.score-codegen
+  review_standards: /Users/le/projects/metascript/tests/backends/PRINCIPAL_ENGINEER_REVIEW.md
+
+# =============================================================================
+# WORKFLOW STAGES
+# =============================================================================
+
+stages:
+  # ---------------------------------------------------------------------------
+  # STAGE 0: Setup and Discovery
+  # ---------------------------------------------------------------------------
+  - id: setup
+    name: Environment Setup & Discovery
+    agent: environment-scanner
+    timeout: 30s
+
+    actions:
+      - discover_fixtures:
+          path: ${fixture_base}
+          categories:
+            - algorithms
+            - basic
+            - bugs
+            - classes
+            - control_flow
+            - executable
+            - patterns
+
+      - load_baseline:
+          path: ${output_dir}/baseline.json
+          fallback: null
+
+      - validate_backends:
+          backends: ${args.backends}
+          tools:
+            c: [gcc, clang]
+            js: [node]
+            erl: [erl, erlc]
+
+    outputs:
+      - available_fixtures
+      - backend_configs
+      - previous_baseline
+
+  # ---------------------------------------------------------------------------
+  # STAGE 1: Parallel Compilation
+  # ---------------------------------------------------------------------------
+  - id: compile
+    name: Compile All Fixtures
+    depends_on: setup
+    parallel: true
+    timeout: 5m
+
+    matrix:
+      backend: ${parsed_backends}
+      category: ${selected_categories}
+
+    agents:
+      c: c-compiler-agent
+      js: js-compiler-agent
+      erl: erl-compiler-agent
+
+    actions:
+      - compile_fixtures:
+          backend: ${backend}
+          category: ${category}
+          capture:
+            - exit_code
+            - stdout
+            - stderr
+            - duration_ms
+            - output_path
+            - output_size
+            - warnings
+
+      - categorize_failures:
+          extract:
+            - error_type
+            - error_location
+            - likely_component
+
+    outputs:
+      - compilation_results
+      - generated_code_paths
+      - compilation_metrics
+
+  # ---------------------------------------------------------------------------
+  # STAGE 2: Parallel Execution
+  # ---------------------------------------------------------------------------
+  - id: execute
+    name: Execute Compiled Outputs
+    depends_on: compile
+    parallel: true
+    timeout: 10m
+    filter: compilation_success == true
+
+    matrix:
+      backend: ${parsed_backends}
+      compiled: ${successful_compilations}
+
+    agents:
+      c: c-executor-agent
+      js: js-executor-agent
+      erl: erl-executor-agent
+
+    actions:
+      - execute_output:
+          timeout: 30s
+          capture:
+            - exit_code
+            - stdout
+            - stderr
+            - duration_ms
+            - memory_kb
+
+      - validate_output:
+          expected: ${fixture.expected}
+          tolerance:
+            numeric: 0.0001
+            string: exact
+
+      - run_test_cases:
+          if: fixture.has_tests
+
+    outputs:
+      - execution_results
+      - test_case_results
+      - runtime_metrics
+
+  # ---------------------------------------------------------------------------
+  # STAGE 3: Code Quality Analysis
+  # ---------------------------------------------------------------------------
+  - id: quality
+    name: Code Quality Evaluation
+    depends_on: compile
+    parallel: true
+    timeout: 15m
+
+    matrix:
+      backend: ${parsed_backends}
+      generated_file: ${generated_code_paths}
+
+    agent: code-quality-reviewer
+
+    actions:
+      - load_standards:
+          path: ${review_standards}
+
+      - analyze_readability:
+          metrics: [naming, function_length, nesting, comments, structure]
+          max_score: 100
+
+      - analyze_efficiency:
+          metrics: [allocations, redundant_ops, loops, memory, branches]
+          max_score: 100
+
+      - analyze_idiomaticity:
+          backend_specific: true
+          max_score: 100
+
+      - analyze_safety:
+          metrics: [null_handling, bounds, errors, cleanup, edge_cases]
+          max_score: 100
+
+      - analyze_size:
+          metrics: [bloat_ratio, dead_code, duplication]
+          max_score: 100
+
+      - extract_samples:
+          worst: 3
+          best: 2
+
+    outputs:
+      - quality_scores
+      - quality_issues
+      - code_samples
+
+  # ---------------------------------------------------------------------------
+  # STAGE 4: Component Attribution
+  # ---------------------------------------------------------------------------
+  - id: attribute
+    name: Map Issues to Components
+    depends_on: [compile, execute, quality]
+    timeout: 5m
+
+    agent: compiler-diagnostician
+
+    actions:
+      - aggregate_issues:
+          sources:
+            - compilation_failures
+            - execution_failures
+            - quality_issues
+
+      - classify_by_component:
+          components:
+            - lexer
+            - ast_generation
+            - ast_analyzer
+            - trans_am_cache
+            - drc_orc
+            - lobster_optimization
+            - macro_system
+            - c_backend
+            - js_backend
+            - erl_backend
+
+      - analyze_root_causes:
+          depth: 2
+          correlate_backends: true
+
+      - generate_recommendations:
+          priority_factors:
+            frequency: 0.3
+            severity: 0.3
+            complexity: 0.2
+            cross_backend: 0.2
+
+    outputs:
+      - component_issues
+      - root_causes
+      - recommendations
+
+  # ---------------------------------------------------------------------------
+  # STAGE 5: Report Generation
+  # ---------------------------------------------------------------------------
+  - id: report
+    name: Generate Reports
+    depends_on: attribute
+    timeout: 2m
+
+    agent: report-generator
+
+    actions:
+      - calculate_scores:
+          per_backend:
+            compilation_rate: successful / total * 100
+            execution_rate: passed / compiled * 100
+            quality_score: avg(dimensions)
+            overall: compile*0.3 + execute*0.3 + quality*0.4
+          overall:
+            health: avg(backend_scores)
+
+      - compare_baseline:
+          if: previous_baseline != null
+          track:
+            - score_delta
+            - new_failures
+            - fixed_issues
+            - regressions
+
+      - generate_summary:
+          format: markdown
+          sections:
+            - executive_summary
+            - backend_comparison
+            - top_issues
+            - actions
+
+      - generate_detailed:
+          format: markdown
+          include_all: true
+
+      - save_baseline:
+          path: ${output_dir}/baseline.json
+
+      - save_reports:
+          summary: ${output_dir}/reports/summary_${timestamp}.md
+          detailed: ${output_dir}/reports/detailed_${timestamp}.md
+          latest: ${output_dir}/LATEST_SCORE.md
+
+    outputs:
+      - summary_report
+      - detailed_report
+      - trend_analysis
+
+# =============================================================================
+# ERROR HANDLING
+# =============================================================================
+
+error_handling:
+  stage_failures:
+    setup: abort
+    compile: continue_partial
+    execute: continue_partial
+    quality: continue_partial
+    attribute: continue_partial
+    report: retry_once
+
+  timeout:
+    action: save_partial
+    notify: true
+
+  retry:
+    max_attempts: 2
+    backoff: exponential
+    initial_delay: 1s
+
+# =============================================================================
+# QUALITY GATES
+# =============================================================================
+
+quality_gates:
+  - id: min_compile
+    condition: compilation_success_count >= 1
+    on_fail: abort
+    message: No fixtures compiled. Check compiler.
+
+  - id: regression
+    condition: overall_score >= baseline - 5
+    on_fail: warn
+    message: Score regressed >5 points.
+
+  - id: critical
+    condition: critical_issues == 0
+    on_fail: warn
+    message: Critical issues detected.
+
+# =============================================================================
+# NOTIFICATIONS
+# =============================================================================
+
+notifications:
+  on_complete:
+    - print_summary
+    - save_latest
+
+  on_regression:
+    - highlight_red
+    - log_regression
+
+  on_improvement:
+    - highlight_green
+    - celebrate
+
+# =============================================================================
+# PERFORMANCE
+# =============================================================================
+
+performance:
+  parallelization:
+    max_concurrent_backends: 3
+    max_concurrent_fixtures: 10
+    max_concurrent_quality: 5
+
+  caching:
+    enabled: true
+    cache_compilations: false  # Always fresh
+    cache_baselines: true
+
+  resource_limits:
+    memory_per_execution: 512MB
+    timeout_per_fixture: 30s
+    total_timeout: 30m

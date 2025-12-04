@@ -55,7 +55,15 @@ pub const TypeInference = struct {
         return switch (node.kind) {
             // Literals have known types
             .number_literal => {
-                node.type = try self.createPrimitive(.number, node.location);
+                // Infer int32 for integer literals, number for floats
+                const val = node.data.number_literal;
+                if (@floor(val) == val and val >= -2147483648 and val <= 2147483647) {
+                    // Integer literal that fits in int32
+                    node.type = try self.createPrimitive(.int32, node.location);
+                } else {
+                    // Float literal or too large for int32
+                    node.type = try self.createPrimitive(.number, node.location);
+                }
                 return node.type;
             },
             .string_literal => {
@@ -475,18 +483,23 @@ pub const TypeInference = struct {
             // Assignment → type of right-hand side
             .assign => right_type orelse try self.createPrimitive(.unknown, node.location),
 
-            // Add: string + string → string, otherwise → number
+            // Arithmetic: preserve int type if both operands are int
             .add => blk: {
                 const is_left_string = if (left_type) |lt| lt.kind == .string else false;
                 const is_right_string = if (right_type) |rt| rt.kind == .string else false;
                 if (is_left_string or is_right_string) {
                     break :blk try self.createPrimitive(.string, node.location);
                 }
-                break :blk try self.createPrimitive(.number, node.location);
+                // int + int → int (preserve precision)
+                break :blk try self.inferArithmeticResultType(left_type, right_type, node.location);
             },
 
-            // Other arithmetic operators → number
-            .sub, .mul, .div, .mod => try self.createPrimitive(.number, node.location),
+            // Other arithmetic: preserve int if both are int
+            .sub, .mul => try self.inferArithmeticResultType(left_type, right_type, node.location),
+
+            // Division/modulo always produce number (could have fractional result)
+            .div => try self.createPrimitive(.number, node.location),
+            .mod => try self.inferArithmeticResultType(left_type, right_type, node.location),
 
             // Comparison operators → boolean
             .eq, .ne, .lt, .le, .gt, .ge => try self.createPrimitive(.boolean, node.location),
@@ -494,11 +507,32 @@ pub const TypeInference = struct {
             // Logical operators → boolean
             .@"and", .@"or" => try self.createPrimitive(.boolean, node.location),
 
-            // Bitwise operators → number
-            .bit_and, .bit_or, .bit_xor, .shl, .shr => try self.createPrimitive(.number, node.location),
+            // Bitwise operators → int32 (bitwise ops work on integers)
+            .bit_and, .bit_or, .bit_xor, .shl, .shr => try self.createPrimitive(.int32, node.location),
         };
 
         return node.type;
+    }
+
+    /// Infer result type for arithmetic operations
+    /// int + int → int, otherwise → number (widening)
+    fn inferArithmeticResultType(self: *TypeInference, left: ?*types.Type, right: ?*types.Type, loc: location.SourceLocation) InferError!*types.Type {
+        const left_is_int = if (left) |lt| (lt.kind == .int32 or lt.kind == .int64) else false;
+        const right_is_int = if (right) |rt| (rt.kind == .int32 or rt.kind == .int64) else false;
+
+        // Both int → preserve int type (use wider if different)
+        if (left_is_int and right_is_int) {
+            // If either is int64, result is int64
+            const left_is_64 = if (left) |lt| lt.kind == .int64 else false;
+            const right_is_64 = if (right) |rt| rt.kind == .int64 else false;
+            if (left_is_64 or right_is_64) {
+                return try self.createPrimitive(.int64, loc);
+            }
+            return try self.createPrimitive(.int32, loc);
+        }
+
+        // Mixed or float → number (double)
+        return try self.createPrimitive(.number, loc);
     }
 
     /// Infer type for unary expression
@@ -583,7 +617,7 @@ pub const TypeInference = struct {
 // Tests
 // ============================================================================
 
-test "inference: number literal" {
+test "inference: integer literal infers int32" {
     const allocator = std.testing.allocator;
 
     var symbols = try symbol_mod.SymbolTable.init(allocator);
@@ -592,7 +626,7 @@ test "inference: number literal" {
     var inference = TypeInference.init(allocator, &symbols);
     defer inference.deinit();
 
-    // Create a number literal node
+    // Create an integer literal node (42.0 is an integer value)
     var node = ast.Node{
         .kind = .number_literal,
         .location = location.SourceLocation.dummy(),
@@ -602,6 +636,30 @@ test "inference: number literal" {
     _ = try inference.inferNode(&node);
 
     try std.testing.expect(node.type != null);
+    // Integer literals should infer as int32, not number
+    try std.testing.expectEqual(types.TypeKind.int32, node.type.?.kind);
+}
+
+test "inference: float literal infers number" {
+    const allocator = std.testing.allocator;
+
+    var symbols = try symbol_mod.SymbolTable.init(allocator);
+    defer symbols.deinit();
+
+    var inference = TypeInference.init(allocator, &symbols);
+    defer inference.deinit();
+
+    // Create a float literal node (3.14 has decimal part)
+    var node = ast.Node{
+        .kind = .number_literal,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .number_literal = 3.14 },
+    };
+
+    _ = try inference.inferNode(&node);
+
+    try std.testing.expect(node.type != null);
+    // Float literals should infer as number
     try std.testing.expectEqual(types.TypeKind.number, node.type.?.kind);
 }
 
@@ -647,7 +705,7 @@ test "inference: boolean literal" {
     try std.testing.expectEqual(types.TypeKind.boolean, node.type.?.kind);
 }
 
-test "inference: arithmetic binary expression" {
+test "inference: arithmetic binary expression int + int = int32" {
     const allocator = std.testing.allocator;
 
     var symbols = try symbol_mod.SymbolTable.init(allocator);
@@ -656,7 +714,7 @@ test "inference: arithmetic binary expression" {
     var inference = TypeInference.init(allocator, &symbols);
     defer inference.deinit();
 
-    // Create 1 + 2
+    // Create 1 + 2 (both integers)
     var left = ast.Node{
         .kind = .number_literal,
         .location = location.SourceLocation.dummy(),
@@ -682,6 +740,46 @@ test "inference: arithmetic binary expression" {
     _ = try inference.inferNode(&node);
 
     try std.testing.expect(node.type != null);
+    // int + int = int32 (type preservation)
+    try std.testing.expectEqual(types.TypeKind.int32, node.type.?.kind);
+}
+
+test "inference: arithmetic binary expression int + float = number" {
+    const allocator = std.testing.allocator;
+
+    var symbols = try symbol_mod.SymbolTable.init(allocator);
+    defer symbols.deinit();
+
+    var inference = TypeInference.init(allocator, &symbols);
+    defer inference.deinit();
+
+    // Create 1 + 2.5 (int + float = number)
+    var left = ast.Node{
+        .kind = .number_literal,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .number_literal = 1.0 },
+    };
+
+    var right = ast.Node{
+        .kind = .number_literal,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .number_literal = 2.5 },
+    };
+
+    var node = ast.Node{
+        .kind = .binary_expr,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .binary_expr = .{
+            .op = .add,
+            .left = &left,
+            .right = &right,
+        } },
+    };
+
+    _ = try inference.inferNode(&node);
+
+    try std.testing.expect(node.type != null);
+    // int + float = number (widening)
     try std.testing.expectEqual(types.TypeKind.number, node.type.?.kind);
 }
 
@@ -986,4 +1084,153 @@ test "inference: array index access returns element type" {
     // Should resolve to number type (element type)
     try std.testing.expect(result_type != null);
     try std.testing.expectEqual(types.TypeKind.number, result_type.?.kind);
+}
+
+// ============================================================================
+// TDD: NEW FAILING TESTS for class type inference
+// These tests document the expected behavior we need to implement
+// ============================================================================
+
+test "inference: new expression infers class type from symbol table" {
+    const allocator = std.testing.allocator;
+
+    var symbols = try symbol_mod.SymbolTable.init(allocator);
+    defer symbols.deinit();
+
+    var inference = TypeInference.init(allocator, &symbols);
+    defer inference.deinit();
+
+    // First, register a class "User" in the symbol table
+    // The class symbol should have an object type
+    var str_type = types.Type{
+        .kind = .string,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .string = {} },
+    };
+
+    // Create object type with properties for User class
+    var props = [_]types.ObjectType.Property{
+        .{ .name = "name", .type = &str_type, .optional = false },
+    };
+
+    var user_obj = types.ObjectType{
+        .properties = &props,
+        .methods = &[_]types.ObjectType.Property{},
+        .name = "User",
+    };
+
+    var user_type = types.Type{
+        .kind = .object,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .object = &user_obj },
+    };
+
+    // Register the class in symbol table
+    var class_sym = symbol_mod.Symbol.init("User", .class, location.SourceLocation.dummy());
+    class_sym.type = &user_type;
+    try symbols.define(class_sym);
+
+    // Create: new User()
+    var class_id = ast.Node{
+        .kind = .identifier,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .identifier = "User" },
+    };
+
+    var new_expr = ast.Node{
+        .kind = .new_expr,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .new_expr = .{
+            .callee = &class_id,
+            .arguments = &[_]*ast.Node{},
+            .type_args = &[_]*types.Type{},
+        } },
+    };
+
+    const result_type = try inference.inferNode(&new_expr);
+
+    // KEY TEST: new User() should have the User class's object type
+    try std.testing.expect(result_type != null);
+    try std.testing.expectEqual(types.TypeKind.object, result_type.?.kind);
+    // The object type should have name = "User"
+    try std.testing.expectEqualStrings("User", result_type.?.data.object.name orelse "");
+}
+
+test "inference: variable initialized with new expr gets class type" {
+    const allocator = std.testing.allocator;
+
+    var symbols = try symbol_mod.SymbolTable.init(allocator);
+    defer symbols.deinit();
+
+    var inference = TypeInference.init(allocator, &symbols);
+    defer inference.deinit();
+
+    // Register class "Entity" with id: int property
+    var int_type = types.Type{
+        .kind = .int32,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .int32 = {} },
+    };
+
+    var props = [_]types.ObjectType.Property{
+        .{ .name = "id", .type = &int_type, .optional = false },
+    };
+
+    var entity_obj = types.ObjectType{
+        .properties = &props,
+        .methods = &[_]types.ObjectType.Property{},
+        .name = "Entity",
+    };
+
+    var entity_type = types.Type{
+        .kind = .object,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .object = &entity_obj },
+    };
+
+    var class_sym = symbol_mod.Symbol.init("Entity", .class, location.SourceLocation.dummy());
+    class_sym.type = &entity_type;
+    try symbols.define(class_sym);
+
+    // Create: let e = new Entity();
+    var class_id = ast.Node{
+        .kind = .identifier,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .identifier = "Entity" },
+    };
+
+    var new_expr = ast.Node{
+        .kind = .new_expr,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .new_expr = .{
+            .callee = &class_id,
+            .arguments = &[_]*ast.Node{},
+            .type_args = &[_]*types.Type{},
+        } },
+    };
+
+    const decl = ast.node.VariableStmt.VariableDeclarator{
+        .name = "e",
+        .type = null, // Infer from init
+        .init = &new_expr,
+    };
+    var decls = [_]ast.node.VariableStmt.VariableDeclarator{decl};
+
+    var var_stmt = ast.Node{
+        .kind = .variable_stmt,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .variable_stmt = .{
+            .kind = .let,
+            .declarations = &decls,
+        } },
+    };
+
+    _ = try inference.inferNode(&var_stmt);
+
+    // KEY TEST: The variable "e" should now be in the symbol table with Entity type
+    const e_sym = symbols.lookupAll("e");
+    try std.testing.expect(e_sym != null);
+    try std.testing.expect(e_sym.?.type != null);
+    try std.testing.expectEqual(types.TypeKind.object, e_sym.?.type.?.kind);
+    try std.testing.expectEqualStrings("Entity", e_sym.?.type.?.data.object.name orelse "");
 }

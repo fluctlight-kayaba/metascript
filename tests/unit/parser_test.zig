@@ -358,3 +358,96 @@ test "parser: parses full module" {
     // Should have: import, interface, class, export
     try testing.expect(program.data.program.statements.len >= 3);
 }
+
+// ============================================================================
+// Typed Array Tests (Primitive Array Types)
+// ============================================================================
+
+test "parser: parses 1D int32 array type" {
+    var arena = ast_mod.ASTArena.init(testing.allocator);
+    defer arena.deinit();
+
+    const program = try parseWithArena(&arena, fixtures.ARRAY_1D_INT32);
+
+    try testing.expectEqual(@as(usize, 1), program.data.program.statements.len);
+    const stmt = program.data.program.statements[0];
+    try testing.expectEqual(NodeKind.variable_stmt, stmt.kind);
+
+    // Check that the type annotation is an array type
+    const type_anno = stmt.data.variable_stmt.type_annotation;
+    try testing.expect(type_anno != null);
+    try testing.expectEqual(ast_mod.types.TypeKind.array, type_anno.?.kind);
+
+    // The element type should be int32
+    const elem_type = type_anno.?.data.array;
+    try testing.expectEqual(ast_mod.types.TypeKind.int32, elem_type.kind);
+}
+
+test "parser: parses 1D float64 array type" {
+    var arena = ast_mod.ASTArena.init(testing.allocator);
+    defer arena.deinit();
+
+    const program = try parseWithArena(&arena, fixtures.ARRAY_1D_FLOAT64);
+
+    try testing.expectEqual(@as(usize, 1), program.data.program.statements.len);
+    const stmt = program.data.program.statements[0];
+
+    const type_anno = stmt.data.variable_stmt.type_annotation;
+    try testing.expect(type_anno != null);
+    try testing.expectEqual(ast_mod.types.TypeKind.array, type_anno.?.kind);
+
+    // The element type should be float64
+    const elem_type = type_anno.?.data.array;
+    try testing.expectEqual(ast_mod.types.TypeKind.float64, elem_type.kind);
+}
+
+test "parser: parses 2D int32 array type (int32[][])" {
+    var arena = ast_mod.ASTArena.init(testing.allocator);
+    defer arena.deinit();
+
+    const program = try parseWithArena(&arena, fixtures.ARRAY_2D_INT32);
+
+    try testing.expectEqual(@as(usize, 1), program.data.program.statements.len);
+    const stmt = program.data.program.statements[0];
+
+    const type_anno = stmt.data.variable_stmt.type_annotation;
+    try testing.expect(type_anno != null);
+
+    // Outer type should be array
+    try testing.expectEqual(ast_mod.types.TypeKind.array, type_anno.?.kind);
+
+    // Inner type should also be array (array of arrays)
+    const inner_type = type_anno.?.data.array;
+    try testing.expectEqual(ast_mod.types.TypeKind.array, inner_type.kind);
+
+    // Element type of inner array should be int32
+    const elem_type = inner_type.data.array;
+    try testing.expectEqual(ast_mod.types.TypeKind.int32, elem_type.kind);
+}
+
+test "parser: parses multiple typed arrays with different primitive types" {
+    var arena = ast_mod.ASTArena.init(testing.allocator);
+    defer arena.deinit();
+
+    const program = try parseWithArena(&arena, fixtures.ARRAY_MULTIPLE_TYPES);
+
+    try testing.expectEqual(@as(usize, 3), program.data.program.statements.len);
+
+    // First: int32[]
+    const stmt1 = program.data.program.statements[0];
+    const type1 = stmt1.data.variable_stmt.type_annotation.?;
+    try testing.expectEqual(ast_mod.types.TypeKind.array, type1.kind);
+    try testing.expectEqual(ast_mod.types.TypeKind.int32, type1.data.array.kind);
+
+    // Second: float64[]
+    const stmt2 = program.data.program.statements[1];
+    const type2 = stmt2.data.variable_stmt.type_annotation.?;
+    try testing.expectEqual(ast_mod.types.TypeKind.array, type2.kind);
+    try testing.expectEqual(ast_mod.types.TypeKind.float64, type2.data.array.kind);
+
+    // Third: uint8[]
+    const stmt3 = program.data.program.statements[2];
+    const type3 = stmt3.data.variable_stmt.type_annotation.?;
+    try testing.expectEqual(ast_mod.types.TypeKind.array, type3.kind);
+    try testing.expectEqual(ast_mod.types.TypeKind.uint8, type3.data.array.kind);
+}

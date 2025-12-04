@@ -254,11 +254,88 @@ static inline msString* ms_string_clone(msString* str) {
 }
 
 /*
- * String concatenation helpers for codegen
- * These return heap-allocated C strings (caller must free)
+ * ORC-managed string concatenation helpers for codegen
+ * These return ORC-managed msString* (use ms_decref for cleanup)
  */
 
-// Concatenate two C strings
+// Concatenate msString + number → msString (ORC-managed)
+static inline msString* ms_string_concat_num(msString* str, double num) {
+    if (str == NULL) return NULL;
+
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%g", num);
+    size_t buf_len = strlen(buf);
+    size_t new_len = str->len + buf_len;
+
+    // Allocate new string with ORC header
+    size_t total_size = sizeof(msRefHeader) + sizeof(msString) + new_len + 1;
+    void* mem = malloc(total_size);
+    if (mem == NULL) return NULL;
+
+    // Initialize RefHeader
+    msRefHeader* header = (msRefHeader*)mem;
+    header->rc = 1;
+    header->flags.color = MS_COLOR_BLACK;
+    header->flags.buffered = 0;
+    header->flags._reserved = 0;
+    ms_set_type_id(header, 0);
+
+    // Initialize msString
+    msString* result = (msString*)((char*)mem + sizeof(msRefHeader));
+    result->len = new_len;
+    result->capacity = new_len;
+    result->data = (char*)mem + sizeof(msRefHeader) + sizeof(msString);
+
+    // Copy data
+    memcpy(result->data, str->data, str->len);
+    memcpy(result->data + str->len, buf, buf_len);
+    result->data[new_len] = '\0';
+
+    return result;
+}
+
+// Concatenate number + msString → msString (ORC-managed)
+static inline msString* ms_num_concat_string(double num, msString* str) {
+    if (str == NULL) return NULL;
+
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%g", num);
+    size_t buf_len = strlen(buf);
+    size_t new_len = buf_len + str->len;
+
+    // Allocate new string with ORC header
+    size_t total_size = sizeof(msRefHeader) + sizeof(msString) + new_len + 1;
+    void* mem = malloc(total_size);
+    if (mem == NULL) return NULL;
+
+    // Initialize RefHeader
+    msRefHeader* header = (msRefHeader*)mem;
+    header->rc = 1;
+    header->flags.color = MS_COLOR_BLACK;
+    header->flags.buffered = 0;
+    header->flags._reserved = 0;
+    ms_set_type_id(header, 0);
+
+    // Initialize msString
+    msString* result = (msString*)((char*)mem + sizeof(msRefHeader));
+    result->len = new_len;
+    result->capacity = new_len;
+    result->data = (char*)mem + sizeof(msRefHeader) + sizeof(msString);
+
+    // Copy data
+    memcpy(result->data, buf, buf_len);
+    memcpy(result->data + buf_len, str->data, str->len);
+    result->data[new_len] = '\0';
+
+    return result;
+}
+
+/*
+ * Legacy C string concatenation helpers (deprecated - use msString versions above)
+ * These return heap-allocated C strings (caller must free with free())
+ */
+
+// Concatenate two C strings (legacy - returns raw char*)
 static inline char* ms_cstr_concat(const char* a, const char* b) {
     size_t len_a = strlen(a);
     size_t len_b = strlen(b);
@@ -270,14 +347,14 @@ static inline char* ms_cstr_concat(const char* a, const char* b) {
     return result;
 }
 
-// Concatenate C string + number
+// Concatenate C string + number (legacy)
 static inline char* ms_cstr_concat_num(const char* str, double num) {
     char buf[64];
     snprintf(buf, sizeof(buf), "%g", num);
     return ms_cstr_concat(str, buf);
 }
 
-// Concatenate number + C string
+// Concatenate number + C string (legacy)
 static inline char* ms_num_concat_cstr(double num, const char* str) {
     char buf[64];
     snprintf(buf, sizeof(buf), "%g", num);

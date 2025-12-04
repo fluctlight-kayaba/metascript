@@ -1384,9 +1384,23 @@ pub const Server = struct {
 
             // For identifiers, try to look up type information via Trans-Am
             if (tok.kind == .identifier) {
+                // First, check if this is a member expression property (e.g., "floor" in "Math.floor")
+                // Re-scan to find if there's a dot before this identifier
+                const member_hover = self.getMemberExpressionHover(text, tok, line) catch null;
+                if (member_hover) |content| {
+                    defer self.allocator.free(content);
+                    const elapsed_ms = std.time.milliTimestamp() - start_time;
+                    try stderr.print("[mls] Hover: member property '{s}' ({d}ms)\n", .{ tok.text, elapsed_ms });
+                    try self.sendHoverResponse(id, content, tok, stdout, stderr);
+                    return;
+                }
+
                 if (self.transam_db) |*db| {
-                    // Look up the symbol in the type checker's symbol table
-                    const symbol_result = db.lookupSymbol(uri.string, tok.text) catch null;
+                    // Look up the symbol at the hover position (position-aware for shadowing)
+                    // This ensures we find the correct symbol when multiple variables share the same name
+                    // Note: LSP uses 0-based lines, our parser uses 1-based, so add 1 to convert
+                    const parser_line = line + 1;
+                    const symbol_result = db.lookupSymbolAtPosition(uri.string, tok.text, parser_line, character) catch null;
                     if (symbol_result) |symbol| {
                         const hover_text = formatSymbolHover(self.allocator, symbol) catch null;
                         if (hover_text) |content| {
@@ -1552,6 +1566,173 @@ pub const Server = struct {
         ) catch return null;
 
         return hover_content;
+    }
+
+    /// Check if token is a property in a member expression (e.g., "floor" in "Math.floor")
+    /// and return hover content for global builtins like Math.*
+    fn getMemberExpressionHover(
+        self: *Server,
+        text: []const u8,
+        tok: token_mod.Token,
+        hover_line: u32,
+    ) !?[]const u8 {
+        _ = hover_line;
+
+        // Re-lex to find the pattern: <identifier> . <current_token>
+        var lexer = try lexer_mod.Lexer.init(self.allocator, text, 1);
+        defer lexer.deinit();
+
+        var prev_prev_tok: ?token_mod.Token = null;
+        var prev_tok: ?token_mod.Token = null;
+
+        while (true) {
+            const current = lexer.next() catch break;
+            if (current.kind == .end_of_file) break;
+
+            // Check if current token matches the one we're hovering over
+            if (current.kind == .identifier and
+                current.loc.start.line == tok.loc.start.line and
+                current.loc.start.column == tok.loc.start.column)
+            {
+                // Check if pattern is: identifier . identifier
+                if (prev_tok != null and prev_tok.?.kind == .dot and
+                    prev_prev_tok != null and prev_prev_tok.?.kind == .identifier)
+                {
+                    const object_name = prev_prev_tok.?.text;
+                    const property_name = current.text;
+
+                    // Handle Math.* builtins
+                    if (std.mem.eql(u8, object_name, "Math")) {
+                        return try self.getMathPropertyHover(property_name);
+                    }
+
+                    // Handle console.* builtins
+                    if (std.mem.eql(u8, object_name, "console")) {
+                        return try self.getConsolePropertyHover(property_name);
+                    }
+                }
+                break;
+            }
+
+            prev_prev_tok = prev_tok;
+            prev_tok = current;
+        }
+
+        return null;
+    }
+
+    /// Get hover content for Math.* properties and methods
+    fn getMathPropertyHover(self: *Server, property: []const u8) !?[]const u8 {
+        // Math methods - single arg
+        const single_arg_methods = [_]struct { name: []const u8, desc: []const u8 }{
+            .{ .name = "floor", .desc = "Returns the largest integer less than or equal to x" },
+            .{ .name = "ceil", .desc = "Returns the smallest integer greater than or equal to x" },
+            .{ .name = "round", .desc = "Returns the value of x rounded to the nearest integer" },
+            .{ .name = "trunc", .desc = "Returns the integer part of x by removing any fractional digits" },
+            .{ .name = "sqrt", .desc = "Returns the square root of x" },
+            .{ .name = "cbrt", .desc = "Returns the cube root of x" },
+            .{ .name = "abs", .desc = "Returns the absolute value of x" },
+            .{ .name = "sign", .desc = "Returns the sign of x (-1, 0, or 1)" },
+            .{ .name = "sin", .desc = "Returns the sine of x (x in radians)" },
+            .{ .name = "cos", .desc = "Returns the cosine of x (x in radians)" },
+            .{ .name = "tan", .desc = "Returns the tangent of x (x in radians)" },
+            .{ .name = "asin", .desc = "Returns the arcsine of x in radians" },
+            .{ .name = "acos", .desc = "Returns the arccosine of x in radians" },
+            .{ .name = "atan", .desc = "Returns the arctangent of x in radians" },
+            .{ .name = "sinh", .desc = "Returns the hyperbolic sine of x" },
+            .{ .name = "cosh", .desc = "Returns the hyperbolic cosine of x" },
+            .{ .name = "tanh", .desc = "Returns the hyperbolic tangent of x" },
+            .{ .name = "exp", .desc = "Returns e^x" },
+            .{ .name = "expm1", .desc = "Returns e^x - 1" },
+            .{ .name = "log", .desc = "Returns the natural logarithm of x" },
+            .{ .name = "log10", .desc = "Returns the base-10 logarithm of x" },
+            .{ .name = "log2", .desc = "Returns the base-2 logarithm of x" },
+            .{ .name = "log1p", .desc = "Returns the natural log of (1 + x)" },
+        };
+
+        for (single_arg_methods) |method| {
+            if (std.mem.eql(u8, property, method.name)) {
+                return try std.fmt.allocPrint(
+                    self.allocator,
+                    "```typescript\nMath.{s}(x: number): number\n```\n{s}",
+                    .{ method.name, method.desc },
+                );
+            }
+        }
+
+        // Math methods - two args
+        const two_arg_methods = [_]struct { name: []const u8, desc: []const u8 }{
+            .{ .name = "pow", .desc = "Returns x raised to the power y" },
+            .{ .name = "atan2", .desc = "Returns the arctangent of y/x in radians" },
+            .{ .name = "min", .desc = "Returns the smaller of x and y" },
+            .{ .name = "max", .desc = "Returns the larger of x and y" },
+            .{ .name = "hypot", .desc = "Returns the square root of the sum of squares of x and y" },
+            .{ .name = "imul", .desc = "Returns the result of the C-like 32-bit multiplication of x and y" },
+        };
+
+        for (two_arg_methods) |method| {
+            if (std.mem.eql(u8, property, method.name)) {
+                return try std.fmt.allocPrint(
+                    self.allocator,
+                    "```typescript\nMath.{s}(x: number, y: number): number\n```\n{s}",
+                    .{ method.name, method.desc },
+                );
+            }
+        }
+
+        // Math.random()
+        if (std.mem.eql(u8, property, "random")) {
+            return try std.fmt.allocPrint(
+                self.allocator,
+                "```typescript\nMath.random(): number\n```\nReturns a pseudo-random number between 0 (inclusive) and 1 (exclusive)",
+                .{},
+            );
+        }
+
+        // Math constants
+        const constants = [_]struct { name: []const u8, value: []const u8, desc: []const u8 }{
+            .{ .name = "PI", .value = "3.141592653589793", .desc = "The ratio of a circle's circumference to its diameter" },
+            .{ .name = "E", .value = "2.718281828459045", .desc = "Euler's number, the base of natural logarithms" },
+            .{ .name = "LN2", .value = "0.6931471805599453", .desc = "The natural logarithm of 2" },
+            .{ .name = "LN10", .value = "2.302585092994046", .desc = "The natural logarithm of 10" },
+            .{ .name = "LOG2E", .value = "1.4426950408889634", .desc = "The base-2 logarithm of E" },
+            .{ .name = "LOG10E", .value = "0.4342944819032518", .desc = "The base-10 logarithm of E" },
+            .{ .name = "SQRT2", .value = "1.4142135623730951", .desc = "The square root of 2" },
+            .{ .name = "SQRT1_2", .value = "0.7071067811865476", .desc = "The square root of 1/2" },
+        };
+
+        for (constants) |constant| {
+            if (std.mem.eql(u8, property, constant.name)) {
+                return try std.fmt.allocPrint(
+                    self.allocator,
+                    "```typescript\nMath.{s}: number\n```\n{s}\n\nValue: `{s}`",
+                    .{ constant.name, constant.desc, constant.value },
+                );
+            }
+        }
+
+        return null;
+    }
+
+    /// Get hover content for console.* methods
+    fn getConsolePropertyHover(self: *Server, property: []const u8) !?[]const u8 {
+        const methods = [_]struct { name: []const u8, desc: []const u8 }{
+            .{ .name = "log", .desc = "Outputs a message to the console" },
+            .{ .name = "error", .desc = "Outputs an error message to the console" },
+            .{ .name = "warn", .desc = "Outputs a warning message to the console" },
+        };
+
+        for (methods) |method| {
+            if (std.mem.eql(u8, property, method.name)) {
+                return try std.fmt.allocPrint(
+                    self.allocator,
+                    "```typescript\nconsole.{s}(...args: any[]): void\n```\n{s}",
+                    .{ method.name, method.desc },
+                );
+            }
+        }
+
+        return null;
     }
 
     fn sendHoverResponse(
@@ -1826,9 +2007,12 @@ pub const Server = struct {
             }
         }
 
-        // Try Trans-Am symbol table lookup first (type-aware, scope-aware)
+        // Try Trans-Am symbol table lookup first (type-aware, scope-aware, position-aware)
         if (self.transam_db) |*db| {
-            const symbol_opt = db.lookupSymbol(uri.string, target_name.?) catch null;
+            // Use position-aware lookup to handle shadowed variables correctly
+            // LSP uses 0-based lines, parser uses 1-based, so add 1 to convert
+            const parser_line = line + 1;
+            const symbol_opt = db.lookupSymbolAtPosition(uri.string, target_name.?, parser_line, character) catch null;
             if (symbol_opt) |symbol| {
                 // Found symbol in type checker's symbol table
                 var buf = std.ArrayList(u8).init(self.allocator);

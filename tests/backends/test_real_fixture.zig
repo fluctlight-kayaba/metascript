@@ -1,7 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const helpers = @import("backend_test_helpers.zig");
-const fixtures = @import("real_world_fixtures.zig");
+const fixtures = @import("fixtures");
 
 test "test actual fixture: INHERITANCE_SIMPLE" {
     std.debug.print("\n=== Testing INHERITANCE_SIMPLE ===\n", .{});

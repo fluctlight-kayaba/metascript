@@ -17,7 +17,7 @@
 const std = @import("std");
 const testing = std.testing;
 const helpers = @import("backend_test_helpers.zig");
-const fixtures = @import("real_world_fixtures.zig");
+const fixtures = @import("fixtures");
 
 const Backend = helpers.Backend;
 const Allocator = std.mem.Allocator;
@@ -847,35 +847,14 @@ pub const ScoreRunner = struct {
 };
 
 // ============================================================================
-// Fixture List
+// Fixture List - Uses unified fixtures from tests/fixtures/fixtures.zig
 // ============================================================================
 
-const Fixture = struct {
-    name: []const u8,
-    source: []const u8,
-};
+const Fixture = fixtures.Fixture;
 
 fn getFixtureList() []const Fixture {
-    return &[_]Fixture{
-        .{ .name = "SIMPLE_FUNCTION", .source = fixtures.SIMPLE_FUNCTION },
-        .{ .name = "FACTORIAL_RECURSIVE", .source = fixtures.FACTORIAL_RECURSIVE },
-        .{ .name = "FACTORIAL_ITERATIVE", .source = fixtures.FACTORIAL_ITERATIVE },
-        .{ .name = "FIBONACCI", .source = fixtures.FIBONACCI },
-        .{ .name = "WHILE_LOOP_COUNTER", .source = fixtures.WHILE_LOOP_COUNTER },
-        .{ .name = "FOR_LOOP_SUM", .source = fixtures.FOR_LOOP_SUM },
-        .{ .name = "NESTED_LOOPS", .source = fixtures.NESTED_LOOPS },
-        .{ .name = "EARLY_RETURN", .source = fixtures.EARLY_RETURN },
-        .{ .name = "VARIABLE_SHADOWING_SIMPLE", .source = fixtures.VARIABLE_SHADOWING_SIMPLE },
-        .{ .name = "VARIABLE_SHADOWING_MULTIPLE", .source = fixtures.VARIABLE_SHADOWING_MULTIPLE },
-        .{ .name = "OBJECT_LITERAL", .source = fixtures.OBJECT_LITERAL },
-        .{ .name = "OBJECT_MEMBER_ACCESS", .source = fixtures.OBJECT_MEMBER_ACCESS },
-        .{ .name = "ARRAY_OPERATIONS", .source = fixtures.ARRAY_OPERATIONS },
-        .{ .name = "SIMPLE_CLASS", .source = fixtures.SIMPLE_CLASS },
-        .{ .name = "CLASS_WITH_METHODS", .source = fixtures.CLASS_WITH_METHODS },
-        .{ .name = "QUICKSORT", .source = fixtures.QUICKSORT },
-        .{ .name = "BINARY_SEARCH", .source = fixtures.BINARY_SEARCH },
-        .{ .name = "IS_PRIME", .source = fixtures.IS_PRIME },
-    };
+    // Use all fixtures from the unified fixture system
+    return fixtures.all();
 }
 
 // ============================================================================

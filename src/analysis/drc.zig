@@ -460,6 +460,10 @@ pub const Drc = struct {
                 });
                 self.stats.moves += 1;
             },
+            .variable_copy => {
+                // Variable-to-variable copy is handled by trackVariableCopy()
+                // This case should not be reached via trackUse()
+            },
             .read, .function_arg_borrowed => {
                 // Just reading or borrowing - no RC change
             },
@@ -472,15 +476,50 @@ pub const Drc = struct {
         function_arg_owned,
         function_arg_borrowed,
         returned,
+        /// Variable-to-variable copy: let x = y where y is reference type
+        /// This creates a shared reference, needs incref on the NEW variable
+        variable_copy,
     };
 
     fn toOwnershipContext(ctx: UseContext) ownership.UseContext {
         return switch (ctx) {
-            .read => .read,
+            .read, .variable_copy => .read,
             .field_store => .stored,
             .function_arg_owned, .function_arg_borrowed => .argument,
             .returned => .returned,
         };
+    }
+
+    // ========================================================================
+    // Variable Copy Handling
+    // ========================================================================
+
+    /// Track a variable-to-variable copy: let target = source
+    /// This creates a shared reference - target needs incref after assignment
+    pub fn trackVariableCopy(
+        self: *Drc,
+        target_var: []const u8,
+        source_var: []const u8,
+        line: u32,
+        column: u32,
+    ) !void {
+        _ = source_var; // Source is used for documentation/debugging
+
+        // Check if target is a reference type that needs RC
+        const v = self.variables.get(target_var) orelse return;
+        if (!v.needs_rc) return;
+
+        // Emit incref for the target variable after the assignment
+        try self.addOp(.{
+            .kind = .incref,
+            .target = target_var,
+            .line = line,
+            .column = column,
+            .position = .after, // After the assignment line
+            .reason = .assignment,
+            .comment = if (self.config.debug_mode) "// DRC: incref for variable copy" else null,
+        });
+        self.stats.increfs += 1;
     }
 
     // ========================================================================

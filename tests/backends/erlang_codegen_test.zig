@@ -6,7 +6,7 @@
 const std = @import("std");
 const testing = std.testing;
 const helpers = @import("backend_test_helpers.zig");
-const fixtures = @import("real_world_fixtures.zig");
+const fixtures = @import("fixtures");
 
 // ============================================================================
 // ✅ Tests That SHOULD Pass (Currently Working)

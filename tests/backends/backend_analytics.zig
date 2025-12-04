@@ -6,7 +6,7 @@
 const std = @import("std");
 const testing = std.testing;
 const helpers = @import("backend_test_helpers.zig");
-const fixtures = @import("real_world_fixtures.zig");
+const fixtures = @import("fixtures");
 
 const Backend = helpers.Backend;
 
@@ -122,54 +122,11 @@ fn runAnalytics(allocator: std.mem.Allocator) !AnalyticsSummary {
     var results = std.ArrayList(FixtureResult).init(allocator);
     defer results.deinit();
 
-    // Test all basic language features
-    try results.append(testFixture(allocator, "SIMPLE_FUNCTION", fixtures.SIMPLE_FUNCTION));
-    try results.append(testFixture(allocator, "FACTORIAL_RECURSIVE", fixtures.FACTORIAL_RECURSIVE));
-    try results.append(testFixture(allocator, "FACTORIAL_ITERATIVE", fixtures.FACTORIAL_ITERATIVE));
-    try results.append(testFixture(allocator, "FIBONACCI", fixtures.FIBONACCI));
-
-    // Test loops and control flow
-    try results.append(testFixture(allocator, "WHILE_LOOP_COUNTER", fixtures.WHILE_LOOP_COUNTER));
-    try results.append(testFixture(allocator, "FOR_LOOP_SUM", fixtures.FOR_LOOP_SUM));
-    try results.append(testFixture(allocator, "NESTED_LOOPS", fixtures.NESTED_LOOPS));
-    try results.append(testFixture(allocator, "EARLY_RETURN", fixtures.EARLY_RETURN));
-
-    // Test variable shadowing
-    try results.append(testFixture(allocator, "VARIABLE_SHADOWING_SIMPLE", fixtures.VARIABLE_SHADOWING_SIMPLE));
-    try results.append(testFixture(allocator, "VARIABLE_SHADOWING_MULTIPLE", fixtures.VARIABLE_SHADOWING_MULTIPLE));
-
-    // Test objects and arrays
-    try results.append(testFixture(allocator, "OBJECT_LITERAL", fixtures.OBJECT_LITERAL));
-    try results.append(testFixture(allocator, "OBJECT_MEMBER_ACCESS", fixtures.OBJECT_MEMBER_ACCESS));
-    try results.append(testFixture(allocator, "ARRAY_OPERATIONS", fixtures.ARRAY_OPERATIONS));
-
-    // Test classes
-    try results.append(testFixture(allocator, "SIMPLE_CLASS", fixtures.SIMPLE_CLASS));
-    try results.append(testFixture(allocator, "CLASS_WITH_METHODS", fixtures.CLASS_WITH_METHODS));
-    try results.append(testFixture(allocator, "INHERITANCE_SIMPLE", fixtures.INHERITANCE_SIMPLE));
-    try results.append(testFixture(allocator, "METHOD_OVERRIDE", fixtures.METHOD_OVERRIDE));
-    try results.append(testFixture(allocator, "POLYMORPHISM", fixtures.POLYMORPHISM));
-
-    // Test algorithms
-    try results.append(testFixture(allocator, "QUICKSORT", fixtures.QUICKSORT));
-    try results.append(testFixture(allocator, "MERGE_SORT", fixtures.MERGE_SORT));
-    try results.append(testFixture(allocator, "LINKED_LIST", fixtures.LINKED_LIST));
-    try results.append(testFixture(allocator, "BINARY_SEARCH_TREE", fixtures.BINARY_SEARCH_TREE));
-    try results.append(testFixture(allocator, "BINARY_SEARCH", fixtures.BINARY_SEARCH));
-    try results.append(testFixture(allocator, "IS_PRIME", fixtures.IS_PRIME));
-
-    // Test design patterns
-    try results.append(testFixture(allocator, "BUILDER_PATTERN", fixtures.BUILDER_PATTERN));
-    try results.append(testFixture(allocator, "FACTORY_PATTERN", fixtures.FACTORY_PATTERN));
-    try results.append(testFixture(allocator, "SINGLETON_PATTERN", fixtures.SINGLETON_PATTERN));
-    try results.append(testFixture(allocator, "OBSERVER_PATTERN", fixtures.OBSERVER_PATTERN));
-
-    // Test comprehensive demo
-    try results.append(testFixture(allocator, "COMPREHENSIVE_DEMO", fixtures.COMPREHENSIVE_DEMO));
-
-    // Test known bugs (these SHOULD fail)
-    try results.append(testFixture(allocator, "ERLANG_BUG_LOOP_CLOSURE", fixtures.ERLANG_BUG_LOOP_CLOSURE));
-    try results.append(testFixture(allocator, "ERLANG_BUG_EARLY_RETURN", fixtures.ERLANG_BUG_EARLY_RETURN));
+    // Use unified fixture system - single source of truth
+    const all_fixtures = fixtures.all();
+    for (all_fixtures) |fixture| {
+        try results.append(testFixture(allocator, fixture.name, fixture.source));
+    }
 
     // Calculate summary
     var summary = AnalyticsSummary{

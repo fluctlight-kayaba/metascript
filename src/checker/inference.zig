@@ -330,16 +330,18 @@ pub const TypeInference = struct {
                             decl.type = init_type;
                         }
 
-                        // Register variable in symbol table
-                        var var_sym = symbol_mod.Symbol.init(decl.name, .variable, node.location);
-                        var_sym.type = decl.type;
-                        var_sym.mutable = !is_const;
-                        self.symbols.define(var_sym) catch {
-                            // Already defined - try to update type instead
-                            if (decl.type) |dt| {
-                                self.symbols.updateType(decl.name, dt) catch {};
-                            }
-                        };
+                        // Update the symbol's type in the symbol table
+                        // Use updateTypeAll because the symbol was defined in Phase 1's scope,
+                        // not the current scope (which is a new scope created in Phase 3)
+                        if (decl.type) |dt| {
+                            self.symbols.updateTypeAll(decl.name, dt) catch {
+                                // Symbol not found in any scope - define it in current scope
+                                var var_sym = symbol_mod.Symbol.init(decl.name, .variable, node.location);
+                                var_sym.type = dt;
+                                var_sym.mutable = !is_const;
+                                self.symbols.define(var_sym) catch {};
+                            };
+                        }
                     }
                 }
                 return null;

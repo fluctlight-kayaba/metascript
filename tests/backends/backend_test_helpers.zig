@@ -18,6 +18,9 @@ const c_codegen = main_mod.cgen;
 const js_codegen = main_mod.jsgen;
 const erlang_codegen = main_mod.erlgen;
 
+// DRC analysis (required for C backend)
+const drc_mod = main_mod.drc;
+
 // ============================================================================
 // Backend Target Enum
 // ============================================================================
@@ -131,7 +134,12 @@ pub fn compile(
     // Generate code for backend
     const output = switch (backend) {
         .c => blk: {
-            var generator = c_codegen.CGenerator.init(allocator);
+            // DRC analysis is required for C backend
+            var drc = drc_mod.Drc.init(allocator);
+            defer drc.deinit();
+            drc.annotate(ast) catch {}; // Annotate AST with RC operations
+
+            var generator = c_codegen.CGenerator.init(allocator, &drc);
             defer generator.deinit();
             break :blk try generator.generate(ast);
         },

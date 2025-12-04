@@ -25,10 +25,19 @@ Backend tests enable **TRUE TDD** for MetaScript compiler development:
 tests/backends/
 ├── README.md                        # This file
 ├── backend_test_helpers.zig         # Core testing utilities
-├── real_world_fixtures.zig          # Real TypeScript programs as tests
+├── score_codegen.zig                # Comprehensive codegen quality scoring
 ├── erlang_codegen_test.zig          # Erlang backend tests
 ├── c_codegen_test.zig               # C backend tests
 ├── cross_backend_test.zig           # Multi-backend parity tests
+
+tests/fixtures/
+├── fixtures.zig                     # Unified fixture system (single source of truth)
+├── basic/*.ms                       # Basic language features
+├── control_flow/*.ms                # Loops and conditionals
+├── classes/*.ms                     # Class definitions
+├── algorithms/*.ms                  # Sorting, searching, etc.
+├── patterns/*.ms                    # Design patterns
+├── executable/*.ms                  # Fixtures with main() for execution tests
 ```
 
 ---
@@ -60,7 +69,7 @@ zig build test-backends -- --test-filter="while loop"
 
 ```zig
 const helpers = @import("backend_test_helpers.zig");
-const fixtures = @import("real_world_fixtures.zig");
+const fixtures = @import("fixtures");
 
 // Compile TypeScript to specified backend
 var result = try helpers.compile(allocator, source, .erlang);
@@ -124,7 +133,7 @@ defer erlc_result.deinit();
 
 ## 📝 Real-World Fixtures
 
-`real_world_fixtures.zig` contains **actual TypeScript programs** used as test data:
+`tests/fixtures/fixtures.zig` contains **actual TypeScript programs** used as test data (loaded from `.ms` files via `@embedFile`):
 
 ### Basic Features
 - `SIMPLE_FUNCTION` - Function with parameters and return

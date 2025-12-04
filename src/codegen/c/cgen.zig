@@ -27,116 +27,58 @@ const ast = @import("../../ast/ast.zig");
 const types_mod = @import("../../ast/types.zig");
 const node_mod = @import("../../ast/node.zig");
 
-// Optional DRC analysis support
+// DRC (Deferred Reference Counting) analysis - REQUIRED for C backend
+// DRC provides ownership analysis and RC operation placement
 const drc_mod = @import("../../analysis/drc.zig");
 const Drc = drc_mod.Drc;
 const RcOp = drc_mod.RcOp;
-
-/// Tracks a variable that needs ORC decref at scope exit
-const ScopeVar = struct {
-    name: []const u8,
-    type_name: []const u8,
-};
-
-/// Scope marker: tracks scope boundaries and variables needing cleanup
-const Scope = struct {
-    vars: std.ArrayList(ScopeVar),
-
-    fn init(allocator: std.mem.Allocator) Scope {
-        return .{ .vars = std.ArrayList(ScopeVar).init(allocator) };
-    }
-
-    fn deinit(self: *Scope) void {
-        self.vars.deinit();
-    }
-};
 
 pub const CGenerator = struct {
     allocator: std.mem.Allocator,
     output: std.ArrayList(u8),
     indent_level: usize,
-    /// Stack of scopes for ORC cleanup tracking (legacy mode)
-    scope_stack: std.ArrayList(Scope),
-    /// Optional DRC analysis results (when --enable-drc is used)
-    drc: ?*Drc,
+    /// DRC analysis results - REQUIRED for C backend
+    /// Provides ownership analysis and RC operation placement
+    drc: *Drc,
     /// Current line being generated (for DRC queries)
     current_line: u32,
 
     const Self = @This();
 
-    pub fn init(allocator: std.mem.Allocator) Self {
+    /// Initialize C generator with DRC analysis results (required)
+    pub fn init(allocator: std.mem.Allocator, drc: *Drc) Self {
         return .{
             .allocator = allocator,
             .output = std.ArrayList(u8).init(allocator),
             .indent_level = 0,
-            .scope_stack = std.ArrayList(Scope).init(allocator),
-            .drc = null,
-            .current_line = 0,
-        };
-    }
-
-    /// Initialize with DRC analysis results
-    pub fn initWithDrc(allocator: std.mem.Allocator, drc: *Drc) Self {
-        return .{
-            .allocator = allocator,
-            .output = std.ArrayList(u8).init(allocator),
-            .indent_level = 0,
-            .scope_stack = std.ArrayList(Scope).init(allocator),
             .drc = drc,
             .current_line = 0,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        for (self.scope_stack.items) |*scope| {
-            scope.deinit();
-        }
-        self.scope_stack.deinit();
         self.output.deinit();
     }
 
-    /// Push a new scope for variable tracking
-    fn pushScope(self: *Self) !void {
-        try self.scope_stack.append(Scope.init(self.allocator));
-    }
-
-    /// Pop scope and emit decrefs for all tracked variables
-    fn popScopeWithCleanup(self: *Self) !void {
-        // Always clean up legacy scope stack
-        if (self.scope_stack.items.len == 0) return;
-        var scope = self.scope_stack.pop().?;
-        defer scope.deinit();
-
-        // If DRC is used, emit DRC ops for current line (scope exit ops)
-        if (self.drc) |drc| {
-            try self.emitDrcOpsForLine(drc, self.current_line);
-            return;
-        }
-
-        // Legacy mode: emit decrefs in reverse order (LIFO)
-        var i: usize = scope.vars.items.len;
-        while (i > 0) {
-            i -= 1;
-            const v = scope.vars.items[i];
-            try self.emitIndent();
-            try self.emit("ms_decref_typed(");
-            try self.emit(v.name);
-            try self.emit(", &");
-            try self.emit(v.type_name);
-            try self.emit("_type);\n");
-        }
-    }
-
-    /// Pop scope WITHOUT emitting cleanup (used when control flow already handled it)
-    fn popScopeNoCleanup(self: *Self) !void {
-        if (self.scope_stack.items.len == 0) return;
-        var scope = self.scope_stack.pop().?;
-        scope.deinit();
-    }
+    // ========================================================================
+    // DRC Integration - Emit RC operations from analysis
+    // ========================================================================
 
     /// Emit RC operations from DRC analysis for a specific line
-    fn emitDrcOpsForLine(self: *Self, drc: *Drc, line: u32) !void {
-        const ops = drc.getOpsForLine(line);
+    /// Call this before emitting the statement at `line` (for .before ops)
+    /// or after emitting the statement (for .after ops)
+    fn emitDrcOpsForLine(self: *Self, line: u32, position: RcOp.Position) !void {
+        const ops = self.drc.getOpsForLine(line);
+        for (ops) |op| {
+            if (op.position == position) {
+                try self.emitRcOp(op);
+            }
+        }
+    }
+
+    /// Emit all RC operations for a line (both before and after)
+    fn emitAllDrcOpsForLine(self: *Self, line: u32) !void {
+        const ops = self.drc.getOpsForLine(line);
         for (ops) |op| {
             try self.emitRcOp(op);
         }
@@ -155,7 +97,6 @@ pub const CGenerator = struct {
                 try self.emit(");\n");
             },
             .decref => {
-                // For decref we need the type info - use generic version
                 try self.emitIndent();
                 try self.emit("ms_decref(");
                 try self.emit(op.target);
@@ -170,10 +111,12 @@ pub const CGenerator = struct {
             },
             .move => {
                 // Transfer ownership - no RC change needed
-                try self.emitIndent();
-                try self.emit("// move: ");
-                try self.emit(op.target);
-                try self.emit("\n");
+                // Emit comment for debugging
+                if (op.comment) |comment| {
+                    try self.emitIndent();
+                    try self.emit(comment);
+                    try self.emit("\n");
+                }
             },
             .scope_cleanup_start => {
                 try self.emitIndent();
@@ -184,15 +127,6 @@ pub const CGenerator = struct {
                 try self.emit("// scope cleanup end\n");
             },
         }
-    }
-
-    /// Track a reference-type variable for cleanup at scope exit
-    fn trackScopeVar(self: *Self, name: []const u8, type_name: []const u8) !void {
-        if (self.scope_stack.items.len == 0) return;
-        try self.scope_stack.items[self.scope_stack.items.len - 1].vars.append(.{
-            .name = name,
-            .type_name = type_name,
-        });
     }
 
     /// Convert BinaryOp enum to C operator string
@@ -383,7 +317,11 @@ pub const CGenerator = struct {
         const t = typ.?;
         return switch (t.kind) {
             // Reference types that need ORC tracing
-            .object, .array, .type_reference => true,
+            // - object: class instances (heap allocated with ORC header)
+            // - array: arrays (heap allocated with ORC header)
+            // - string: msString* (heap allocated with ORC header)
+            // - type_reference: may resolve to a reference type
+            .object, .array, .string, .type_reference => true,
             // Primitives - no tracing needed
             else => false,
         };
@@ -819,14 +757,8 @@ pub const CGenerator = struct {
                 if (decl.init) |init_expr| {
                     try self.emit(" = ");
                     try self.emitExpression(init_expr);
-
-                    // Track reference-type variables for ORC cleanup
-                    if (init_expr.kind == .new_expr) {
-                        const new_e = &init_expr.data.new_expr;
-                        if (new_e.callee.kind == .identifier) {
-                            try self.trackScopeVar(decl.name, new_e.callee.data.identifier);
-                        }
-                    }
+                    // Note: incref for variable-to-variable copy (let x = y) is handled
+                    // by DRC and emitted via emitDrcOpsForLine(.after) after this statement
                 }
 
                 try self.emit(";\n");
@@ -877,23 +809,33 @@ pub const CGenerator = struct {
     /// Emit a block statement
     fn emitBlockStmt(self: *Self, node: *ast.Node) !void {
         const block = &node.data.block_stmt;
+        const block_start_line = node.location.start.line;
 
         try self.emit("{\n");
         self.indent_level += 1;
-        try self.pushScope(); // Track variables for ORC cleanup
 
+        // Emit statements in the block
         for (block.statements) |stmt| {
+            const stmt_line = stmt.location.start.line;
+            self.current_line = stmt_line;
+
             try self.emitIndent();
             try self.emitNode(stmt);
+
+            // Emit DRC ops that should come AFTER this statement
+            // This includes incref for variable copies (let x = y)
+            try self.emitDrcOpsForLine(stmt_line, .after);
         }
 
-        // Update current_line to block's end for DRC scope exit ops
-        if (block.statements.len > 0) {
-            self.current_line = block.statements[block.statements.len - 1].location.start.line;
-        }
+        // Update current_line to block's end for scope exit ops
+        const block_end_line = if (block.statements.len > 0)
+            block.statements[block.statements.len - 1].location.start.line
+        else
+            block_start_line;
+        self.current_line = block_end_line;
 
         // Check if block ends with return/break/continue (control flow exit)
-        // If so, skip cleanup - it was already emitted by the return statement
+        // If so, skip scope cleanup - return statement handles its own cleanup
         const ends_with_control_flow = if (block.statements.len > 0)
             switch (block.statements[block.statements.len - 1].kind) {
                 .return_stmt, .break_stmt, .continue_stmt => true,
@@ -902,12 +844,11 @@ pub const CGenerator = struct {
         else
             false;
 
-        // Emit ORC cleanup (decrefs) before closing scope - but only if we didn't already
+        // Emit scope cleanup from DRC (if not already handled by control flow)
+        // Note: Scope cleanup ops have position=.before, so they won't duplicate
+        // the per-statement .after ops
         if (!ends_with_control_flow) {
-            try self.popScopeWithCleanup();
-        } else {
-            // Still need to pop scope, just skip the cleanup emission
-            try self.popScopeNoCleanup();
+            try self.emitDrcOpsForLine(block_end_line, .before);
         }
 
         self.indent_level -= 1;
@@ -1103,43 +1044,15 @@ pub const CGenerator = struct {
 
     /// Check if any scope has variables that need cleanup
     fn hasAnyCleanup(self: *Self) bool {
-        // In DRC mode, check if there are ops for current line
-        if (self.drc) |drc| {
-            const ops = drc.getOpsForLine(self.current_line);
-            return ops.len > 0;
-        }
-        // Legacy mode: check scope stack
-        for (self.scope_stack.items) |scope| {
-            if (scope.vars.items.len > 0) return true;
-        }
-        return false;
+        // Check DRC for ops at current line
+        const ops = self.drc.getOpsForLine(self.current_line);
+        return ops.len > 0;
     }
 
     /// Emit cleanup for all scopes (used for early return)
     fn emitAllScopeCleanup(self: *Self) !void {
-        // If DRC is available, emit DRC cleanup before return
-        if (self.drc) |drc| {
-            try self.emitDrcOpsForLine(drc, self.current_line);
-            return;
-        }
-
-        // Legacy mode: emit decrefs for all scopes in reverse order (innermost first)
-        var scope_idx: usize = self.scope_stack.items.len;
-        while (scope_idx > 0) {
-            scope_idx -= 1;
-            const scope = &self.scope_stack.items[scope_idx];
-            var i: usize = scope.vars.items.len;
-            while (i > 0) {
-                i -= 1;
-                const v = scope.vars.items[i];
-                try self.emitIndent();
-                try self.emit("ms_decref_typed(");
-                try self.emit(v.name);
-                try self.emit(", &");
-                try self.emit(v.type_name);
-                try self.emit("_type);\n");
-            }
-        }
+        // Emit all DRC cleanup ops for current line
+        try self.emitAllDrcOpsForLine(self.current_line);
     }
 
     /// Emit console.log/error/warn as printf
@@ -1213,10 +1126,11 @@ pub const CGenerator = struct {
                     }
                     continue;
                 }
-                // Strings: emit directly without cast
+                // Strings: wrap with ms_string_cstr() to get char* for printf
                 if (arg_type.kind == .string) {
-                    try self.emit(", ");
+                    try self.emit(", ms_string_cstr(");
                     try self.emitExpression(arg);
+                    try self.emit(")");
                     continue;
                 }
                 // Booleans: emit directly without cast
@@ -1254,6 +1168,74 @@ pub const CGenerator = struct {
         try self.emit(");\n");
     }
 
+    /// Emit Math.* builtin calls mapped to C <math.h> functions
+    /// Math.floor(x) → floor(x), Math.sqrt(x) → sqrt(x), etc.
+    fn emitMathCall(self: *Self, method: []const u8, args: []const *ast.Node) !void {
+        // Map TypeScript Math methods to C <math.h> functions
+        const c_func: ?[]const u8 = if (std.mem.eql(u8, method, "floor")) "floor"
+            else if (std.mem.eql(u8, method, "ceil")) "ceil"
+            else if (std.mem.eql(u8, method, "round")) "round"
+            else if (std.mem.eql(u8, method, "trunc")) "trunc"
+            else if (std.mem.eql(u8, method, "sqrt")) "sqrt"
+            else if (std.mem.eql(u8, method, "cbrt")) "cbrt"
+            else if (std.mem.eql(u8, method, "abs")) "fabs"
+            else if (std.mem.eql(u8, method, "sin")) "sin"
+            else if (std.mem.eql(u8, method, "cos")) "cos"
+            else if (std.mem.eql(u8, method, "tan")) "tan"
+            else if (std.mem.eql(u8, method, "asin")) "asin"
+            else if (std.mem.eql(u8, method, "acos")) "acos"
+            else if (std.mem.eql(u8, method, "atan")) "atan"
+            else if (std.mem.eql(u8, method, "atan2")) "atan2"
+            else if (std.mem.eql(u8, method, "sinh")) "sinh"
+            else if (std.mem.eql(u8, method, "cosh")) "cosh"
+            else if (std.mem.eql(u8, method, "tanh")) "tanh"
+            else if (std.mem.eql(u8, method, "exp")) "exp"
+            else if (std.mem.eql(u8, method, "expm1")) "expm1"
+            else if (std.mem.eql(u8, method, "log")) "log"
+            else if (std.mem.eql(u8, method, "log10")) "log10"
+            else if (std.mem.eql(u8, method, "log2")) "log2"
+            else if (std.mem.eql(u8, method, "log1p")) "log1p"
+            else if (std.mem.eql(u8, method, "pow")) "pow"
+            else if (std.mem.eql(u8, method, "hypot")) "hypot"
+            else if (std.mem.eql(u8, method, "sign")) "copysign"  // sign(x) → copysign(1.0, x)
+            else if (std.mem.eql(u8, method, "min")) "fmin"
+            else if (std.mem.eql(u8, method, "max")) "fmax"
+            else if (std.mem.eql(u8, method, "random")) "((double)rand() / RAND_MAX)"  // Simple random [0,1)
+            else null;
+
+        if (c_func) |func| {
+            // Special case: Math.sign(x) → copysign(1.0, x)
+            if (std.mem.eql(u8, method, "sign")) {
+                try self.emit("copysign(1.0, ");
+                if (args.len > 0) {
+                    try self.emitExpression(args[0]);
+                }
+                try self.emit(")");
+                return;
+            }
+
+            // Special case: Math.random() has no arguments
+            if (std.mem.eql(u8, method, "random")) {
+                try self.emit("((double)rand() / RAND_MAX)");
+                return;
+            }
+
+            // Standard case: func(arg1, arg2, ...)
+            try self.emit(func);
+            try self.emit("(");
+            for (args, 0..) |arg, i| {
+                if (i > 0) try self.emit(", ");
+                try self.emitExpression(arg);
+            }
+            try self.emit(")");
+        } else {
+            // Unknown Math method - emit as-is (will cause C compiler error)
+            try self.emit("/* unsupported: Math.");
+            try self.emit(method);
+            try self.emit(" */ 0");
+        }
+    }
+
     /// Emit an expression (recursive)
     fn emitExpression(self: *Self, node: *ast.Node) anyerror!void {
         switch (node.kind) {
@@ -1264,9 +1246,10 @@ pub const CGenerator = struct {
                 try self.emit(num_str);
             },
             .string_literal => {
-                try self.emit("\"");
+                // Wrap string literals in ms_string_from_cstr for ORC management
+                try self.emit("ms_string_from_cstr(\"");
                 try self.emit(node.data.string_literal);
-                try self.emit("\"");
+                try self.emit("\")");
             },
             .boolean_literal => {
                 if (node.data.boolean_literal) {
@@ -1328,24 +1311,24 @@ pub const CGenerator = struct {
                         false;
 
                     if (left_is_string and right_is_string) {
-                        // string + string → ms_cstr_concat
-                        try self.emit("ms_cstr_concat(");
+                        // string + string → ms_string_concat (ORC-managed)
+                        try self.emit("ms_string_concat(");
                         try self.emitExpression(binary.left);
                         try self.emit(", ");
                         try self.emitExpression(binary.right);
                         try self.emit(")");
                         return;
                     } else if (left_is_string and right_is_number) {
-                        // string + number → ms_cstr_concat_num
-                        try self.emit("ms_cstr_concat_num(");
+                        // string + number → ms_string_concat_num (ORC-managed)
+                        try self.emit("ms_string_concat_num(");
                         try self.emitExpression(binary.left);
                         try self.emit(", ");
                         try self.emitExpression(binary.right);
                         try self.emit(")");
                         return;
                     } else if (left_is_number and right_is_string) {
-                        // number + string → ms_num_concat_cstr
-                        try self.emit("ms_num_concat_cstr(");
+                        // number + string → ms_num_concat_string (ORC-managed)
+                        try self.emit("ms_num_concat_string(");
                         try self.emitExpression(binary.left);
                         try self.emit(", ");
                         try self.emitExpression(binary.right);
@@ -1374,6 +1357,28 @@ pub const CGenerator = struct {
                 // Default: regular binary expression
                 // Skip outer parens for assignment operators (already lowest precedence)
                 const is_assign = binary.op == .assign;
+
+                // ORC: For reference-type assignments to member expressions,
+                // emit ms_incref on the right-hand side to prevent use-after-free
+                // Example: team.leader = user  ->  ms_incref(user); team->leader = user;
+                //
+                // CRITICAL: Only incref EXISTING references (identifiers, member expressions).
+                // Fresh allocations (string literals, new expressions, call expressions)
+                // already have rc=1 and don't need incref - calling emitExpression twice
+                // would create TWO separate allocations, leaking the first one.
+                if (is_assign and binary.left.kind == .member_expr) {
+                    const rhs_is_ref = isOrcReferenceType(binary.right.type);
+                    const rhs_is_existing_ref = binary.right.kind == .identifier or
+                        binary.right.kind == .member_expr;
+                    if (rhs_is_ref and rhs_is_existing_ref) {
+                        // Emit incref for existing reference being assigned
+                        try self.emit("ms_incref(");
+                        try self.emitExpression(binary.right);
+                        try self.emit(");\n");
+                        try self.emitIndent();
+                    }
+                }
+
                 if (!is_assign) try self.emit("(");
                 try self.emitExpression(binary.left);
                 try self.emit(" ");
@@ -1392,6 +1397,30 @@ pub const CGenerator = struct {
             },
             .member_expr => {
                 const member = &node.data.member_expr;
+
+                // Check for Math.* constants: Math.PI → M_PI, Math.E → M_E
+                if (member.object.kind == .identifier and
+                    std.mem.eql(u8, member.object.data.identifier, "Math") and
+                    member.property.kind == .identifier)
+                {
+                    const prop = member.property.data.identifier;
+                    const c_const: ?[]const u8 = if (std.mem.eql(u8, prop, "PI")) "M_PI"
+                        else if (std.mem.eql(u8, prop, "E")) "M_E"
+                        else if (std.mem.eql(u8, prop, "LN2")) "M_LN2"
+                        else if (std.mem.eql(u8, prop, "LN10")) "M_LN10"
+                        else if (std.mem.eql(u8, prop, "LOG2E")) "M_LOG2E"
+                        else if (std.mem.eql(u8, prop, "LOG10E")) "M_LOG10E"
+                        else if (std.mem.eql(u8, prop, "SQRT2")) "M_SQRT2"
+                        else if (std.mem.eql(u8, prop, "SQRT1_2")) "M_SQRT1_2"
+                        else null;
+
+                    if (c_const) |c| {
+                        try self.emit(c);
+                        return;
+                    }
+                    // Fall through for unknown Math properties (might be method without call)
+                }
+
                 try self.emitExpression(member.object);
                 if (member.computed) {
                     try self.emit("[");
@@ -1428,6 +1457,19 @@ pub const CGenerator = struct {
             },
             .call_expr => {
                 const call = &node.data.call_expr;
+
+                // Check for Math.* builtin calls: Math.floor(x) → floor(x)
+                if (call.callee.kind == .member_expr) {
+                    const member = &call.callee.data.member_expr;
+                    if (member.object.kind == .identifier and
+                        std.mem.eql(u8, member.object.data.identifier, "Math"))
+                    {
+                        if (member.property.kind == .identifier) {
+                            try self.emitMathCall(member.property.data.identifier, call.arguments);
+                            return;
+                        }
+                    }
+                }
 
                 // Check for method call on class instance: obj.method(args) → ClassName_method(obj, args)
                 if (call.callee.kind == .member_expr) {
@@ -1546,7 +1588,7 @@ pub const CGenerator = struct {
             .float32 => try self.emit("float"),
             .float64 => try self.emit("double"),
             .number => try self.emit("double"),
-            .string => try self.emit("char*"),
+            .string => try self.emit("msString*"),
             .boolean => try self.emit("bool"),
             .void => try self.emit("void"),
             .type_reference => {
@@ -1561,7 +1603,7 @@ pub const CGenerator = struct {
                 // Map common type names to C types
                 const name = type_ref.name;
                 if (std.mem.eql(u8, name, "string")) {
-                    try self.emit("char*");
+                    try self.emit("msString*");
                 } else if (std.mem.eql(u8, name, "number")) {
                     try self.emit("double");
                 } else if (std.mem.eql(u8, name, "boolean")) {
@@ -1597,8 +1639,16 @@ pub const CGenerator = struct {
                 }
             },
             .object => {
-                // Object types: emit as anonymous struct
                 const obj = t.data.object;
+
+                // If object has a name, it's a class instance (emit as ClassName*)
+                if (obj.name) |class_name| {
+                    try self.emit(class_name);
+                    try self.emit("*");
+                    return;
+                }
+
+                // Anonymous object: emit as anonymous struct
                 try self.emit("struct { ");
 
                 // Emit properties as struct fields

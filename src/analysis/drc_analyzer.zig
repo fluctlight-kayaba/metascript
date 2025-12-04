@@ -97,6 +97,8 @@ pub const DrcAnalyzer = struct {
         for (var_stmt.declarations) |decl| {
             // Determine type kind from initializer or explicit type
             var type_kind = ownership.TypeKind.value;
+            var is_copy_from_var = false;
+            var source_var_name: ?[]const u8 = null;
 
             if (decl.init) |init_expr| {
                 if (init_expr.kind == .new_expr) {
@@ -105,6 +107,13 @@ pub const DrcAnalyzer = struct {
 
                     // Register allocation
                     try self.drc.registerAllocation(decl.name, line, col);
+                } else if (init_expr.kind == .identifier) {
+                    // Variable-to-variable copy: let x = y
+                    type_kind = self.getExprTypeKind(init_expr);
+                    if (type_kind == .object or type_kind == .array or type_kind == .string) {
+                        is_copy_from_var = true;
+                        source_var_name = init_expr.data.identifier;
+                    }
                 } else {
                     type_kind = self.getExprTypeKind(init_expr);
                 }
@@ -120,6 +129,16 @@ pub const DrcAnalyzer = struct {
                 col,
                 false, // not a parameter
             );
+
+            // If this is a variable copy, register the incref
+            if (is_copy_from_var) {
+                try self.drc.trackVariableCopy(
+                    decl.name,
+                    source_var_name.?,
+                    line,
+                    col,
+                );
+            }
 
             // Analyze the initializer expression for uses
             if (decl.init) |init_expr| {

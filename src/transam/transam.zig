@@ -852,7 +852,7 @@ pub const TransAmDatabase = struct {
         const type_checker = try self.allocator.create(checker.TypeChecker);
         type_checker.* = try checker.TypeChecker.init(self.allocator);
 
-        // Run type checking (Phase 1: collectDeclarations populates symbols)
+        // Run type checking (all phases: collect declarations, resolve types, infer types, check types)
         _ = type_checker.check(tree) catch |err| {
             type_checker.deinit();
             self.allocator.destroy(type_checker);
@@ -935,6 +935,16 @@ pub const TransAmDatabase = struct {
     pub fn lookupSymbol(self: *Self, file_id: []const u8, name: []const u8) !?checker.symbol.Symbol {
         const symbols = try self.getSymbols(file_id);
         return symbols.lookupAll(name);
+    }
+
+    /// Look up a symbol at a specific position (line, column)
+    /// Position-aware: finds the symbol visible at that location.
+    /// This handles variable shadowing correctly - when multiple variables
+    /// have the same name in different scopes, it returns the one that's
+    /// actually visible at the cursor position.
+    pub fn lookupSymbolAtPosition(self: *Self, file_id: []const u8, name: []const u8, line: u32, column: u32) !?checker.symbol.Symbol {
+        const symbols = try self.getSymbols(file_id);
+        return symbols.lookupAtPosition(name, line, column);
     }
 
     /// Invalidate type checker cache for a file (called when file changes)

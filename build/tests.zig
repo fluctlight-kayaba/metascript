@@ -183,6 +183,11 @@ pub fn setup(
     // Backend Tests (Phase 1 - Critical for TDD)
     // =========================================================================
 
+    // Create fixtures module (single source of truth for test fixtures)
+    const fixtures_module = b.createModule(.{
+        .root_source_file = b.path("tests/fixtures/fixtures.zig"),
+    });
+
     // Erlang backend tests
     const erlang_backend_tests = b.addTest(.{
         .root_source_file = b.path("tests/backends/erlang_codegen_test.zig"),
@@ -190,6 +195,7 @@ pub fn setup(
         .optimize = optimize,
     });
     erlang_backend_tests.root_module.addImport("src", src_module);
+    erlang_backend_tests.root_module.addImport("fixtures", fixtures_module);
     const run_erlang_backend_tests = b.addRunArtifact(erlang_backend_tests);
 
     // C backend tests
@@ -199,6 +205,7 @@ pub fn setup(
         .optimize = optimize,
     });
     c_backend_tests.root_module.addImport("src", src_module);
+    c_backend_tests.root_module.addImport("fixtures", fixtures_module);
     const run_c_backend_tests = b.addRunArtifact(c_backend_tests);
 
     // Cross-backend parity tests
@@ -208,6 +215,7 @@ pub fn setup(
         .optimize = optimize,
     });
     cross_backend_tests.root_module.addImport("src", src_module);
+    cross_backend_tests.root_module.addImport("fixtures", fixtures_module);
     const run_cross_backend_tests = b.addRunArtifact(cross_backend_tests);
 
     // Backend analytics test
@@ -217,6 +225,7 @@ pub fn setup(
         .optimize = optimize,
     });
     backend_analytics_tests.root_module.addImport("src", src_module);
+    backend_analytics_tests.root_module.addImport("fixtures", fixtures_module);
     const run_backend_analytics_tests = b.addRunArtifact(backend_analytics_tests);
 
     // Error detection test
@@ -250,6 +259,7 @@ pub fn setup(
         .optimize = optimize,
     });
     test_real_fixture_tests.root_module.addImport("src", src_module);
+    test_real_fixture_tests.root_module.addImport("fixtures", fixtures_module);
     const run_test_real_fixture_tests = b.addRunArtifact(test_real_fixture_tests);
 
     const test_real_fixture_step = b.step("test-real-fixture", "Test real fixtures individually");
@@ -306,6 +316,7 @@ pub fn setup(
         .optimize = optimize,
     });
     execution_analytics_tests.root_module.addImport("src", src_module);
+    execution_analytics_tests.root_module.addImport("fixtures", fixtures_module);
     const run_execution_analytics_tests = b.addRunArtifact(execution_analytics_tests);
 
     const test_execution_step = b.step("test-execution", "Run enhanced execution analytics (compile + run generated code)");
@@ -318,6 +329,7 @@ pub fn setup(
         .optimize = optimize,
     });
     score_codegen_tests.root_module.addImport("src", src_module);
+    score_codegen_tests.root_module.addImport("fixtures", fixtures_module);
     const run_score_codegen_tests = b.addRunArtifact(score_codegen_tests);
 
     const test_score_codegen_step = b.step("test-score-codegen", "Run comprehensive codegen quality scoring (compile + quality + component attribution)");

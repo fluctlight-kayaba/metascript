@@ -172,7 +172,7 @@ pub const TypeChecker = struct {
                 for (var_stmt.declarations) |decl| {
                     var sym = symbol.Symbol.init(decl.name, .variable, node.location);
                     sym.mutable = is_mutable;
-                    sym.type = decl.type;
+                    sym.type = decl.type; // May be null, will be inferred later in Phase 3
 
                     self.symbols.define(sym) catch {
                         try self.errors.append(.{

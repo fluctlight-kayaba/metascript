@@ -229,14 +229,21 @@ pub fn functionTypesCompatible(target: *types.FunctionType, source: *types.Funct
         }
     }
 
-    // Check parameter types (contravariant)
+    // Check parameter types (CONTRAVARIANT)
+    // For a function assignment: target = source
+    // Source function must accept AT LEAST what target function accepts.
+    // This means source's parameter type must be a SUPERTYPE of target's parameter type.
+    //
+    // Example: target: (Animal) => void, source: (Dog) => void
+    // - Source only handles Dogs, but target may receive any Animal
+    // - This should FAIL because Dog <: Animal, not Animal <: Dog
+    //
+    // Correct check: source.params[i].type must accept target.params[i].type
+    // Which means: typesCompatible(source.params[i].type, target.params[i].type)
     const min_params = @min(target.params.len, source.params.len);
     for (0..min_params) |i| {
-        // For contravariance: source param should accept what target param accepts
-        // Simplified: just check for compatibility in either direction
-        if (!typesCompatible(target.params[i].type, source.params[i].type) and
-            !typesCompatible(source.params[i].type, target.params[i].type))
-        {
+        // Contravariant: source param must accept target param (source is supertype)
+        if (!typesCompatible(source.params[i].type, target.params[i].type)) {
             return false;
         }
     }
@@ -248,6 +255,255 @@ pub fn functionTypesCompatible(target: *types.FunctionType, source: *types.Funct
 // ============================================================================
 // Tests
 // ============================================================================
+
+test "functionTypesCompatible: contravariant parameters with incompatible types" {
+    // Test parameter contravariance with clearly incompatible types (number vs string)
+    // Function (number) => void is NOT compatible with (string) => void
+    // Because a function expecting a number can't handle a string, and vice versa.
+    //
+    // Contravariance: source param type must be compatible with target param type
+    // in the correct direction (source can accept what target accepts).
+
+    const testing = std.testing;
+    const location = @import("../ast/location.zig");
+    const dummy_loc = location.SourceLocation.dummy();
+
+    // Create number type
+    var number_type = types.Type{
+        .kind = .number,
+        .location = dummy_loc,
+        .data = .{ .number = {} },
+    };
+
+    // Create string type
+    var string_type = types.Type{
+        .kind = .string,
+        .location = dummy_loc,
+        .data = .{ .string = {} },
+    };
+
+    // Create void type for return
+    var void_type = types.Type{
+        .kind = .void,
+        .location = dummy_loc,
+        .data = .{ .void = {} },
+    };
+
+    // Create function type: (number) => void
+    const number_param = types.FunctionType.FunctionParam{
+        .name = "n",
+        .type = &number_type,
+        .optional = false,
+    };
+    var fn_takes_number = types.FunctionType{
+        .params = @constCast(&[_]types.FunctionType.FunctionParam{number_param}),
+        .return_type = &void_type,
+        .type_params = &[_]types.GenericParam{},
+    };
+
+    // Create function type: (string) => void
+    const string_param = types.FunctionType.FunctionParam{
+        .name = "s",
+        .type = &string_type,
+        .optional = false,
+    };
+    var fn_takes_string = types.FunctionType{
+        .params = @constCast(&[_]types.FunctionType.FunctionParam{string_param}),
+        .return_type = &void_type,
+        .type_params = &[_]types.GenericParam{},
+    };
+
+    // (number) => void should NOT be compatible with (string) => void
+    // Because string is not compatible with number
+    try testing.expect(!functionTypesCompatible(&fn_takes_number, &fn_takes_string));
+    try testing.expect(!functionTypesCompatible(&fn_takes_string, &fn_takes_number));
+}
+
+test "functionTypesCompatible: contravariant parameters with structural subtyping" {
+    // Test TRUE contravariance with structural subtyping
+    //
+    // Given: Dog <: Animal (Dog is a structural subtype of Animal - Dog has all Animal's properties)
+    //
+    // Function assignment: let f: (Animal) => void = g
+    // - If g: (Animal) => void → YES (same type)
+    // - If g: (Dog) => void → NO! (g only handles Dogs, can't handle all Animals)
+    //
+    // CONTRAVARIANCE: Source function's parameter must be a SUPERTYPE of target's parameter
+    // So source param must ACCEPT what target param accepts.
+    //
+    // This is counterintuitive but correct:
+    // - Target says "I need a function that handles Animals"
+    // - A function that handles "any Object" (supertype) is fine
+    // - A function that only handles "Dogs" (subtype) is NOT fine
+
+    const testing = std.testing;
+    const location = @import("../ast/location.zig");
+    const dummy_loc = location.SourceLocation.dummy();
+
+    // Create Animal type with property "name: string"
+    var name_prop_type = types.Type{
+        .kind = .string,
+        .location = dummy_loc,
+        .data = .{ .string = {} },
+    };
+    const animal_name_prop = types.ObjectType.Property{
+        .name = "name",
+        .type = &name_prop_type,
+        .optional = false,
+    };
+    var animal_obj = types.ObjectType{
+        .name = "Animal",
+        .properties = @constCast(&[_]types.ObjectType.Property{animal_name_prop}),
+        .methods = &[_]types.ObjectType.Property{},
+    };
+    var animal_type = types.Type{
+        .kind = .object,
+        .location = dummy_loc,
+        .data = .{ .object = &animal_obj },
+    };
+
+    // Create Dog type with properties "name: string" AND "breed: string" (Dog <: Animal)
+    const dog_name_prop = types.ObjectType.Property{
+        .name = "name",
+        .type = &name_prop_type,
+        .optional = false,
+    };
+    var breed_prop_type = types.Type{
+        .kind = .string,
+        .location = dummy_loc,
+        .data = .{ .string = {} },
+    };
+    const dog_breed_prop = types.ObjectType.Property{
+        .name = "breed",
+        .type = &breed_prop_type,
+        .optional = false,
+    };
+    var dog_obj = types.ObjectType{
+        .name = "Dog",
+        .properties = @constCast(&[_]types.ObjectType.Property{ dog_name_prop, dog_breed_prop }),
+        .methods = &[_]types.ObjectType.Property{},
+    };
+    var dog_type = types.Type{
+        .kind = .object,
+        .location = dummy_loc,
+        .data = .{ .object = &dog_obj },
+    };
+
+    // Verify structural subtyping: Dog <: Animal (Dog has all Animal's properties)
+    try testing.expect(typesCompatible(&animal_type, &dog_type)); // Dog assignable to Animal
+    try testing.expect(!typesCompatible(&dog_type, &animal_type)); // Animal NOT assignable to Dog
+
+    // Create void type for return
+    var void_type = types.Type{
+        .kind = .void,
+        .location = dummy_loc,
+        .data = .{ .void = {} },
+    };
+
+    // Create function type: (Animal) => void
+    const animal_param = types.FunctionType.FunctionParam{
+        .name = "a",
+        .type = &animal_type,
+        .optional = false,
+    };
+    var fn_takes_animal = types.FunctionType{
+        .params = @constCast(&[_]types.FunctionType.FunctionParam{animal_param}),
+        .return_type = &void_type,
+        .type_params = &[_]types.GenericParam{},
+    };
+
+    // Create function type: (Dog) => void
+    const dog_param = types.FunctionType.FunctionParam{
+        .name = "d",
+        .type = &dog_type,
+        .optional = false,
+    };
+    var fn_takes_dog = types.FunctionType{
+        .params = @constCast(&[_]types.FunctionType.FunctionParam{dog_param}),
+        .return_type = &void_type,
+        .type_params = &[_]types.GenericParam{},
+    };
+
+    // CONTRAVARIANCE TEST:
+    // Can we assign (Dog) => void to (Animal) => void?
+    // Target expects function that handles any Animal
+    // Source only handles Dogs - SHOULD FAIL (violates Liskov Substitution)
+    //
+    // CURRENT BUG: Symmetrical check passes because Dog <: Animal
+    // CORRECT: Should fail because Dog (source param) doesn't accept Animal (target param)
+    try testing.expect(!functionTypesCompatible(&fn_takes_animal, &fn_takes_dog));
+
+    // Can we assign (Animal) => void to (Dog) => void?
+    // Target expects function that handles Dogs
+    // Source handles all Animals (including Dogs) - SHOULD PASS
+    try testing.expect(functionTypesCompatible(&fn_takes_dog, &fn_takes_animal));
+}
+
+test "functionTypesCompatible: covariant return types" {
+    // Return types are covariant: if target returns Animal, source can return Dog (subtype)
+    // But if target returns Dog, source cannot return Animal (supertype)
+
+    const testing = std.testing;
+    const location = @import("../ast/location.zig");
+    const dummy_loc = location.SourceLocation.dummy();
+
+    // Create number and string types for testing
+    var number_type = types.Type{
+        .kind = .number,
+        .location = dummy_loc,
+        .data = .{ .number = {} },
+    };
+    var string_type = types.Type{
+        .kind = .string,
+        .location = dummy_loc,
+        .data = .{ .string = {} },
+    };
+
+    // Create function type: () => number
+    var fn_returns_number = types.FunctionType{
+        .params = &[_]types.FunctionType.FunctionParam{},
+        .return_type = &number_type,
+        .type_params = &[_]types.GenericParam{},
+    };
+
+    // Create function type: () => string
+    var fn_returns_string = types.FunctionType{
+        .params = &[_]types.FunctionType.FunctionParam{},
+        .return_type = &string_type,
+        .type_params = &[_]types.GenericParam{},
+    };
+
+    // number and string are incompatible, so neither function should be assignable to the other
+    try testing.expect(!functionTypesCompatible(&fn_returns_number, &fn_returns_string));
+    try testing.expect(!functionTypesCompatible(&fn_returns_string, &fn_returns_number));
+}
+
+test "functionTypesCompatible: same types are compatible" {
+    const testing = std.testing;
+    const location = @import("../ast/location.zig");
+    const dummy_loc = location.SourceLocation.dummy();
+
+    var number_type = types.Type{
+        .kind = .number,
+        .location = dummy_loc,
+        .data = .{ .number = {} },
+    };
+
+    const number_param = types.FunctionType.FunctionParam{
+        .name = "n",
+        .type = &number_type,
+        .optional = false,
+    };
+
+    var fn_type = types.FunctionType{
+        .params = @constCast(&[_]types.FunctionType.FunctionParam{number_param}),
+        .return_type = &number_type,
+        .type_params = &[_]types.GenericParam{},
+    };
+
+    // Same function type should be compatible with itself
+    try testing.expect(functionTypesCompatible(&fn_type, &fn_type));
+}
 
 test "isNumericType: primitive numeric types" {
     const testing = std.testing;

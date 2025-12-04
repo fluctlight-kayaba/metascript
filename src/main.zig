@@ -18,6 +18,9 @@ pub const jsgen = @import("codegen/js/jsgen.zig");
 pub const cgen = @import("codegen/c/cgen.zig");
 pub const erlgen = @import("codegen/erlang/erlgen.zig");
 
+// Analysis modules
+pub const drc = @import("analysis/drc.zig");
+
 // Import CLI commands
 const cli_dump_tokens = @import("cli/dump_tokens.zig");
 const cli_dump_ast = @import("cli/dump_ast.zig");

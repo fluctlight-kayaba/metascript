@@ -266,10 +266,10 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
             colors.Color.reset.code(),
         });
 
-        // Move optimization disabled - causes memory leaks (marks vars as moved prematurely)
-        // TODO: Fix move optimization to only move when ownership is actually transferred
+        // Initialize DRC with move optimization enabled
+        // Move optimization detects last-use of variables and elides RC ops
         drc_storage = Drc.initWithConfig(allocator, .{
-            .enable_move_optimization = false,
+            .enable_move_optimization = true,
             .enable_cycle_detection = true,
         });
         drc = &drc_storage;
@@ -413,8 +413,16 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
             });
         },
         .c => {
-            // Use DRC-aware generator if DRC analysis was performed
-            var gen = if (drc) |d| cgen.CGenerator.initWithDrc(allocator, d) else cgen.CGenerator.init(allocator);
+            // DRC is required for C backend
+            if (drc == null) {
+                std.debug.print("{s}error:{s} DRC analysis is required for C backend\n", .{
+                    colors.error_color.code(),
+                    colors.Color.reset.code(),
+                });
+                return;
+            }
+
+            var gen = cgen.CGenerator.init(allocator, drc.?);
             defer gen.deinit();
 
             const c_code = gen.generate(final_ast) catch |err| {

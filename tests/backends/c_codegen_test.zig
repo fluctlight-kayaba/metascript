@@ -7,7 +7,7 @@
 const std = @import("std");
 const testing = std.testing;
 const helpers = @import("backend_test_helpers.zig");
-const fixtures = @import("real_world_fixtures.zig");
+const fixtures = @import("fixtures");
 
 // ============================================================================
 // Basic C Code Generation (Start Here)
@@ -680,6 +680,166 @@ test "c: conditional types compile" {
     };
     defer result.deinit();
     std.debug.print("\n✅ Conditional types: SUPPORTED\n", .{});
+}
+
+// ============================================================================
+// Math.* Global Builtins
+// ============================================================================
+
+test "c: Math.floor maps to C floor()" {
+    const source =
+        \\function demo(): number {
+        \\    return Math.floor(3.7);
+        \\}
+    ;
+
+    var result = try helpers.expectCompiles(testing.allocator, source, .c);
+    defer result.deinit();
+
+    // Math.floor should map to C floor()
+    try helpers.expectContains(result.output, "floor(3.7)");
+    // Should NOT have Math.floor (JavaScript syntax)
+    try helpers.expectNotContains(result.output, "Math.floor");
+}
+
+test "c: Math.ceil maps to C ceil()" {
+    const source =
+        \\function demo(): number {
+        \\    return Math.ceil(3.2);
+        \\}
+    ;
+
+    var result = try helpers.expectCompiles(testing.allocator, source, .c);
+    defer result.deinit();
+
+    try helpers.expectContains(result.output, "ceil(3.2)");
+    try helpers.expectNotContains(result.output, "Math.ceil");
+}
+
+test "c: Math.sqrt maps to C sqrt()" {
+    const source =
+        \\function demo(): number {
+        \\    return Math.sqrt(16.0);
+        \\}
+    ;
+
+    var result = try helpers.expectCompiles(testing.allocator, source, .c);
+    defer result.deinit();
+
+    try helpers.expectContains(result.output, "sqrt(16)");
+    try helpers.expectNotContains(result.output, "Math.sqrt");
+}
+
+test "c: Math.abs maps to C fabs()" {
+    const source =
+        \\function demo(): number {
+        \\    return Math.abs(-5.5);
+        \\}
+    ;
+
+    var result = try helpers.expectCompiles(testing.allocator, source, .c);
+    defer result.deinit();
+
+    // Math.abs for numbers maps to fabs (floating point abs)
+    try helpers.expectContains(result.output, "fabs(-5.5)");
+    try helpers.expectNotContains(result.output, "Math.abs");
+}
+
+test "c: Math.pow maps to C pow()" {
+    const source =
+        \\function demo(): number {
+        \\    return Math.pow(2.0, 3.0);
+        \\}
+    ;
+
+    var result = try helpers.expectCompiles(testing.allocator, source, .c);
+    defer result.deinit();
+
+    try helpers.expectContains(result.output, "pow(2, 3)");
+    try helpers.expectNotContains(result.output, "Math.pow");
+}
+
+test "c: Math.sin and Math.cos map to C functions" {
+    const source =
+        \\function demo(): number {
+        \\    return Math.sin(0.0) + Math.cos(0.0);
+        \\}
+    ;
+
+    var result = try helpers.expectCompiles(testing.allocator, source, .c);
+    defer result.deinit();
+
+    try helpers.expectContains(result.output, "sin(0)");
+    try helpers.expectContains(result.output, "cos(0)");
+}
+
+test "c: Math.round maps to C round()" {
+    const source =
+        \\function demo(): number {
+        \\    return Math.round(3.5);
+        \\}
+    ;
+
+    var result = try helpers.expectCompiles(testing.allocator, source, .c);
+    defer result.deinit();
+
+    try helpers.expectContains(result.output, "round(3.5)");
+}
+
+test "c: Math.PI maps to M_PI" {
+    const source =
+        \\function demo(): number {
+        \\    return Math.PI;
+        \\}
+    ;
+
+    var result = try helpers.expectCompiles(testing.allocator, source, .c);
+    defer result.deinit();
+
+    try helpers.expectContains(result.output, "M_PI");
+    try helpers.expectNotContains(result.output, "Math.PI");
+}
+
+test "c: Math.E maps to M_E" {
+    const source =
+        \\function demo(): number {
+        \\    return Math.E;
+        \\}
+    ;
+
+    var result = try helpers.expectCompiles(testing.allocator, source, .c);
+    defer result.deinit();
+
+    try helpers.expectContains(result.output, "M_E");
+    try helpers.expectNotContains(result.output, "Math.E");
+}
+
+test "c: Math.min and Math.max map to fmin/fmax" {
+    const source =
+        \\function demo(): number {
+        \\    return Math.min(1.0, 2.0) + Math.max(3.0, 4.0);
+        \\}
+    ;
+
+    var result = try helpers.expectCompiles(testing.allocator, source, .c);
+    defer result.deinit();
+
+    try helpers.expectContains(result.output, "fmin(1, 2)");
+    try helpers.expectContains(result.output, "fmax(3, 4)");
+}
+
+test "c: Math functions include math.h" {
+    const source =
+        \\function demo(): number {
+        \\    return Math.floor(1.5);
+        \\}
+    ;
+
+    var result = try helpers.expectCompiles(testing.allocator, source, .c);
+    defer result.deinit();
+
+    // Should include math.h header
+    try helpers.expectContains(result.output, "#include <math.h>");
 }
 
 // ============================================================================

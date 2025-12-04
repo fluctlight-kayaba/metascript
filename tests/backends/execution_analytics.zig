@@ -11,7 +11,7 @@ const testing = std.testing;
 const helpers = @import("backend_test_helpers.zig");
 const exec_helpers = @import("execution_test_helpers.zig");
 const quality_helpers = @import("code_quality_helpers.zig");
-const fixtures = @import("executable_fixtures.zig");
+const fixtures = @import("fixtures");
 
 const Backend = helpers.Backend;
 

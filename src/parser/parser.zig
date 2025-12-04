@@ -1898,10 +1898,31 @@ pub const Parser = struct {
 
     // ===== Type Parsing =====
 
-    fn parseTypeReference(self: *Parser) !*ast.types.Type {
+    fn parseTypeReference(self: *Parser) Error!*ast.types.Type {
         const loc = self.current.loc;
 
-        // Simple type name
+        // Parse the base type first, then check for array suffix
+        const base_type = try self.parseBaseType(loc);
+
+        // Check for array type suffix: Type[]
+        // Can be chained: int32[][] for 2D arrays
+        var result_type = base_type;
+        while (self.match(.left_bracket)) {
+            try self.consume(.right_bracket, "Expected ']' for array type");
+            result_type = try self.arena.createType(
+                .array,
+                loc,
+                .{ .array = result_type },
+            );
+        }
+
+        return result_type;
+    }
+
+    /// Parse a base type without array suffix
+    /// Uses direct returns to avoid undefined initialization
+    fn parseBaseType(self: *Parser, loc: ast.SourceLocation) Error!*ast.types.Type {
+        // Simple type name (identifier)
         if (self.check(.identifier)) {
             const name = self.current.text;
             self.advance();
@@ -1924,22 +1945,6 @@ pub const Parser = struct {
                 .name = name,
                 .type_args = try self.arena.allocator().dupe(*ast.types.Type, type_args.items),
             };
-
-            // Check for array type: Type[]
-            if (self.match(.left_bracket)) {
-                try self.consume(.right_bracket, "Expected ']' for array type");
-                // Return array type
-                const element_type = try self.arena.createType(
-                    .type_reference,
-                    loc,
-                    .{ .type_reference = type_ref },
-                );
-                return try self.arena.createType(
-                    .array,
-                    loc,
-                    .{ .array = element_type },
-                );
-            }
 
             return try self.arena.createType(
                 .type_reference,
@@ -2004,7 +2009,7 @@ pub const Parser = struct {
             return try self.arena.createType(.float64, loc, .{ .float64 = {} });
         }
 
-        // Return a placeholder type for now
+        // Fallback: Return a placeholder type for unknown tokens
         const placeholder_ref = try self.arena.allocator().create(ast.types.TypeReference);
         placeholder_ref.* = .{
             .name = "unknown",

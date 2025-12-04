@@ -363,3 +363,29 @@ pub const ERROR_UNCLOSED_BRACE =
 pub const ERROR_UNEXPECTED_TOKEN =
     \\const x = ;
 ;
+
+// ============================================================================
+// Typed Arrays (Primitive Array Types)
+// ============================================================================
+
+/// 1D typed array with primitive element type
+pub const ARRAY_1D_INT32 =
+    \\let nums: int32[] = [1, 2, 3];
+;
+
+/// 1D typed array with float element type
+pub const ARRAY_1D_FLOAT64 =
+    \\let values: float64[] = [1.1, 2.2, 3.3];
+;
+
+/// 2D typed array (array of arrays)
+pub const ARRAY_2D_INT32 =
+    \\let matrix: int32[][] = [[1, 2], [3, 4]];
+;
+
+/// Multiple typed arrays with different primitive types
+pub const ARRAY_MULTIPLE_TYPES =
+    \\let ints: int32[] = [1, 2, 3];
+    \\let floats: float64[] = [1.1, 2.2, 3.3];
+    \\let bytes: uint8[] = [0, 1, 2, 255];
+;

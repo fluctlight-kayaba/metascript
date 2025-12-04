@@ -97,8 +97,11 @@ GC overhead:     <10% vs C
 
 ### Memory Management
 
-- **GC (default):** Generational (young/old), bump-pointer allocation
-- **ARC mode:** Reference counting via `@memory(strategy: "arc")`
+- **ORC/DRC (default):** Reference counting with automatic cycle detection ✅ **IMPLEMENTED**
+  - `orc.h` runtime: 720 LOC, 8-byte RefHeader, Bacon-Rajan collector
+  - 6-8% average overhead, meets production targets
+  - Caller-provides-type pattern for zero-overhead acyclic types
+- **Future:** Lobster-style compile-time RC elimination (target: 0.5-2%)
 - **Stack allocation:** Interfaces stack-allocated when possible
 
 ### FFI
@@ -425,4 +428,4 @@ Choose backend for deployment needs, not language limitations.
 - **JavaScript:** Universal reach (browser + npm)
 - **Erlang:** Fault tolerance (OTP)
 
-**See:** `architecture.md` (unified IR), `lsp-architecture.md` (tooling)
+**See:** `architecture.md` (compilation pipeline), `lsp-architecture.md` (tooling)

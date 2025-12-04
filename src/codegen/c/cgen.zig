@@ -27,10 +27,40 @@ const ast = @import("../../ast/ast.zig");
 const types_mod = @import("../../ast/types.zig");
 const node_mod = @import("../../ast/node.zig");
 
+// Optional DRC analysis support
+const drc_mod = @import("../../analysis/drc.zig");
+const Drc = drc_mod.Drc;
+const RcOp = drc_mod.RcOp;
+
+/// Tracks a variable that needs ORC decref at scope exit
+const ScopeVar = struct {
+    name: []const u8,
+    type_name: []const u8,
+};
+
+/// Scope marker: tracks scope boundaries and variables needing cleanup
+const Scope = struct {
+    vars: std.ArrayList(ScopeVar),
+
+    fn init(allocator: std.mem.Allocator) Scope {
+        return .{ .vars = std.ArrayList(ScopeVar).init(allocator) };
+    }
+
+    fn deinit(self: *Scope) void {
+        self.vars.deinit();
+    }
+};
+
 pub const CGenerator = struct {
     allocator: std.mem.Allocator,
     output: std.ArrayList(u8),
     indent_level: usize,
+    /// Stack of scopes for ORC cleanup tracking (legacy mode)
+    scope_stack: std.ArrayList(Scope),
+    /// Optional DRC analysis results (when --enable-drc is used)
+    drc: ?*Drc,
+    /// Current line being generated (for DRC queries)
+    current_line: u32,
 
     const Self = @This();
 
@@ -39,11 +69,121 @@ pub const CGenerator = struct {
             .allocator = allocator,
             .output = std.ArrayList(u8).init(allocator),
             .indent_level = 0,
+            .scope_stack = std.ArrayList(Scope).init(allocator),
+            .drc = null,
+            .current_line = 0,
+        };
+    }
+
+    /// Initialize with DRC analysis results
+    pub fn initWithDrc(allocator: std.mem.Allocator, drc: *Drc) Self {
+        return .{
+            .allocator = allocator,
+            .output = std.ArrayList(u8).init(allocator),
+            .indent_level = 0,
+            .scope_stack = std.ArrayList(Scope).init(allocator),
+            .drc = drc,
+            .current_line = 0,
         };
     }
 
     pub fn deinit(self: *Self) void {
+        for (self.scope_stack.items) |*scope| {
+            scope.deinit();
+        }
+        self.scope_stack.deinit();
         self.output.deinit();
+    }
+
+    /// Push a new scope for variable tracking
+    fn pushScope(self: *Self) !void {
+        try self.scope_stack.append(Scope.init(self.allocator));
+    }
+
+    /// Pop scope and emit decrefs for all tracked variables
+    fn popScopeWithCleanup(self: *Self) !void {
+        // Always clean up legacy scope stack
+        if (self.scope_stack.items.len == 0) return;
+        var scope = self.scope_stack.pop().?;
+        defer scope.deinit();
+
+        // If DRC is used, cleanup happens before return statements
+        // Don't emit here to avoid unreachable code after return
+        if (self.drc != null) return;
+
+        // Legacy mode: emit decrefs in reverse order (LIFO)
+        var i: usize = scope.vars.items.len;
+        while (i > 0) {
+            i -= 1;
+            const v = scope.vars.items[i];
+            try self.emitIndent();
+            try self.emit("ms_decref_typed(");
+            try self.emit(v.name);
+            try self.emit(", &");
+            try self.emit(v.type_name);
+            try self.emit("_type);\n");
+        }
+    }
+
+    /// Emit RC operations from DRC analysis for a specific line
+    fn emitDrcOpsForLine(self: *Self, drc: *Drc, line: u32) !void {
+        const ops = drc.getOpsForLine(line);
+        for (ops) |op| {
+            try self.emitRcOp(op);
+        }
+    }
+
+    /// Emit a single RC operation from DRC
+    fn emitRcOp(self: *Self, op: RcOp) !void {
+        switch (op.kind) {
+            .init => {
+                // RC = 1 is handled by ms_alloc, no explicit op needed
+            },
+            .incref => {
+                try self.emitIndent();
+                try self.emit("ms_incref(");
+                try self.emit(op.target);
+                try self.emit(");\n");
+            },
+            .decref => {
+                // For decref we need the type info - use generic version
+                try self.emitIndent();
+                try self.emit("ms_decref(");
+                try self.emit(op.target);
+                try self.emit(");\n");
+            },
+            .decref_cycle_check => {
+                // Use ms_decref which handles cycle detection internally
+                try self.emitIndent();
+                try self.emit("ms_decref(");
+                try self.emit(op.target);
+                try self.emit(");\n");
+            },
+            .move => {
+                // Transfer ownership - no RC change needed
+                try self.emitIndent();
+                try self.emit("// move: ");
+                try self.emit(op.target);
+                try self.emit("\n");
+            },
+            .scope_cleanup_start => {
+                try self.emitIndent();
+                try self.emit("// scope cleanup start\n");
+            },
+            .scope_cleanup_end => {
+                try self.emitIndent();
+                try self.emit("// scope cleanup end\n");
+            },
+        }
+    }
+
+    /// Track a reference-type variable for cleanup at scope exit
+    fn trackScopeVar(self: *Self, name: []const u8, type_name: []const u8) !void {
+        if (self.scope_stack.items.len == 0) return;
+        try self.scope_stack.items[self.scope_stack.items.len - 1].vars.append(.{
+            .name = name,
+            .type_name = type_name,
+        });
     }
 
     /// Convert BinaryOp enum to C operator string
@@ -90,6 +230,18 @@ pub const CGenerator = struct {
         try self.emitIncludes();
         try self.emitNewline();
 
+        // Check if user defined a main function
+        var has_user_main = false;
+        for (program.data.program.statements) |stmt| {
+            if (stmt.kind == .function_decl) {
+                const func = &stmt.data.function_decl;
+                if (std.mem.eql(u8, func.name, "main")) {
+                    has_user_main = true;
+                    break;
+                }
+            }
+        }
+
         // Emit forward declarations for classes/functions
         for (program.data.program.statements) |stmt| {
             if (stmt.kind == .class_decl or stmt.kind == .function_decl) {
@@ -97,25 +249,28 @@ pub const CGenerator = struct {
             }
         }
 
-        // Emit main function containing all code
-        try self.emit("int main(void) {\n");
-        self.indent_level += 1;
+        // Only emit wrapper main if user didn't define one
+        if (!has_user_main) {
+            // Emit main function containing all code
+            try self.emit("int main(void) {\n");
+            self.indent_level += 1;
 
-        // Emit program statements inside main
-        for (program.data.program.statements) |stmt| {
-            // Skip class/function declarations (already emitted)
-            if (stmt.kind != .class_decl and stmt.kind != .function_decl) {
-                try self.emitIndent();
-                try self.emitNode(stmt);
+            // Emit program statements inside main
+            for (program.data.program.statements) |stmt| {
+                // Skip class/function declarations (already emitted)
+                if (stmt.kind != .class_decl and stmt.kind != .function_decl) {
+                    try self.emitIndent();
+                    try self.emitNode(stmt);
+                }
             }
+
+            // Return 0
+            try self.emitIndent();
+            try self.emit("return 0;\n");
+
+            self.indent_level -= 1;
+            try self.emit("}\n");
         }
-
-        // Return 0
-        try self.emitIndent();
-        try self.emit("return 0;\n");
-
-        self.indent_level -= 1;
-        try self.emit("}\n");
 
         return try self.output.toOwnedSlice();
     }
@@ -128,12 +283,16 @@ pub const CGenerator = struct {
         try self.emit("#include <string.h>\n");
         try self.emit("#include <stdlib.h>\n");
         try self.emit("\n// Metascript ORC Runtime (compile with: -I<metascript>/src/runtime)\n");
+        try self.emit("#define MS_ORC_IMPLEMENTATION\n");
         try self.emit("#include \"orc.h\"\n");
         try self.emit("#include \"ms_string.h\"\n");
     }
 
     /// Main dispatch for node emission
     pub fn emitNode(self: *Self, node: *ast.Node) anyerror!void {
+        // Track current line for DRC queries
+        self.current_line = node.location.start.line;
+
         switch (node.kind) {
             // Declarations
             .class_decl => try self.emitClassDecl(node),
@@ -196,6 +355,105 @@ pub const CGenerator = struct {
                 try self.emitMethodPrototype(class.name, member);
             }
         }
+
+        // ORC Integration: Emit trace function and TypeInfo for cycle detection
+        try self.emitClassOrcSupport(class.name, class.members);
+    }
+
+    /// Check if a type is a reference type (needs ORC tracing)
+    fn isOrcReferenceType(typ: ?*types_mod.Type) bool {
+        if (typ == null) return false;
+        const t = typ.?;
+        return switch (t.kind) {
+            // Reference types that need ORC tracing
+            .object, .array, .type_reference => true,
+            // Primitives - no tracing needed
+            else => false,
+        };
+    }
+
+    /// Emit ORC support (trace function + TypeInfo) for a class
+    fn emitClassOrcSupport(self: *Self, class_name: []const u8, members: []*ast.Node) !void {
+        // Check if class has any reference-type fields (determines is_cyclic)
+        var has_ref_fields = false;
+        for (members) |member| {
+            if (member.kind == .property_decl) {
+                const prop = &member.data.property_decl;
+                if (isOrcReferenceType(prop.type)) {
+                    has_ref_fields = true;
+                    break;
+                }
+            }
+        }
+
+        // Emit trace function (traces reference fields for cycle detection)
+        try self.emit("static void ");
+        try self.emit(class_name);
+        try self.emit("_trace(void* obj, msTraceCallback cb) {\n");
+        self.indent_level += 1;
+
+        if (has_ref_fields) {
+            try self.emitIndent();
+            try self.emit(class_name);
+            try self.emit("* self = (");
+            try self.emit(class_name);
+            try self.emit("*)obj;\n");
+
+            // Trace each reference-type field
+            for (members) |member| {
+                if (member.kind == .property_decl) {
+                    const prop = &member.data.property_decl;
+                    if (isOrcReferenceType(prop.type)) {
+                        try self.emitIndent();
+                        try self.emit("if (self->");
+                        try self.emit(prop.name);
+                        try self.emit(") cb(self->");
+                        try self.emit(prop.name);
+                        try self.emit(");\n");
+                    }
+                }
+            }
+        } else {
+            try self.emitIndent();
+            try self.emit("(void)obj; (void)cb; // No reference fields to trace\n");
+        }
+
+        self.indent_level -= 1;
+        try self.emit("}\n\n");
+
+        // Emit TypeInfo struct
+        try self.emit("static const msTypeInfo ");
+        try self.emit(class_name);
+        try self.emit("_type = {\n");
+        self.indent_level += 1;
+
+        try self.emitIndent();
+        try self.emit(".name = \"");
+        try self.emit(class_name);
+        try self.emit("\",\n");
+
+        try self.emitIndent();
+        try self.emit(".size = sizeof(");
+        try self.emit(class_name);
+        try self.emit("),\n");
+
+        try self.emitIndent();
+        if (has_ref_fields) {
+            try self.emit(".is_cyclic = true,\n");
+        } else {
+            try self.emit(".is_cyclic = false,\n");
+        }
+
+        try self.emitIndent();
+        try self.emit(".trace_fn = ");
+        try self.emit(class_name);
+        try self.emit("_trace,\n");
+
+        try self.emitIndent();
+        try self.emit(".destroy_fn = NULL\n");
+
+        self.indent_level -= 1;
+        try self.emit("};\n\n");
     }
 
     /// Emit method prototype: returnType ClassName_methodName(ClassName* this, params...)
@@ -242,8 +500,13 @@ pub const CGenerator = struct {
     fn emitFunctionDecl(self: *Self, node: *ast.Node) !void {
         const func = &node.data.function_decl;
 
+        // Special case: main always returns int in C
+        const is_main = std.mem.eql(u8, func.name, "main");
+
         // Emit return type
-        if (func.return_type) |ret_type| {
+        if (is_main) {
+            try self.emit("int");
+        } else if (func.return_type) |ret_type| {
             try self.emitType(ret_type);
         } else {
             try self.emit("void");
@@ -456,6 +719,14 @@ pub const CGenerator = struct {
                 if (decl.init) |init_expr| {
                     try self.emit(" = ");
                     try self.emitExpression(init_expr);
+
+                    // Track reference-type variables for ORC cleanup
+                    if (init_expr.kind == .new_expr) {
+                        const new_e = &init_expr.data.new_expr;
+                        if (new_e.callee.kind == .identifier) {
+                            try self.trackScopeVar(decl.name, new_e.callee.data.identifier);
+                        }
+                    }
                 }
 
                 try self.emit(";\n");
@@ -509,11 +780,20 @@ pub const CGenerator = struct {
 
         try self.emit("{\n");
         self.indent_level += 1;
+        try self.pushScope(); // Track variables for ORC cleanup
 
         for (block.statements) |stmt| {
             try self.emitIndent();
             try self.emitNode(stmt);
         }
+
+        // Update current_line to block's end for DRC scope exit ops
+        if (block.statements.len > 0) {
+            self.current_line = block.statements[block.statements.len - 1].location.start.line;
+        }
+
+        // Emit ORC cleanup (decrefs) before closing scope
+        try self.popScopeWithCleanup();
 
         self.indent_level -= 1;
         try self.emitIndent();
@@ -687,12 +967,42 @@ pub const CGenerator = struct {
     fn emitReturnStmt(self: *Self, node: *ast.Node) !void {
         const ret = &node.data.return_stmt;
 
+        // Emit cleanup for all scopes before return (early exit)
+        try self.emitAllScopeCleanup();
+
         try self.emit("return");
         if (ret.argument) |arg| {
             try self.emit(" ");
             try self.emitExpression(arg);
         }
         try self.emit(";\n");
+    }
+
+    /// Emit cleanup for all scopes (used for early return)
+    fn emitAllScopeCleanup(self: *Self) !void {
+        // If DRC is available, emit DRC cleanup before return
+        if (self.drc) |drc| {
+            try self.emitDrcOpsForLine(drc, self.current_line);
+            return;
+        }
+
+        // Legacy mode: emit decrefs for all scopes in reverse order (innermost first)
+        var scope_idx: usize = self.scope_stack.items.len;
+        while (scope_idx > 0) {
+            scope_idx -= 1;
+            const scope = &self.scope_stack.items[scope_idx];
+            var i: usize = scope.vars.items.len;
+            while (i > 0) {
+                i -= 1;
+                const v = scope.vars.items[i];
+                try self.emitIndent();
+                try self.emit("ms_decref_typed(");
+                try self.emit(v.name);
+                try self.emit(", &");
+                try self.emit(v.type_name);
+                try self.emit("_type);\n");
+            }
+        }
     }
 
     /// Emit console.log/error/warn as printf
@@ -856,8 +1166,9 @@ pub const CGenerator = struct {
                     try self.emit("]");
                 } else {
                     // Use -> for pointer types (class instances allocated with ms_alloc)
+                    // Note: .object literals are stack-allocated value types, only .type_reference are pointers
                     const is_pointer = if (member.object.type) |obj_type|
-                        obj_type.kind == .type_reference or obj_type.kind == .object
+                        obj_type.kind == .type_reference
                     else
                         false;
                     if (is_pointer) {
@@ -888,15 +1199,20 @@ pub const CGenerator = struct {
                 try self.emit("}");
             },
             .new_expr => {
-                // Emit: (ClassName*)ms_alloc(sizeof(ClassName))
+                // Emit: ({ ClassName* _t = (ClassName*)ms_alloc(sizeof(ClassName)); ms_set_type(_t, &ClassName_type); _t; })
+                // Uses GCC statement expression to allocate + register with ORC in one expression
                 const new_e = &node.data.new_expr;
                 if (new_e.callee.kind == .identifier) {
                     const class_name = new_e.callee.data.identifier;
-                    try self.emit("(");
+                    try self.emit("({ ");
+                    try self.emit(class_name);
+                    try self.emit("* _t = (");
                     try self.emit(class_name);
                     try self.emit("*)ms_alloc(sizeof(");
                     try self.emit(class_name);
-                    try self.emit("))");
+                    try self.emit(")); ms_set_type(_t, &");
+                    try self.emit(class_name);
+                    try self.emit("_type); _t; })");
                 } else {
                     try self.emit("/* unsupported: new with non-identifier */");
                 }
@@ -1006,7 +1322,9 @@ pub const CGenerator = struct {
                 } else if (std.mem.eql(u8, name, "double") or std.mem.eql(u8, name, "float64")) {
                     try self.emit("double");
                 } else {
-                    // Assume it's a custom type (struct)
+                    // Assume it's a custom type (struct pointer)
+                    // Use 'struct Name*' for forward-compatibility in struct definitions
+                    try self.emit("struct ");
                     try self.emit(name);
                     try self.emit("*");
                 }

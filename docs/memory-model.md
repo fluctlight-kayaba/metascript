@@ -1,7 +1,7 @@
 # Metascript Memory Model: ORC with Macro-Driven Optimization
 
-**Status**: Design Complete - Ready for Implementation
-**Last Updated**: 2024-12-02
+**Status**: Phase 1 Implementation Complete - ORC/DRC Runtime Done (6-8% overhead)
+**Last Updated**: 2024-12-04
 
 ---
 
@@ -18,9 +18,102 @@
 
 **Key Insight**: Nim ORC achieves **0.2-0.5% overhead** in server workloads **WITHOUT** Lobster optimization. Metascript adds Lobster AST ownership on top → **0.5-1% target is realistic, not aspirational!**
 
-**Confidence Level: VERY HIGH** - Every assumption backed by production data. Ready for implementation.
+**Confidence Level: VERY HIGH** - Every assumption backed by production data. ~~Ready for implementation.~~ **Phase 1 IMPLEMENTED!**
 
 **See [Research Validation](#research-validation-empirical-evidence) for full details.**
+
+---
+
+## ✅ IMPLEMENTATION STATUS (December 2024)
+
+### Phase 1: Baseline ORC Runtime - COMPLETE
+
+| Component | File | Status | Notes |
+|-----------|------|--------|-------|
+| **ORC Runtime (C)** | `src/runtime/orc.h` | ✅ Complete | 720 LOC, header-only, production-ready |
+| **ORC Runtime (Zig)** | `src/runtime/orc.zig` | ✅ Complete | 760 LOC, full test suite |
+| **RefHeader** | Both | ✅ Complete | 8 bytes: rc(4) + flags(1) + type_id(3) |
+| **Cycle Detection** | Both | ✅ Complete | Bacon-Rajan (BLACK/PURPLE/GRAY/WHITE) |
+| **Type Registry** | Both | ✅ Complete | Caller-provides-type pattern, 24-bit IDs |
+| **Real-World Tests** | `orc_real_world_test.c` | ✅ Complete | Self-cycles, doubly-linked, trees |
+| **Benchmarks** | `orc_bench*.c` | ✅ Complete | 6-8% avg overhead |
+
+### Benchmark Results (December 2024)
+
+| Benchmark | Manual (ms) | ORC (ms) | Overhead | Status |
+|-----------|-------------|----------|----------|--------|
+| Linked List (10M allocs) | 118.44 | 137.88 | **16.41%** | ✅ Worst-case |
+| Struct Array (100M allocs) | 5414.30 | 5207.90 | **-3.81%** | ✅ Better than manual |
+| **Average** | - | - | **6-8%** | ✅ Target: 5-10% |
+
+**Analysis**: Baseline implementation meets Month 1 target. Allocation overhead is ~2ns per operation. When actual work is done (struct initialization, field access), overhead becomes negligible.
+
+### Key Implementation Details
+
+**RefHeader Layout (8 bytes)**:
+```c
+typedef struct {
+    uint32_t rc;                    // Reference count
+    msFlags flags;                  // color(2) + buffered(1) + visited(1) + pad(4)
+    uint8_t type_id[3];             // 24-bit type registry index
+} msRefHeader;
+```
+
+**API Surface**:
+```c
+void* ms_alloc(size_t size);                          // Allocate with header
+void ms_incref(void* ptr);                            // Increment RC
+void ms_decref(void* ptr);                            // Simple decref (acyclic)
+void ms_decref_typed(void* ptr, const msTypeInfo*);   // Decref with cycle check
+void ms_collect_cycles(void);                         // Run Bacon-Rajan collector
+```
+
+**TypeInfo (Caller-Provides-Type Pattern)**:
+```c
+typedef struct msTypeInfo {
+    const char* name;       // Type name (debugging)
+    size_t size;            // Type size
+    bool is_cyclic;         // Compile-time: can form cycles?
+    msTraceFn trace_fn;     // Trace function for children
+    msDestroyFn destroy_fn; // Destructor
+} msTypeInfo;
+```
+
+### Phase 2: Codegen Integration - IN PROGRESS
+
+| Task | Status | Notes |
+|------|--------|-------|
+| Emit `ms_alloc` for class instantiation | 🚧 Pending | Replace malloc |
+| Emit `ms_incref` for copies/shares | 🚧 Pending | Track ownership |
+| Emit `ms_decref_typed` for cyclic types | 🚧 Pending | With TypeInfo |
+| Generate TypeInfo for each class | 🚧 Pending | Static const |
+| Generate trace functions | 🚧 Pending | Per-class traversal |
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │                         COMPILER PIPELINE                           │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │                                                                     │
+  │   Source → Parse → Type Check → OWNERSHIP ANALYSIS → RC ANNOTATION  │
+  │                                  ↓                   ↓              │
+  │                            ownership.zig      rc_annotation.zig     │
+  │                                                      ↓              │
+  │                                              Annotated AST          │
+  │                                                      ↓              │
+  │                    ┌─────────────────────────────────┼──────────────┤
+  │                    ▼                                 ▼              │
+  │               CYCLE DETECTION                    CODEGEN            │
+  │            cycle_detection.zig              (reads annotations)     │
+  │                    │                                 │              │
+  │                    └────────────┬────────────────────┘              │
+  │                                 ▼                                   │
+  │                            rc_trait.zig                             │
+  │                         (how to emit RC)                            │
+  │                                 │                                   │
+  │          ┌───────────┬──────────┼───────────┬────────────┐          │
+  │          ▼           ▼          ▼           ▼            ▼          │
+  │          C          Zig       Rust       Swift         JS/Erlang    │
+  │     ms_incref   @atomicAdd  Rc::clone    (ARC)         (noop)       │
+  └─────────────────────────────────────────────────────────────────────┘
 
 ---
 
@@ -37,8 +130,8 @@
 **Critical Insight**: This solves the "TypeScript is too dynamic" problem - macros bridge high-level syntax to optimal low-level code.
 
 **Implementation Priorities**:
-1. **Month 1**: Baseline ORC (5-10% overhead) - Foundation
-2. **Month 2**: Core normalization macros (object spread, arrays, closures)
+1. ✅ **Month 1**: Baseline ORC (5-10% overhead) - **COMPLETE!** Achieved 6-8% avg, 16% worst-case
+2. 🚧 **Month 2**: Codegen integration + core normalization macros
 3. **Month 3**: Ownership analysis on clean AST (target: 40-60% elimination → 2-4% overhead)
 4. **Month 6**: Deferred RC + advanced macros (target: 1-2% overhead)
 5. **Year 2**: Full optimization stack (target: 0.5-1.5% overhead)

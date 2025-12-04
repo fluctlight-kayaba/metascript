@@ -96,12 +96,24 @@ pub const classifyDurability = types_mod.classifyDurability;
 pub const LRUCache = cache_mod.LRUCache;
 pub const MacroOutputCache = cache_mod.MacroOutputCache;
 pub const ShallowTypeContext = cache_mod.ShallowTypeContext;
+pub const CompletionCache = cache_mod.CompletionCache;
+pub const CachedCompletions = CompletionCache.CachedCompletions;
+pub const CompletionItem = cache_mod.CompletionItem;
 
 // From disk_cache.zig
 pub const BytecodeCache = disk_cache_mod.BytecodeCache;
 pub const CACHE_DIR = disk_cache_mod.CACHE_DIR;
 pub const hashFileContents = disk_cache_mod.hashFileContents;
 pub const hashMacroSource = disk_cache_mod.hashMacroSource;
+
+/// Submodule: Network cache for @comptime fetch() responses (L5)
+pub const network_cache_mod = @import("network_cache.zig");
+
+// From network_cache.zig
+pub const NetworkCache = network_cache_mod.NetworkCache;
+pub const CachedResponse = network_cache_mod.CachedResponse;
+pub const DEFAULT_TTL_MS = network_cache_mod.DEFAULT_TTL_MS;
+pub const NETWORK_TIMEOUT_MS = network_cache_mod.NETWORK_TIMEOUT_MS;
 
 // From hash.zig
 pub const hashString = hash_mod.hashString;
@@ -149,8 +161,8 @@ pub const TransAmDatabase = struct {
     macro_cache: LRUCache(MacroExpansion),
     ast_id_cache: LRUCache(AstIdMap),
 
-    // DEFAULT CACHE - Unbounded for now (will add LRU later)
-    type_cache: std.AutoHashMap(u64, TypeInference),
+    // Type cache - LRU bounded (2000 entries, ~50MB)
+    type_cache: LRUCache(TypeInference),
     ir_cache: std.AutoHashMap(u64, UnifiedIR),
 
     // INTERNED LAYER - Deduplicated, never evicted
@@ -161,8 +173,9 @@ pub const TransAmDatabase = struct {
     dirty_files: std.AutoHashMap(u64, void),
     revision: u64 = 0, // Legacy field, synced with current_revision
 
-    // CANCELLATION SUPPORT
-    cancel_flag: *std.atomic.Value(bool),
+    // CANCELLATION SUPPORT (rust-analyzer pattern)
+    cancel_flag: *std.atomic.Value(bool), // Legacy boolean flag
+    cancellation_version: *std.atomic.Value(u64), // Version-based cancellation (Salsa pattern)
 
     // ===== PHASE 4: PARALLEL HIGHLIGHTING STATE =====
     // Async expansion tracking
@@ -184,6 +197,12 @@ pub const TransAmDatabase = struct {
     // Diagnostics cache (incremental)
     diagnostics_cache: std.StringHashMap(CachedDiagnostics),
 
+    // Completion cache (L4) - LRU bounded with stale-while-revalidate
+    completion_cache: CompletionCache,
+
+    // Network cache (L5) - Disk-based cache for @comptime fetch() responses
+    network_cache: ?NetworkCache,
+
     // Phase 6: Parser integration - AST arenas per file
     // Each file gets its own arena, freed when file is removed or re-parsed
     ast_arenas: std.AutoHashMap(u64, *ast.ASTArena),
@@ -203,8 +222,11 @@ pub const TransAmDatabase = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator) !Self {
+        // Cancellation support (rust-analyzer/Salsa pattern)
         const cancel_flag = try allocator.create(std.atomic.Value(bool));
         cancel_flag.* = std.atomic.Value(bool).init(false);
+        const cancellation_version = try allocator.create(std.atomic.Value(u64));
+        cancellation_version.* = std.atomic.Value(u64).init(0);
 
         return .{
             .allocator = allocator,
@@ -212,8 +234,8 @@ pub const TransAmDatabase = struct {
             .current_revision = Revision.init(),
             .query_cache = std.AutoHashMap(u64, QueryValue).init(allocator),
             .dependency_stack = DependencyStack.init(allocator),
-            // Macro output cache
-            .macro_output_cache = MacroOutputCache.init(allocator),
+            // Macro output cache (LRU bounded, 2000 entries default)
+            .macro_output_cache = try MacroOutputCache.init(allocator),
             // Bytecode cache (disk-persisted, try to init but don't fail if can't)
             .bytecode_cache = BytecodeCache.init(allocator, null) catch null,
             // Input layer
@@ -224,7 +246,7 @@ pub const TransAmDatabase = struct {
             .parse_cache = try LRUCache(ParseResult).init(allocator, 128),
             .macro_cache = try LRUCache(MacroExpansion).init(allocator, 512),
             .ast_id_cache = try LRUCache(AstIdMap).init(allocator, 1024),
-            .type_cache = std.AutoHashMap(u64, TypeInference).init(allocator),
+            .type_cache = try LRUCache(TypeInference).init(allocator, 2000),
             .ir_cache = std.AutoHashMap(u64, UnifiedIR).init(allocator),
             // Interned layer
             .symbol_interner = StringInterner.init(allocator),
@@ -232,6 +254,7 @@ pub const TransAmDatabase = struct {
             // Invalidation tracking
             .dirty_files = std.AutoHashMap(u64, void).init(allocator),
             .cancel_flag = cancel_flag,
+            .cancellation_version = cancellation_version,
             // Phase 4: Parallel highlighting
             .async_tasks = std.AutoHashMap(u64, AsyncExpansionTask).init(allocator),
             .expansion_mutex = .{},
@@ -239,6 +262,10 @@ pub const TransAmDatabase = struct {
             .semantic_token_versions = std.StringHashMap(u64).init(allocator),
             // Phase 5: Incremental diagnostics
             .diagnostics_cache = std.StringHashMap(CachedDiagnostics).init(allocator),
+            // Completion cache (L4) - stale-while-revalidate
+            .completion_cache = try CompletionCache.init(allocator),
+            // Network cache (L5) - disk-based, try to init but don't fail if can't
+            .network_cache = NetworkCache.init(allocator, null) catch null,
             // Phase 6: Parser integration
             .ast_arenas = std.AutoHashMap(u64, *ast.ASTArena).init(allocator),
             // Phase 9: Type Checker Integration
@@ -313,8 +340,9 @@ pub const TransAmDatabase = struct {
         }
         self.async_tasks.deinit();
 
-        // Now safe to destroy cancel_flag after all threads are done
+        // Now safe to destroy cancellation state after all threads are done
         self.allocator.destroy(self.cancel_flag);
+        self.allocator.destroy(self.cancellation_version);
 
         // Clean up diagnostics cache
         var dc_it = self.diagnostics_cache.iterator();
@@ -326,6 +354,14 @@ pub const TransAmDatabase = struct {
             self.allocator.free(entry.value_ptr.diagnostics);
         }
         self.diagnostics_cache.deinit();
+
+        // Clean up completion cache (L4)
+        self.completion_cache.deinit();
+
+        // Clean up network cache (L5)
+        if (self.network_cache) |*nc| {
+            nc.deinit();
+        }
 
         // Phase 6: Clean up AST arenas
         var arena_it = self.ast_arenas.valueIterator();
@@ -657,27 +693,67 @@ pub const TransAmDatabase = struct {
     }
 
     /// Firewall 3: Expand macro - LRU cached (limit 512 entries)
+    /// Includes slow query tracking: macros >100ms are flagged.
+    /// CRITICAL: Always return stale cached result for slow macros (never error).
     pub fn macroExpand(self: *Self, call_id: MacroCallId) !MacroExpansion {
         try self.checkCancellation();
 
         const call_hash = hashMacroCallId(call_id);
 
-        // Check cache
+        // Check cache FIRST - always return cached if available
         if (self.macro_cache.get(call_hash)) |cached| {
             return cached;
         }
 
-        // Cache miss: expand
+        // Cache miss: check if this is a known slow macro
+        // If slow AND no cached result, we still compute (first time)
+        // but subsequent requests will use the cached stale result above
+        const is_slow = self.macro_output_cache.isSlowQuery(call_hash);
+
+        // Expand with timing and timeout
+        const start_time = std.time.milliTimestamp();
+
         const args = try self.macroArg(call_id);
         const call_loc = self.macro_call_interner.lookup(call_id);
         const expander = try self.macroExpander(call_loc.def_id);
+
+        // Check cancellation before expensive expansion
+        try self.checkCancellation();
+
         const expanded = try expander(self, args);
+
+        const elapsed_ms = std.time.milliTimestamp() - start_time;
+
+        // Check for hard timeout (5 seconds) - prevents infinite loop from blocking forever
+        // We still return the result since we already spent the time, but log an error
+        if (elapsed_ms > cache_mod.MACRO_TIMEOUT_MS) {
+            std.log.err("[Trans-Am] TIMEOUT: Macro exceeded {d}ms limit (took {d}ms). Hash: {x}", .{
+                cache_mod.MACRO_TIMEOUT_MS,
+                elapsed_ms,
+                call_hash,
+            });
+            std.log.err("[Trans-Am] Consider optimizing this macro or adding @comptime caching", .{});
+            // Mark as slow so future requests can use cached result
+            try self.macro_output_cache.markSlow(call_hash, elapsed_ms);
+        } else if (elapsed_ms > cache_mod.SLOW_QUERY_THRESHOLD_MS) {
+            // Mark as slow if >100ms (rust-analyzer threshold)
+            try self.macro_output_cache.markSlow(call_hash, elapsed_ms);
+            // Log warning for user visibility (first time only)
+            if (!is_slow) {
+                std.log.warn("[Trans-Am] Slow macro detected ({d}ms > {d}ms threshold). Hash: {x}", .{
+                    elapsed_ms,
+                    cache_mod.SLOW_QUERY_THRESHOLD_MS,
+                    call_hash,
+                });
+            }
+        }
 
         const result = MacroExpansion{
             .ast = expanded,
             .origin = call_loc,
         };
 
+        // ALWAYS cache the result - stale is better than nothing
         try self.macro_cache.put(call_hash, result);
 
         return result;
@@ -695,16 +771,16 @@ pub const TransAmDatabase = struct {
         return try self.macro_call_interner.intern(loc);
     }
 
-    // ===== CANCELLATION SUPPORT =====
+    // ===== CANCELLATION SUPPORT (rust-analyzer/Salsa pattern) =====
 
-    /// Check if query execution should be cancelled
+    /// Check if query execution should be cancelled (legacy boolean)
     pub fn checkCancellation(self: *Self) !void {
         if (self.cancel_flag.load(.seq_cst)) {
             return error.Cancelled;
         }
     }
 
-    /// Request cancellation of all in-flight queries
+    /// Request cancellation of all in-flight queries (legacy boolean)
     pub fn requestCancellation(self: *Self) void {
         self.cancel_flag.store(true, .seq_cst);
     }
@@ -712,6 +788,42 @@ pub const TransAmDatabase = struct {
     /// Reset cancellation flag (after handling cancellation)
     pub fn resetCancellation(self: *Self) void {
         self.cancel_flag.store(false, .seq_cst);
+    }
+
+    // ===== VERSION-BASED CANCELLATION (Salsa pattern) =====
+    // Used for cooperative cancellation: queries periodically check if
+    // their starting version matches current version. If not, abort.
+
+    /// Get current cancellation version. Call this at query start.
+    pub fn getCancellationVersion(self: *Self) u64 {
+        return self.cancellation_version.load(.seq_cst);
+    }
+
+    /// Check if query should abort. Call this periodically in long-running queries.
+    /// Returns error.QueryCancelled if version changed since query started.
+    pub fn unwindIfCancelled(self: *Self, starting_version: u64) !void {
+        const current = self.cancellation_version.load(.seq_cst);
+        if (current != starting_version) {
+            return error.QueryCancelled;
+        }
+        // Also check legacy flag for backward compatibility
+        if (self.cancel_flag.load(.seq_cst)) {
+            return error.QueryCancelled;
+        }
+    }
+
+    /// Cancel all pending queries by incrementing version.
+    /// Called by LSP when user types (didChange notification).
+    pub fn cancelPendingQueries(self: *Self) void {
+        _ = self.cancellation_version.fetchAdd(1, .seq_cst);
+        // Also set legacy flag for backward compatibility
+        self.cancel_flag.store(true, .seq_cst);
+    }
+
+    /// Reset after cancellation handled
+    pub fn resetAfterCancellation(self: *Self) void {
+        self.cancel_flag.store(false, .seq_cst);
+        // Note: version is NOT reset - it only increments
     }
 
     // ===== PHASE 9: TYPE CHECKER QUERIES =====
@@ -905,7 +1017,13 @@ pub const TransAmDatabase = struct {
         var tokens = std.ArrayList(SyntaxToken).init(self.allocator);
         errdefer tokens.deinit();
 
+        var tok_count: usize = 0;
         while (true) {
+            // Cancellation checkpoint: check every 500 tokens for large files
+            if (tok_count % 500 == 0) {
+                try self.checkCancellation();
+            }
+            tok_count += 1;
             const tok = lexer.next() catch break;
             if (tok.kind == .end_of_file) break;
 
@@ -1402,6 +1520,9 @@ pub const TransAmDatabase = struct {
     /// Get diagnostics for a file (cached, incremental).
     /// Returns cached diagnostics if file hasn't changed, otherwise recomputes.
     pub fn getDiagnostics(self: *Self, file_id: []const u8) ![]Diagnostic {
+        // Check cancellation early - abort before expensive work
+        try self.checkCancellation();
+
         const file_hash = hashString(file_id);
 
         // Check cache first
@@ -1454,7 +1575,13 @@ pub const TransAmDatabase = struct {
         defer lexer.deinit();
 
         // Consume all tokens to collect lexer errors
+        var tok_count: usize = 0;
         while (true) {
+            // Cancellation checkpoint: check every 500 tokens for large files
+            if (tok_count % 500 == 0) {
+                try self.checkCancellation();
+            }
+            tok_count += 1;
             const tok = lexer.next() catch break;
             if (tok.kind == .end_of_file) break;
         }
@@ -1570,6 +1697,9 @@ pub const TransAmDatabase = struct {
         call_sites: *std.ArrayList(MacroCallSite),
         call_index: *u32,
     ) !void {
+        // Cancellation checkpoint: check at each node to stay responsive during large AST walks
+        try self.checkCancellation();
+
         switch (node.kind) {
             .program => {
                 // Walk all statements
@@ -1979,7 +2109,11 @@ pub const TransAmDatabase = struct {
         var expanded: usize = 0;
         var from_cache: usize = 0;
 
-        for (call_sites) |site| {
+        for (call_sites, 0..) |site, i| {
+            // Cancellation checkpoint: check every 10 iterations to stay responsive
+            if (i % 10 == 0) {
+                try self.checkCancellation();
+            }
             const result = self.expandMacroCallSite(file_id, site) catch continue;
             expanded += 1;
             if (result.from_cache) {
@@ -1992,6 +2126,131 @@ pub const TransAmDatabase = struct {
             .expanded = expanded,
             .from_cache = from_cache,
         };
+    }
+
+    // ===== COMPLETION SUPPORT (L4 Cache) =====
+
+    /// Get completions for a file, using stale-while-revalidate cache
+    /// Returns completion items and whether they came from cache
+    pub fn getCompletions(self: *Self, file_id: []const u8) !struct {
+        items: []CompletionItem,
+        from_cache: bool,
+        is_stale: bool,
+    } {
+        try self.checkCancellation();
+
+        const file_hash = hashString(file_id);
+        const current_content_hash = self.file_hashes.get(file_id) orelse 0;
+
+        // Use file-level completion key (line=0, column=0, prefix=0)
+        const key = cache_mod.CompletionKey{
+            .file_hash = current_content_hash,
+            .line = 0,
+            .column = 0,
+            .prefix_hash = file_hash, // Use file_id hash as extra discriminator
+        };
+
+        // Check cache - returns stale results if available
+        if (self.completion_cache.get(key)) |cached| {
+            // Since key includes content hash, cache hit means fresh data
+            return .{
+                .items = try self.allocator.dupe(CompletionItem, cached),
+                .from_cache = true,
+                .is_stale = false,
+            };
+        }
+
+        // Try stale key (previous content hash) if available
+        const stale_key = cache_mod.CompletionKey{
+            .file_hash = 0, // Will check any matching prefix_hash
+            .line = 0,
+            .column = 0,
+            .prefix_hash = file_hash,
+        };
+        if (self.completion_cache.get(stale_key)) |cached| {
+            // Stale hit - return old data while background refreshes
+            return .{
+                .items = try self.allocator.dupe(CompletionItem, cached),
+                .from_cache = true,
+                .is_stale = true,
+            };
+        }
+
+        // Cache miss - generate completions
+        const items = try self.generateCompletions(file_id);
+
+        // Cache the result
+        self.completion_cache.put(key, items) catch {};
+
+        return .{
+            .items = items,
+            .from_cache = false,
+            .is_stale = false,
+        };
+    }
+
+    /// Generate completion items by scanning the file
+    fn generateCompletions(self: *Self, file_id: []const u8) ![]CompletionItem {
+        const text = self.getFileText(file_id) orelse return error.FileNotFound;
+
+        var lexer = lexer_mod.Lexer.init(self.allocator, text, 1) catch {
+            return error.LexerInitFailed;
+        };
+        defer lexer.deinit();
+
+        var items = std.ArrayList(CompletionItem).init(self.allocator);
+        errdefer items.deinit();
+
+        var seen = std.StringHashMap(void).init(self.allocator);
+        defer seen.deinit();
+
+        var prev_token: ?token_mod.Token = null;
+        var tok_count: usize = 0;
+
+        while (true) {
+            // Cancellation checkpoint
+            if (tok_count % 500 == 0) {
+                try self.checkCancellation();
+            }
+            tok_count += 1;
+
+            const tok = lexer.next() catch break;
+            if (tok.kind == .end_of_file) break;
+
+            if (prev_token) |prev| {
+                if (tok.kind == .identifier) {
+                    const kind: ?u8 = switch (prev.kind) {
+                        .keyword_class => 7, // Class
+                        .keyword_function => 3, // Function
+                        .keyword_const, .keyword_let, .keyword_var => 6, // Variable
+                        .keyword_interface => 8, // Interface
+                        .keyword_enum => 13, // Enum
+                        else => null,
+                    };
+
+                    if (kind) |k| {
+                        if (!seen.contains(tok.text)) {
+                            try seen.put(tok.text, {});
+                            try items.append(.{
+                                .label = try self.allocator.dupe(u8, tok.text),
+                                .kind = k,
+                                .detail = null,
+                            });
+                        }
+                    }
+                }
+            }
+            prev_token = tok;
+        }
+
+        return try items.toOwnedSlice();
+    }
+
+    /// Invalidate completion cache for a file
+    /// Currently invalidates all since CompletionCache doesn't support per-key invalidation
+    pub fn invalidateCompletions(self: *Self, file_id: []const u8) void {
+        _ = file_id;
+        self.completion_cache.invalidateAll();
     }
 
     // ===== PHASE 5: HOVER SUPPORT =====
@@ -2015,7 +2274,11 @@ pub const TransAmDatabase = struct {
         const text = self.getFileText(file_id) orelse return error.FileNotFound;
 
         // Find token at position
-        for (syntax_tokens) |tok| {
+        for (syntax_tokens, 0..) |tok, i| {
+            // Cancellation checkpoint: check every 100 tokens (usually fast search)
+            if (i % 100 == 0) {
+                try self.checkCancellation();
+            }
             if (tok.line == line and column >= tok.column and column < tok.column + tok.length) {
                 // Extract token text from source
                 const line_start = self.getLineOffset(text, line);
@@ -2542,7 +2805,7 @@ test "Trans-am: query cache invalidation on file change" {
 // ===== MACRO OUTPUT CACHE TESTS =====
 
 test "MacroOutputCache: basic store and retrieve" {
-    var cache = MacroOutputCache.init(std.testing.allocator);
+    var cache = try MacroOutputCache.initWithCapacity(std.testing.allocator, 10);
     defer cache.deinit();
 
     const input_hash: u64 = 12345;
@@ -2571,7 +2834,7 @@ test "MacroOutputCache: basic store and retrieve" {
 }
 
 test "MacroOutputCache: output deduplication" {
-    var cache = MacroOutputCache.init(std.testing.allocator);
+    var cache = try MacroOutputCache.initWithCapacity(std.testing.allocator, 10);
     defer cache.deinit();
 
     var dummy_node = ast.Node{
@@ -2599,7 +2862,7 @@ test "MacroOutputCache: output deduplication" {
 }
 
 test "MacroOutputCache: outputUnchanged" {
-    var cache = MacroOutputCache.init(std.testing.allocator);
+    var cache = try MacroOutputCache.initWithCapacity(std.testing.allocator, 10);
     defer cache.deinit();
 
     var dummy_node = ast.Node{
@@ -2624,7 +2887,7 @@ test "MacroOutputCache: outputUnchanged" {
 }
 
 test "MacroOutputCache: hit rate calculation" {
-    var cache = MacroOutputCache.init(std.testing.allocator);
+    var cache = try MacroOutputCache.initWithCapacity(std.testing.allocator, 10);
     defer cache.deinit();
 
     // Initially 0 hit rate

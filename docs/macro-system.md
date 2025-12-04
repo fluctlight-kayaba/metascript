@@ -37,6 +37,44 @@ class User {
 
 ---
 
+## Architecture: No Built-in Macros
+
+**Key Design Decision:** ALL macros are `.ms` source files shipped with Metascript - NO built-in macros in the compiler.
+
+```
+std/
+├── macros/
+│   ├── index.ms      # Re-exports all standard macros
+│   ├── derive.ms     # @derive(Eq, Hash, Clone, Debug)
+│   ├── serialize.ms  # @serialize, @deserialize (TODO)
+│   └── ffi.ms        # @ffi, @bindC (TODO)
+└── index.ms          # Standard library entry point
+```
+
+**Why This Matters:**
+- **Dogfooding:** Macros are written IN Metascript, proving the language works
+- **Versioning:** Macro updates ship with Metascript releases (no compiler rebuilds)
+- **Transparency:** Users can read `std/macros/derive.ms` to understand exactly what `@derive(Eq)` does
+- **Extensibility:** Same mechanism for standard and user-defined macros
+
+**Execution Flow:**
+```
+@derive(Eq) class User {}
+       │
+       ▼
+┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
+│ Find derive.ms   │ ─▶ │ Execute via      │ ─▶ │ Insert generated │
+│ in std/macros/   │    │ Hermes VM        │    │ AST into class   │
+└──────────────────┘    └──────────────────┘    └──────────────────┘
+```
+
+**Current Status:**
+- `std/macros/derive.ms` - EXISTS but incomplete (generates empty method bodies)
+- `src/macro/builtin_macros.zig` - TEMPORARY fallback (generates full methods in Zig)
+- **Goal:** Complete `derive.ms` implementation, remove Zig fallback
+
+---
+
 ## `@comptime` - Compile-Time Execution
 
 ```typescript

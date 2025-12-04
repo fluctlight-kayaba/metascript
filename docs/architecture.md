@@ -1,6 +1,6 @@
 # Compiler Architecture
 
-**Goal:** One language, three strategic backends (C, JavaScript, Erlang) via unified IR
+**Goal:** One language, three strategic backends (C, JavaScript, Erlang) via typed AST
 
 ---
 
@@ -8,8 +8,10 @@
 
 ```
 Source (.ms) → Parser → AST → Macro Expander → Expanded AST → Type Checker →
-Typed AST → Monomorphization → Specialized AST → Unified IR → Backend Selection
+Typed AST (IR) → Monomorphization → Specialized AST → Backend Selection
 ```
+
+**Note:** The Typed AST serves as our intermediate representation (IR). We don't have a separate IR layer - the AST is rich enough to translate to all three backends.
 
   ┌─────────────────────────────────────────────────┐
   │  COMPILER (Zig)                                 │
@@ -28,9 +30,9 @@ Typed AST → Monomorphization → Specialized AST → Unified IR → Backend Se
       │  C Backend     │ │ JS Backend│ │Erlang Backend│
       │                │ │           │ │              │
       │ Uses:          │ │ Uses:     │ │ Uses:        │
-      │ • orc.h        │ │ • Analysis│ │ • Nothing    │
-      │ • string.h     │ │   only    │ │   (BEAM GC)  │
-      │ (runtime RC)   │ │ • No RC   │ │              │
+      │ • orc.h ✅     │ │ • Analysis│ │ • Nothing    │
+      │ • ms_string.h  │ │   only    │ │   (BEAM GC)  │
+      │ (ORC runtime)  │ │ • No RC   │ │              │
       └────────────────┘ └───────────┘ └──────────────┘
              ↓                ↓               ↓
          C code with      Pure JS       Pure Erlang
@@ -73,18 +75,30 @@ identity<T>(x: T)
 // → identity_number(x: number) + identity_string(x: string)
 ```
 
-### 5. Unified IR
-Platform-agnostic intermediate representation mapping cleanly to all 3 backends:
+### 5. Backend Translation (AST → Target)
+Each backend translates the typed AST directly to its target language:
 
-```zig
-// Interface → IR Struct
+```typescript
+// Interface (TypeScript)
 interface Point { x: number; y: number; }
-// → IR.Struct { name: "Point", fields: [F64, F64], layout: .stack }
 
-// Class → IR Struct + VTable
-class Animal { speak(): void; }
-// → IR.Class { vtable: [speak], layout: .heap }
+// → C backend
+typedef struct { double x, y; } Point;
+
+// → JavaScript backend
+// (TypeScript interfaces don't exist at runtime)
+
+// → Erlang backend
+-record(point, {x :: float(), y :: float()}).
 ```
+
+**Why AST is IR:** The typed AST already contains all information needed:
+- Type annotations (from type checker)
+- Monomorphized generics (concrete types)
+- Expanded macros (no metaprogramming left)
+- Resolved symbols (from scope analysis)
+
+A separate IR layer would just duplicate this information.
 
 ---
 
@@ -182,8 +196,12 @@ import { GenServer } from "@metascript/otp"; // → Erlang
 ## Memory Management
 
 ### C Backend
-- **GC (default):** Generational (young/old gen), bump-pointer allocation
-- **ARC mode:** Reference counting (optional via `@memory(strategy: "arc")`)
+- **ORC/DRC (default):** Reference counting with automatic cycle detection
+  - `orc.h` - 720 LOC, header-only, 8-byte RefHeader
+  - Bacon-Rajan cycle collector (BLACK/PURPLE/GRAY/WHITE)
+  - 6-8% average overhead, 16% worst-case (allocation-heavy)
+  - Caller-provides-type pattern for zero-overhead acyclic types
+- **Future:** Lobster-style compile-time RC elimination (target: 0.5-2% overhead)
 
 ### JavaScript Backend
 Managed by V8/SpiderMonkey (generational GC)
@@ -264,19 +282,22 @@ stdlib/
 
 ## Development Roadmap
 
-**Weeks 1-4:** Foundation + Unified IR
-- [x] Parser, type checker, IR design
+**Weeks 1-4:** Foundation + Core Pipeline
+- [x] Parser, type checker, AST design
 - [x] Basic stdlib
 - [x] "Hello World" compiles
+- [x] ✅ ORC/DRC runtime (6-8% overhead, cycle detection)
 
 **Weeks 5-12:** Three Backends (Parallel, 3-5 person team)
-- [ ] C backend (2 engineers): IR→C, GC runtime
-- [ ] JS backend (1-2 engineers): IR→JS, source maps, npm
-- [ ] Erlang backend (1 engineer): IR→Erlang, OTP basics
+- [x] C backend codegen infrastructure (37KB)
+- [x] JS backend codegen infrastructure (27KB)
+- [x] Erlang backend codegen infrastructure (40KB)
+- [ ] 🚧 C backend + ORC integration (emit RC calls)
 - [ ] Cross-backend test suite
 
 **Weeks 13-24:** Macros + Validation
-- [ ] `@comptime`, `@derive` (all backends)
+- [x] `@derive` macros (Eq, Hash, Clone, Debug)
+- [ ] `@comptime` execution (all backends)
 - [ ] Same semantics across backends
 - [ ] Performance benchmarks
 - [ ] 3-5 pilot projects

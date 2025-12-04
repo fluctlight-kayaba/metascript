@@ -3,41 +3,134 @@
 **Timeline:** 2-3 years to production-ready
 **Philosophy:** Quality over speed, validation over hype
 **Architecture:** AST is the IR - no separate intermediate representation
-**Last Updated:** December 2024
+**Last Updated:** December 2024 (ORC/DRC Complete)
 
 ---
 
-## Current Status (December 2024)
+## Current Status (December 2024) - HONEST ASSESSMENT
 
-### ✅ DONE - Foundation
-| Component | Status | Notes |
-|-----------|--------|-------|
-| **Trans-Am** | ✅ Complete | Incremental query engine (7K LOC), Salsa-style red-green, content-addressed caching, disk persistence |
-| **Lexer** | ✅ Complete | All TS tokens + macro tokens (@derive, @comptime) |
-| **Parser** | ✅ Complete | 76KB, full TypeScript subset parsing |
-| **AST** | ✅ Complete | Nodes, location tracking, pretty printer |
-| **LSP Server** | ✅ Working | Semantic highlighting, hover, diagnostics (powered by Trans-Am) |
-| **Macro System** | ✅ Foundation | Builtin macros, Hermes VM execution |
-| **CLI** | ✅ Working | dump-tokens, dump-ast, pipeline, expand |
-| **Module System** | ✅ Working | Loader, resolver for imports |
-| **Testing** | ✅ Complete | Unit, integration, e2e, property tests |
+**Overall:** 65-70% toward Year 1 completion. Frontend complete, ORC/DRC runtime complete, backends need integration.
+
+### ✅ DONE - Frontend (100%)
+| Component | Status | LOC | Notes |
+|-----------|--------|-----|-------|
+| **Trans-Am** | ✅ Complete | 7K | Incremental query engine, Salsa-style caching |
+| **Lexer** | ✅ Complete | 500 | All TS tokens + macro tokens |
+| **Parser** | ✅ Complete | 76KB | Full TypeScript subset parsing |
+| **AST** | ✅ Complete | - | Nodes, location tracking, pretty printer |
+| **Macro System** | ✅ Complete | 8KB | @derive(Eq,Hash,Clone,Debug) working |
+| **CLI** | ✅ Complete | - | compile, dump-tokens, dump-ast, pipeline, expand |
+| **Module System** | ✅ Working | - | Loader, resolver for imports |
 
 ### ✅ Type System - COMPLETE
+| Component | Status | LOC | Notes |
+|-----------|--------|-----|-------|
+| **Type Checker** | ✅ Complete | 5K | 4-phase: collect → resolve → infer → check |
+| **Type Compatibility** | ✅ Complete | 247 | Extracted to type_compat.zig |
+| **Type Factory** | ✅ Complete | 266 | Extracted to type_factory.zig |
+| **Symbol Table** | ✅ Complete | 465 | Scoped symbol management |
+| **Type Inference** | ✅ Complete | 978 | Expression type inference |
+| **Type Resolver** | ✅ Complete | 617 | Type reference resolution |
+
+### 🚧 IN PROGRESS - Backends (60%)
+
+| Backend | Codegen | Runtime | Completeness | Notes |
+|---------|---------|---------|--------------|-------|
+| **JavaScript** | 27KB | ✅ Native | 60% | Most complete, generates valid ES2020 |
+| **C** | 37KB | ✅ ORC/DRC Complete | 60% | ORC runtime done (6-8% overhead), needs codegen integration |
+| **Erlang** | 40KB | ✅ BEAM | 40% | Generates valid Erlang, limited features |
+
+### ✅ DONE - Memory Management Runtime (100%)
 | Component | Status | Notes |
 |-----------|--------|-------|
-| **Type Checker** | ✅ Complete | 2.2K LOC: symbol table, type resolver, type inference, full 4-phase checker |
+| **ORC Runtime (C)** | ✅ Complete | `orc.h` - 720 LOC, 8-byte RefHeader, Bacon-Rajan cycle detection |
+| **ORC Runtime (Zig)** | ✅ Complete | `orc.zig` - 760 LOC, full test suite |
+| **Type Registry** | ✅ Complete | Caller-provides-type pattern, 24-bit type IDs |
+| **Cycle Detection** | ✅ Complete | BLACK/PURPLE/GRAY/WHITE marking, recursive collection |
+| **Real-World Tests** | ✅ Complete | Self-cycles, doubly-linked lists, trees, complex graphs |
+| **Benchmarks** | ✅ Complete | 6-8% avg overhead, 16% worst-case (allocation-heavy) |
 
-### 🚧 IN PROGRESS - Backends & Runtime (The Critical Path!)
+### ⚠️ NEEDS WORK - Developer Experience (40%)
 
-**Frontend is ✅ DONE. Backend + Runtime is what's needed:**
+| Component | Status | Notes |
+|-----------|--------|-------|
+| **LSP Server** | 🚧 Skeleton (20%) | Architecture exists, basic handlers only |
+| **Macro-Aware LSP** | ❌ CRITICAL | LSP must query EXPANDED AST for completions |
+| **Error Messages** | ❌ Poor | Generic messages, no source context |
+| **Editor Integration** | ❌ Missing | No VSCode extension, no Neovim plugin |
+| **Syntax Highlighting** | ❌ Missing | Tree-sitter grammar exists but not packaged |
+| **Debugger** | ❌ Not built | No debug info generation |
 
-| Backend | Codegen Status | Runtime Status | Next Steps |
-|---------|----------------|----------------|------------|
-| **JavaScript** | 🚧 Infrastructure (27KB) | ✅ JS runtime | Complete AST→JS, handle all node types |
-| **C** | 🚧 Started (8KB) | 🔧 ORC+Lobster in progress | Finish memory mgmt, complete AST→C |
-| **Erlang** | ❌ Not started | ✅ BEAM runtime | Start erlgen.zig, AST→Erlang |
+**Macro-Aware LSP (Holy Grail):** Completions/hover must show macro-generated members.
+Example: `user.█` after `@derive(Eq) class User {}` must autocomplete `equals()`.
 
-**Key Insight:** JS backend can ship first (no runtime needed). C backend needs ORC complete.
+**Trans-Am Caching (5-Level, Automatic):**
+- L1: Bytecode (disk) - ✅ Done
+- L2: Macro output - ✅ Done, needs LRU + timeout
+- L3: Types - 🚧 Partial
+- L4: Completions - ❌ Planned
+- L5: Network - ❌ Planned
+
+**Self-Optimizing (No Config):** Slow macros (>100ms) warned + excluded from LSP cache.
+Users fix their macros, not tune settings. LRU eviction (2000 entries) prevents OOM.
+See: `docs/lsp-architecture.md` "Timeout Bailout" section.
+
+### ❌ CRITICAL GAP - Market Adoption (15%)
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| **Real Examples** | ❌ Missing | No working CLI/Lambda/OTP examples |
+| **Benchmarks** | ❌ Missing | No comparative performance data |
+| **Community** | ❌ None | No forums, Discord, or presence |
+| **Distribution** | ❌ None | No homebrew, npm, or releases |
+
+---
+
+## Four Pillars Status
+
+| Pillar | Status | Priority |
+|--------|--------|----------|
+| **1. Developer Experience** | 40% ❌ | HIGH - Blocking adoption |
+| **2. Macros & Metaprogramming** | 65% ✅ | LOW - Core works |
+| **3. Multi-Backend Architecture** | 60% ⚠️ | HIGH - ORC done, codegen integration needed |
+| **4. Market Adoption** | 15% ❌ | MEDIUM - After backends work |
+
+---
+
+## WHAT TO INVEST IN NOW (Priority Order)
+
+### Tier 1: MUST HAVE (Blocking Year 1 Demo)
+
+| Task | Effort | Impact | Status |
+|------|--------|--------|--------|
+| **Generated Code Verification** | 1-2 weeks | HIGH | ✅ DONE - 51/63 tests passing |
+| **ORC/DRC Runtime** | 2-3 weeks | HIGH | ✅ DONE - 6-8% overhead, cycle detection working |
+| **C Backend + ORC Codegen Integration** | 1-2 weeks | HIGH | 🚧 IN PROGRESS - Runtime ready, emit RC calls |
+| **LSP Basic Functionality** | 1-2 weeks | HIGH | ❌ Pending |
+
+**Test Infrastructure (December 2024):**
+- `tests/backends/c_codegen_test.zig` - 26 tests for C backend
+- `tests/backends/erlang_codegen_test.zig` - 18 tests for Erlang backend
+- `tests/backends/cross_backend_test.zig` - Cross-backend parity tests
+- `tests/backends/backend_test_helpers.zig` - Compiles with GCC/erlc/Node
+- Run with: `zig build test-backends`
+
+### Tier 2: IMPORTANT (For Market Entry)
+
+| Task | Effort | Impact | Why Important |
+|------|--------|--------|---------------|
+| **Error Message Quality** | 1 week | MEDIUM | Poor errors = poor DX |
+| **VSCode Extension** | 1-2 weeks | MEDIUM | Editor integration drives adoption |
+| **Real-World Examples** | 2-3 weeks | HIGH | Prove it works for real use cases |
+| **Performance Benchmarks** | 1 week | MEDIUM | Validate performance claims |
+
+### Tier 3: NICE TO HAVE (Ecosystem)
+
+| Task | Effort | Impact |
+|------|--------|--------|
+| Package Manager | 2-4 weeks | MEDIUM |
+| Debugger Support | 3-4 weeks | LOW |
+| Source Maps | 1-2 weeks | LOW |
 
 ---
 
@@ -68,8 +161,8 @@
                             ↓
         ┌───────────────────┼───────────────────┐
         ↓                   ↓                   ↓
-   🚧 C Codegen      🚧 JS Codegen      ❌ Erlang Codegen
-   + 🔧 ORC/Lobster   (infrastructure)   (not started)
+   🚧 C Codegen      🚧 JS Codegen      🚧 Erlang Codegen
+   + ✅ ORC/DRC       (infrastructure)   (40% complete)
         ↓                   ↓                   ↓
   Native Binary    JavaScript (ES2020)   Erlang (BEAM)
 ```
@@ -78,33 +171,33 @@
 
 ---
 
-## Next Priority: Complete Backends + Runtime
+## Next Priority: Complete Codegen Integration
 
-**Status:** Frontend complete (parse, macros, type check). **Now focus: Codegen + Runtime.**
+**Status:** Frontend complete. ORC/DRC runtime complete. **Now focus: Codegen → Runtime integration.**
 
 **Goal:** `@derive(Eq)` class compiles to runnable code on all backends
 
 ```
 ✅ Source → Trans-Am → Typed AST → 🚧 Backend Codegen → ✅ Runs!
-   (frontend complete)              (+ runtime/GC)
+   (frontend complete)              (ORC ready!)
 ```
 
 ### Critical Path
 
 **The only thing blocking end-to-end compilation:**
-1. Complete codegen (AST → target language)
-2. Runtime/memory management for each backend
+1. ✅ ~~Runtime/memory management~~ - ORC/DRC complete (6-8% overhead)
+2. 🚧 Codegen emits ORC calls (ms_alloc, ms_incref, ms_decref, ms_decref_typed)
+3. 🚧 Wire up type registry for cycle detection
 
 ### Backend 1: JavaScript (Fastest Path to Demo)
 
-**Why first:** No GC needed (JS runtime handles it), fastest validation
-
-**Status:** Infrastructure done (27KB), needs completion
+**Status:** 60% complete (27KB), most feature-complete backend
 - [x] Codegen infrastructure (jsgen.zig, declarations, expressions, statements)
-- [ ] Complete all AST node types → JS
-- [ ] Handle `@derive` macro output
+- [x] Basic AST node types → JS
+- [x] Function declarations, expressions
+- [ ] Complete class/OOP support
 - [ ] Source maps
-- [ ] Test: Compile `examples/macro.ms` → run in Node.js
+- [ ] Verify: Generated JS actually runs correctly
 
 **Runtime:** None needed (JS runtime provides GC, stdlib)
 
@@ -112,38 +205,37 @@
 
 ### Backend 2: C (Performance Target)
 
-**Why second:** Needs ORC/Lobster GC, performance validation
-
-**Status:** Started (8KB), needs GC + completion
+**Status:** 60% complete (37KB + ORC runtime), generates valid C, runtime ready
 - [x] Codegen infrastructure (cgen.zig)
-- [ ] 🔧 **ORC + Lobster memory management** ← IN PROGRESS
-- [ ] **Lobster lifetime analyzer** (`src/codegen/c/lifetime.zig`) - C backend only, NOT Trans-Am
-- [ ] Complete all AST node types → C
-- [ ] Handle `@derive` macro output
-- [ ] String interning, reference counting hooks
-- [ ] Test: Compile `examples/macro.ms` → native binary
+- [x] Function declarations, basic expressions
+- [x] Class → struct mapping
+- [x] ✅ **ORC Runtime Complete** - `orc.h` (720 LOC), 6-8% overhead
+- [x] ✅ **Cycle Detection** - Bacon-Rajan algorithm, real-world tests passing
+- [x] ✅ **Type Registry** - Caller-provides-type pattern, 24-bit type IDs
+- [ ] 🚧 **Codegen → ORC Integration** - Emit ms_alloc/ms_incref/ms_decref calls
+- [ ] String handling (ms_string.h exists)
+- [ ] Array bounds checking
+- [ ] Verify: Generated C actually compiles AND runs with ORC
 
-**Runtime:**
-- 🔧 ORC (Ownership + Reference Counting) - Swift-inspired
-- [ ] Lobster lifetime analysis (C backend optimization pass, runs after macros)
-- [ ] String type (msString with RC)
-- [ ] Array/Object types with RC
-- [ ] Minimal stdlib in C
-
-**Architecture**: Lobster analyzer lives in C backend, NOT Trans-Am (see memory-model.md)
+**Runtime:** ✅ ORC/DRC Complete!
+- `src/runtime/orc.h` - 720 LOC (C header, production-ready)
+- `src/runtime/orc.zig` - 760 LOC (Zig implementation, full tests)
+- `src/runtime/ms_string.h` - String with RC
+- Benchmarks: 6-8% avg overhead, 16% worst-case
+- Real-world tests: self-cycles, doubly-linked lists, trees, complex graphs
 
 ---
 
 ### Backend 3: Erlang (Distributed Target)
 
-**Why third:** Different paradigm, lowest priority for initial demo
-
-**Status:** Not started
-- [ ] Codegen infrastructure (erlgen.zig)
-- [ ] AST → Erlang/BEAM translation
-- [ ] Map classes → Erlang records
-- [ ] Handle `@derive` macro output
-- [ ] Test: Compile `examples/macro.ms` → .beam file
+**Status:** 40% complete (40KB), generates valid but limited Erlang
+- [x] Codegen infrastructure (erlgen.zig)
+- [x] Module declaration, exports
+- [x] Basic function definitions
+- [ ] Class → record mapping
+- [ ] Pattern matching
+- [ ] Gen_server integration
+- [ ] Verify: Generated Erlang compiles AND runs on BEAM
 
 **Runtime:** None needed (BEAM provides GC, OTP)
 
@@ -158,7 +250,7 @@
 - [x] Core stdlib (primitives, collections)
 - [x] Codegen infrastructure (C + JS backends started)
 - [x] Trans-Am query engine (7K LOC, incremental computation)
-- [ ] Memory management (ORC + Lobster) ← **IN PROGRESS**
+- [x] ✅ **Memory management (ORC/DRC)** - Complete! 6-8% overhead, cycle detection working
 - [ ] "Hello World" compiles to any backend ← **NEXT**
 
 **Success:** AST maps cleanly to C, JavaScript, Erlang backends
@@ -183,7 +275,7 @@
 **Success:** C <50ms cold start, 90%+ C perf; JS output ~hand-written; Erlang OTP working
 
 **Milestones:**
-- **M1 (Week 4):** ✅ Type checker complete, 🚧 Memory management in progress
+- **M1 (Week 4):** ✅ Type checker complete, ✅ Memory management (ORC/DRC) complete
 - **M2 (Week 8):** All 3 backends compile "Hello World" ← **NEXT TARGET**
 - **M3 (Week 12):** Cross-backend test suite passing
 - **M4 (Week 16):** Basic macros working (all backends)

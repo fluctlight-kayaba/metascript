@@ -13,6 +13,11 @@ const ast_loc = @import("../ast/location.zig");
 // Trans-Am query engine for incremental computation
 const transam = @import("../transam/transam.zig");
 
+// Background worker for stale-while-revalidate pattern
+const BackgroundWorker = @import("background_worker.zig").BackgroundWorker;
+const JobType = @import("background_worker.zig").JobType;
+const Priority = @import("background_worker.zig").Priority;
+
 // Type checker for symbol lookup
 const checker = @import("../checker/typechecker.zig");
 const symbol_mod = @import("../checker/symbol.zig");
@@ -866,11 +871,15 @@ pub const Server = struct {
     // Trans-Am query engine for incremental computation
     transam_db: ?transam.TransAmDatabase = null,
 
+    // Background worker for stale-while-revalidate pattern
+    background_worker: ?BackgroundWorker = null,
+
     pub fn init(allocator: std.mem.Allocator) Server {
         return .{
             .allocator = allocator,
             .documents = file_store.FileStore.init(allocator),
             .transam_db = null,
+            .background_worker = null,
         };
     }
 
@@ -878,10 +887,18 @@ pub const Server = struct {
     pub fn initTransAm(self: *Server) !void {
         if (self.transam_db == null) {
             self.transam_db = try transam.TransAmDatabase.init(self.allocator);
+            // Initialize background worker with Trans-Am's cancellation version
+            if (self.transam_db) |*db| {
+                self.background_worker = BackgroundWorker.init(self.allocator, db.cancellation_version);
+            }
         }
     }
 
     pub fn deinit(self: *Server) void {
+        // Clean up background worker first (before Trans-Am)
+        if (self.background_worker) |*bw| {
+            bw.deinit();
+        }
         if (self.transam_db) |*db| {
             db.deinit();
         }
@@ -1122,6 +1139,12 @@ pub const Server = struct {
             }
         }
 
+        // Queue background pre-warming for faster subsequent requests
+        if (self.background_worker) |*bw| {
+            const file_hash = transam.hashString(uri.string);
+            bw.queue(.prewarm, .open, file_hash, uri.string) catch {};
+        }
+
         try stderr.print("[mls] Opened: {s} (version {d}, {d} bytes)\n", .{
             uri.string,
             version.integer,
@@ -1138,6 +1161,12 @@ pub const Server = struct {
         stdout: anytype,
         stderr: anytype,
     ) !void {
+        // Cancel all pending queries immediately (rust-analyzer pattern)
+        // When user types, all in-flight macro expansions, type checks, etc. should abort
+        if (self.transam_db) |*db| {
+            db.cancelPendingQueries();
+        }
+
         const params = msg.get("params") orelse return;
         const text_document = params.object.get("textDocument") orelse return;
         const uri = text_document.object.get("uri") orelse return;
@@ -2036,10 +2065,7 @@ pub const Server = struct {
             try self.sendResponse(Response.nullResult(id), stdout, stderr);
             return;
         };
-        const text = entry.text orelse {
-            try self.sendResponse(Response.nullResult(id), stdout, stderr);
-            return;
-        };
+        _ = entry; // We use uri.string as file_id for Trans-Am
 
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
@@ -2051,7 +2077,7 @@ pub const Server = struct {
 
         var item_count: usize = 0;
 
-        // Add keywords
+        // Add keywords (static list)
         const keywords = [_][]const u8{
             "async",     "await",       "break",    "case",     "catch",
             "class",     "const",       "continue", "debugger", "default",
@@ -2072,7 +2098,7 @@ pub const Server = struct {
             item_count += 1;
         }
 
-        // Add macros
+        // Add macros (static list)
         const macros = [_][]const u8{ "@derive", "@comptime", "@serialize", "@ffi" };
         for (macros) |m| {
             if (item_count > 0) try writer.writeAll(",");
@@ -2082,52 +2108,45 @@ pub const Server = struct {
             item_count += 1;
         }
 
-        // Add symbols from current document
-        var lexer = lexer_mod.Lexer.init(self.allocator, text, 1) catch {
-            try writer.writeAll("]}}");
-            try jsonrpc.writeMessage(stdout, buf.items);
-            return;
-        };
-        defer lexer.deinit();
+        // Add symbols from document using cached completions (L4)
+        if (self.transam_db) |*db| {
+            const completions = db.getCompletions(uri.string) catch null;
+            if (completions) |result| {
+                defer self.allocator.free(result.items);
+                for (result.items) |item| {
+                    defer self.allocator.free(item.label);
+                    if (item.detail) |d| self.allocator.free(d);
 
-        var seen = std.StringHashMap(void).init(self.allocator);
-        defer seen.deinit();
-
-        var prev_token: ?token_mod.Token = null;
-
-        while (true) {
-            const tok = lexer.next() catch break;
-            if (tok.kind == .end_of_file) break;
-
-            if (prev_token) |prev| {
-                if (tok.kind == .identifier) {
-                    const kind: ?u8 = switch (prev.kind) {
-                        .keyword_class => 7, // Class
-                        .keyword_function => 3, // Function
-                        .keyword_const, .keyword_let, .keyword_var => 6, // Variable
-                        .keyword_interface => 8, // Interface
-                        .keyword_enum => 13, // Enum
-                        else => null,
-                    };
-
-                    if (kind) |k| {
-                        if (!seen.contains(tok.text)) {
-                            try seen.put(tok.text, {});
-                            if (item_count > 0) try writer.writeAll(",");
-                            try writer.writeAll("{\"label\":");
-                            try std.json.stringify(tok.text, .{}, writer);
-                            try writer.print(",\"kind\":{d}}}", .{k});
-                            item_count += 1;
+                    if (item_count > 0) try writer.writeAll(",");
+                    try writer.writeAll("{\"label\":");
+                    try std.json.stringify(item.label, .{}, writer);
+                    try writer.print(",\"kind\":{d}}}", .{item.kind});
+                    item_count += 1;
+                }
+                if (result.from_cache) {
+                    try stderr.print("[mls] Completion: {d} items (cached{s})\n", .{
+                        item_count,
+                        if (result.is_stale) ", stale" else "",
+                    });
+                    // Queue background refresh if stale
+                    if (result.is_stale) {
+                        if (self.background_worker) |*bw| {
+                            const file_hash = transam.hashString(uri.string);
+                            bw.queue(.completion_refresh, .visible, file_hash, uri.string) catch {};
                         }
                     }
+                } else {
+                    try stderr.print("[mls] Completion: {d} items (generated)\n", .{item_count});
                 }
+            } else {
+                try stderr.print("[mls] Completion: {d} items (no db)\n", .{item_count});
             }
-            prev_token = tok;
+        } else {
+            try stderr.print("[mls] Completion: {d} items (no transam)\n", .{item_count});
         }
 
         try writer.writeAll("]}}");
         try jsonrpc.writeMessage(stdout, buf.items);
-        try stderr.print("[mls] Completion: {d} items\n", .{item_count});
     }
 
     // =========================================================================
@@ -2385,23 +2404,15 @@ pub const Server = struct {
                 });
             }
 
-            // Run type checker if no parse errors
+            // Run type checker using cached Trans-Am infrastructure
+            // (avoids creating new TypeChecker each time)
             if (transam_diags.len == 0) {
-                const parse_result = db.parse(uri) catch {
-                    break :blk true;
-                };
-
-                var type_checker = checker.TypeChecker.init(self.allocator) catch {
-                    break :blk true;
-                };
-                defer type_checker.deinit();
-
-                _ = type_checker.check(parse_result.tree) catch {
+                const check_result = db.checkFile(uri) catch {
                     break :blk true;
                 };
 
                 // Convert type errors to LSP diagnostics
-                for (type_checker.errors.items) |type_err| {
+                for (check_result.errors) |type_err| {
                     try diagnostics.append(.{
                         .range = .{
                             .start = .{
@@ -2470,6 +2481,11 @@ pub const Server = struct {
             source,
             elapsed_ms,
         });
+
+        // Reset cancellation flag after diagnostics complete
+        if (self.transam_db) |*db| {
+            db.resetAfterCancellation();
+        }
 
         // Send publishDiagnostics notification
         try self.publishDiagnostics(uri, diagnostics.items, stdout);

@@ -37,17 +37,12 @@ Source (.mts)
 │  - Re-analyze expanded AST                                  │
 │  - Cache expansions by AST hash                             │
 └────────────────────┬────────────────────────────────────────┘
-                     │ Typed AST (all macros expanded)
-                     ↓
-┌─────────────────────────────────────────────────────────────┐
-│ Unified IR Lowering                                         │
-│  - Backend-agnostic IR                                      │
-│  - No macro syntax (all expanded)                           │
-└────────────────────┬────────────────────────────────────────┘
+                     │ Typed AST (serves as IR - all macros expanded)
                      │
           ┌──────────┴──────────┬──────────────┐
           ↓                     ↓              ↓
     C Backend           JavaScript Backend   Erlang Backend
+    (AST→C)                (AST→JS)            (AST→Erlang)
 ```
 
 ---

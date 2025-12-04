@@ -12,6 +12,10 @@ const vm_expander = @import("../macro/vm_expander.zig");
 const normalize = @import("../macro/normalize.zig");
 const colors = @import("colors.zig");
 
+// DRC (Deferred Reference Counting) analysis - optional, disabled by default
+const Drc = @import("../analysis/drc.zig").Drc;
+const DrcAnalyzer = @import("../analysis/drc_analyzer.zig").DrcAnalyzer;
+
 pub const Backend = enum {
     c,
     js,
@@ -252,18 +256,77 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
         break :blk program_ast;
     };
 
-    // Phase 4: Prepare for code generation
-    std.debug.print("{s}[4/5]{s} Preparing codegen...\n", .{
-        colors.info.code(),
-        colors.Color.reset.code(),
-    });
+    // Phase 4: DRC analysis (for C backend)
+    var drc: ?*Drc = null;
+    var drc_storage: Drc = undefined;
 
-    std.debug.print("{s}[4/5]{s} Ready {s}✓{s}\n", .{
-        colors.success.code(),
-        colors.Color.reset.code(),
-        colors.Color.bright_green.code(),
-        colors.Color.reset.code(),
-    });
+    if (target == .c) {
+        std.debug.print("{s}[4/5]{s} Running DRC analysis...\n", .{
+            colors.info.code(),
+            colors.Color.reset.code(),
+        });
+
+        // Disable move optimization - isLastUse is broken for single-pass analysis
+        drc_storage = Drc.initWithConfig(allocator, .{
+            .enable_move_optimization = false,
+            .enable_cycle_detection = true,
+        });
+        drc = &drc_storage;
+
+        var analyzer = DrcAnalyzer.init(drc.?);
+        analyzer.analyze(final_ast) catch |err| {
+            std.debug.print("{s}[4/5]{s} DRC analysis {s}warning{s}: {s}\n", .{
+                colors.warning.code(),
+                colors.Color.reset.code(),
+                colors.Color.bright_yellow.code(),
+                colors.Color.reset.code(),
+                @errorName(err),
+            });
+            drc.?.deinit();
+            drc = null; // Fall back to legacy mode
+        };
+
+        if (drc != null) {
+            drc.?.finalize() catch |err| {
+                std.debug.print("{s}[4/5]{s} DRC finalize {s}warning{s}: {s}\n", .{
+                    colors.warning.code(),
+                    colors.Color.reset.code(),
+                    colors.Color.bright_yellow.code(),
+                    colors.Color.reset.code(),
+                    @errorName(err),
+                });
+                drc.?.deinit();
+                drc = null;
+            };
+        }
+
+        if (drc != null) {
+            const stats = drc.?.getStats();
+            std.debug.print("{s}[4/5]{s} DRC analyzed {s}✓{s} ({d} vars, {d} RC ops, {d:.0}% elided)\n", .{
+                colors.success.code(),
+                colors.Color.reset.code(),
+                colors.Color.bright_green.code(),
+                colors.Color.reset.code(),
+                stats.variables_analyzed,
+                stats.total_ops,
+                stats.elisionRate() * 100,
+            });
+        }
+    } else {
+        std.debug.print("{s}[4/5]{s} Preparing codegen...\n", .{
+            colors.info.code(),
+            colors.Color.reset.code(),
+        });
+
+        std.debug.print("{s}[4/5]{s} Ready {s}✓{s}\n", .{
+            colors.success.code(),
+            colors.Color.reset.code(),
+            colors.Color.bright_green.code(),
+            colors.Color.reset.code(),
+        });
+    }
+
+    defer if (drc) |d| d.deinit();
 
     // Phase 5: Backend code generation
     const target_name = switch (target) {
@@ -349,7 +412,8 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
             });
         },
         .c => {
-            var gen = cgen.CGenerator.init(allocator);
+            // Use DRC-aware generator if DRC analysis was performed
+            var gen = if (drc) |d| cgen.CGenerator.initWithDrc(allocator, d) else cgen.CGenerator.init(allocator);
             defer gen.deinit();
 
             const c_code = gen.generate(final_ast) catch |err| {

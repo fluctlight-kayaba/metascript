@@ -2,8 +2,25 @@ const std = @import("std");
 const ast = @import("../ast/ast.zig");
 const expander = @import("expander.zig");
 
+// ============================================================================
+// TEMPORARY FALLBACK IMPLEMENTATION
+// ============================================================================
+//
+// This file contains Zig implementations of standard macros as a FALLBACK
+// when the Hermes VM is not available or for bootstrap purposes.
+//
+// DESIGN INTENT: All macros should be .ms files in std/macros/ directory,
+// NOT built-in Zig code. This file should be REMOVED once std/macros/derive.ms
+// is complete and the VM integration is solid.
+//
+// See: std/macros/derive.ms - The intended source-of-truth for @derive
+// See: docs/source-defined-macros.md - Architecture documentation
+// See: docs/macro-system.md - "No Built-in Macros" section
+//
+// ============================================================================
+
 /// Expand @derive(Trait) on a class node directly
-/// This is used by the VMMacroExpander when Hermes VM is not available
+/// TEMPORARY: This is used by the VMMacroExpander when Hermes VM is not available
 pub fn expandDerive(arena: *ast.ASTArena, allocator: std.mem.Allocator, class_node: *ast.Node, trait: []const u8) !void {
     if (class_node.kind != .class_decl) {
         return error.InvalidTarget;

@@ -91,7 +91,14 @@ pub const TypeFactory = struct {
     }
 
     /// Create an object type from class members
+    /// Also computes is_cyclic for ORC optimization
     pub fn createClassType(self: *TypeFactory, members: []*ast.Node, loc: location.SourceLocation) !*types.Type {
+        return self.createClassTypeNamed(null, members, loc);
+    }
+
+    /// Create an object type from class members with a name
+    /// Also computes is_cyclic for ORC optimization
+    pub fn createClassTypeNamed(self: *TypeFactory, name: ?[]const u8, members: []*ast.Node, loc: location.SourceLocation) !*types.Type {
         // Count properties and methods
         var prop_count: usize = 0;
         var method_count: usize = 0;
@@ -103,18 +110,27 @@ pub const TypeFactory = struct {
             }
         }
 
-        // Create property array
+        // Create property array and check for reference types (is_cyclic detection)
         const properties = try self.allocator.alloc(types.ObjectType.Property, prop_count);
         var prop_idx: usize = 0;
+        var has_ref_field = false;
+
         for (members) |member| {
             if (member.kind == .property_decl) {
                 const prop = &member.data.property_decl;
+                const prop_type = prop.type orelse try self.createUnknownType(loc);
                 properties[prop_idx] = .{
                     .name = prop.name,
-                    .type = prop.type orelse try self.createUnknownType(loc),
+                    .type = prop_type,
                     .optional = false,
                 };
                 prop_idx += 1;
+
+                // Check if this property can form cycles
+                // MVP: any reference type field means potentially cyclic
+                if (isReferenceType(prop_type)) {
+                    has_ref_field = true;
+                }
             }
         }
 
@@ -133,11 +149,13 @@ pub const TypeFactory = struct {
             }
         }
 
-        // Create object type
+        // Create object type with is_cyclic computed
         const obj_type_data = try self.allocator.create(types.ObjectType);
         obj_type_data.* = .{
             .properties = properties,
             .methods = methods,
+            .name = name,
+            .is_cyclic = has_ref_field, // MVP: ref field = potentially cyclic
         };
 
         const obj_type = try self.allocator.create(types.Type);
@@ -148,6 +166,26 @@ pub const TypeFactory = struct {
         };
 
         return obj_type;
+    }
+
+    /// Check if a type is a reference type (can participate in cycles)
+    /// Public for testing
+    pub fn isReferenceType(t: *types.Type) bool {
+        return switch (t.kind) {
+            // Reference types that need RC management
+            .object, .array, .type_reference => true,
+            // Primitives - no RC needed
+            .number, .string, .boolean, .void, .unknown, .never => false,
+            .int8, .int16, .int32, .int64 => false,
+            .uint8, .uint16, .uint32, .uint64 => false,
+            .float32, .float64 => false,
+            // Special cases
+            .function => false, // Functions don't form data cycles
+            .tuple => false, // TODO: check element types
+            .generic_param, .generic_instance => false,
+            .ref, .lent => true, // Explicit ref types
+            .@"union", .intersection => false, // TODO: check member types
+        };
     }
 
     /// Create a number type
@@ -263,4 +301,172 @@ test "TypeFactory: create function type with no params" {
     testing.allocator.destroy(func_type.data.function.return_type);
     testing.allocator.destroy(func_type.data.function);
     testing.allocator.destroy(func_type);
+}
+
+// ============================================================================
+// is_cyclic detection tests (ORC integration)
+// ============================================================================
+
+test "TypeFactory: acyclic class (primitives only) has is_cyclic=false" {
+    // class Point { x: number; y: number; }
+    const testing = std.testing;
+    var factory = TypeFactory.init(testing.allocator);
+    const loc = location.SourceLocation.dummy();
+
+    // Create number type for properties
+    const num_type = try factory.createNumberType(loc);
+
+    // Create property nodes
+    var prop_x = ast.Node{
+        .kind = .property_decl,
+        .location = loc,
+        .type = null,
+        .data = .{ .property_decl = .{
+            .name = "x",
+            .type = num_type,
+            .init = null,
+            .readonly = false,
+        } },
+    };
+    var prop_y = ast.Node{
+        .kind = .property_decl,
+        .location = loc,
+        .type = null,
+        .data = .{ .property_decl = .{
+            .name = "y",
+            .type = num_type,
+            .init = null,
+            .readonly = false,
+        } },
+    };
+
+    var members = [_]*ast.Node{ &prop_x, &prop_y };
+
+    const class_type = try factory.createClassTypeNamed("Point", &members, loc);
+
+    // Point has only primitive fields → NOT cyclic
+    try testing.expectEqual(false, class_type.data.object.is_cyclic.?);
+    try testing.expectEqualStrings("Point", class_type.data.object.name.?);
+
+    // Cleanup
+    testing.allocator.free(class_type.data.object.properties);
+    testing.allocator.free(class_type.data.object.methods);
+    testing.allocator.destroy(class_type.data.object);
+    testing.allocator.destroy(class_type);
+    testing.allocator.destroy(num_type);
+}
+
+test "TypeFactory: cyclic class (self-reference) has is_cyclic=true" {
+    // class Node { next: Node; }
+    const testing = std.testing;
+    var factory = TypeFactory.init(testing.allocator);
+    const loc = location.SourceLocation.dummy();
+
+    // Create a type_reference for "Node" (self-reference)
+    const type_ref_data = try testing.allocator.create(types.TypeReference);
+    type_ref_data.* = .{
+        .name = "Node",
+        .type_args = &[_]*types.Type{},
+        .resolved = null,
+    };
+    const node_type_ref = try testing.allocator.create(types.Type);
+    node_type_ref.* = .{
+        .kind = .type_reference,
+        .location = loc,
+        .data = .{ .type_reference = type_ref_data },
+    };
+
+    // Create property node
+    var prop_next = ast.Node{
+        .kind = .property_decl,
+        .location = loc,
+        .type = null,
+        .data = .{ .property_decl = .{
+            .name = "next",
+            .type = node_type_ref,
+            .init = null,
+            .readonly = false,
+        } },
+    };
+
+    var members = [_]*ast.Node{&prop_next};
+
+    const class_type = try factory.createClassTypeNamed("Node", &members, loc);
+
+    // Node has a type_reference field → IS cyclic
+    try testing.expectEqual(true, class_type.data.object.is_cyclic.?);
+    try testing.expectEqualStrings("Node", class_type.data.object.name.?);
+
+    // Cleanup
+    testing.allocator.free(class_type.data.object.properties);
+    testing.allocator.free(class_type.data.object.methods);
+    testing.allocator.destroy(class_type.data.object);
+    testing.allocator.destroy(class_type);
+    testing.allocator.destroy(node_type_ref);
+    testing.allocator.destroy(type_ref_data);
+}
+
+test "TypeFactory: class with array field has is_cyclic=true" {
+    // class Container { items: Item[]; }
+    const testing = std.testing;
+    var factory = TypeFactory.init(testing.allocator);
+    const loc = location.SourceLocation.dummy();
+
+    // Create array type
+    const elem_type = try factory.createNumberType(loc);
+    const array_type = try factory.createArrayType(elem_type, loc);
+
+    // Create property node
+    var prop_items = ast.Node{
+        .kind = .property_decl,
+        .location = loc,
+        .type = null,
+        .data = .{ .property_decl = .{
+            .name = "items",
+            .type = array_type,
+            .init = null,
+            .readonly = false,
+        } },
+    };
+
+    var members = [_]*ast.Node{&prop_items};
+
+    const class_type = try factory.createClassTypeNamed("Container", &members, loc);
+
+    // Container has an array field → IS cyclic (conservative)
+    try testing.expectEqual(true, class_type.data.object.is_cyclic.?);
+
+    // Cleanup
+    testing.allocator.free(class_type.data.object.properties);
+    testing.allocator.free(class_type.data.object.methods);
+    testing.allocator.destroy(class_type.data.object);
+    testing.allocator.destroy(class_type);
+    testing.allocator.destroy(array_type);
+    testing.allocator.destroy(elem_type);
+}
+
+test "TypeFactory: isReferenceType correctly identifies types" {
+    const testing = std.testing;
+    var factory = TypeFactory.init(testing.allocator);
+    const loc = location.SourceLocation.dummy();
+
+    // Primitives → NOT reference types
+    const num_type = try factory.createNumberType(loc);
+    try testing.expectEqual(false, TypeFactory.isReferenceType(num_type));
+
+    const bool_type = try factory.createBooleanType(loc);
+    try testing.expectEqual(false, TypeFactory.isReferenceType(bool_type));
+
+    const void_type = try factory.createVoidType(loc);
+    try testing.expectEqual(false, TypeFactory.isReferenceType(void_type));
+
+    // Array → IS reference type
+    const array_type = try factory.createArrayType(num_type, loc);
+    try testing.expectEqual(true, TypeFactory.isReferenceType(array_type));
+
+    // Cleanup
+    testing.allocator.destroy(num_type);
+    testing.allocator.destroy(bool_type);
+    testing.allocator.destroy(void_type);
+    testing.allocator.destroy(array_type);
 }

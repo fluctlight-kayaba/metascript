@@ -110,6 +110,11 @@ pub const TypeChecker = struct {
         return factory.createClassType(members, loc);
     }
 
+    fn createClassTypeNamed(self: *TypeChecker, name: []const u8, members: []*ast.Node, loc: location.SourceLocation) !*types.Type {
+        var factory = self.getTypeFactory();
+        return factory.createClassTypeNamed(name, members, loc);
+    }
+
     /// Type check the AST
     /// Returns true if no errors were found
     pub fn check(self: *TypeChecker, program: *ast.Node) !bool {
@@ -229,8 +234,8 @@ pub const TypeChecker = struct {
                 const class = &node.data.class_decl;
                 var sym = symbol.Symbol.init(class.name, .class, node.location);
 
-                // Create object type for the class
-                sym.type = try self.createClassType(class.members, node.location);
+                // Create object type for the class (with name for debugging and is_cyclic for ORC)
+                sym.type = try self.createClassTypeNamed(class.name, class.members, node.location);
 
                 self.symbols.define(sym) catch {
                     try self.errors.append(.{

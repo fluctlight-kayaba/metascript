@@ -23,7 +23,7 @@ Metascript synthesizes proven approaches from production languages. Each referen
 
 **What They Proved:**
 - Multi-backend compilation works in production (since 2005)
-- Unified IR → C++, JS, JVM, Python, Lua, PHP
+- Single source → multiple targets (C++, JS, JVM, Python, Lua, PHP)
 - 85-95% of C performance on native backends
 
 **Benchmarks:**
@@ -36,7 +36,7 @@ spectral-norm: 91%
 ```
 
 **What We Adopt:**
-- Multi-backend architecture (unified IR → multiple targets)
+- Multi-backend architecture (typed AST → multiple targets)
 - Performance target: 90%+ of C on compute workloads
 - Generational GC optimized for allocation patterns
 - Struct-based object model (fixed layout, no hash lookups)
@@ -270,7 +270,7 @@ handle_cast(increment, #{count := Count} = State) ->
 ## Synthesis: The Metascript Approach
 
 **Combine the Best:**
-- **Haxe:** Multi-backend compilation (unified IR → C/JS/Erlang)
+- **Haxe:** Multi-backend compilation (typed AST → C/JS/Erlang)
 - **Nim:** Compile-time macros (powerful AST manipulation)
 - **TypeScript:** Syntax and tooling (millions know this)
 - **Bun:** Production TS→JS in Zig (proven approach)

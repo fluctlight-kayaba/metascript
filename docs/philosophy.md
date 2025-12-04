@@ -21,7 +21,7 @@ Every technical decision considers developer impact. Performance means nothing i
 | **Erlang** | Distributed, fault-tolerant | OTP supervision, hot reload, production reliability |
 
 **Why Three Backends:**
-- Unified IR validates design (if it maps to all three, abstraction is sound)
+- Typed AST validates design (if it maps to all three, abstraction is sound)
 - Different strengths (performance, reach, reliability)
 - One codebase, multiple targets (write once, deploy anywhere)
 - De-risks the project (not betting on single runtime)
@@ -103,7 +103,7 @@ Each component is essential:
 **Compile-Time Macros:** Bridge dynamic→static, eliminate boilerplate, zero-cost abstractions
 **Three Backends:** C (performance), JavaScript (reach), Erlang (reliability)
 
-**Why This Works:** Unified IR ensures same semantics, developer chooses backend for deployment, macros expand consistently.
+**Why This Works:** Typed AST ensures same semantics, developer chooses backend for deployment, macros expand consistently.
 
 ---
 

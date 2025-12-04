@@ -58,10 +58,13 @@ static inline msString* ms_string_new(const char* data, size_t len) {
     void* mem = malloc(total_size);
     if (mem == NULL) return NULL;
 
-    // Initialize RefHeader
+    // Initialize RefHeader (matches orc.h msRefHeader)
     msRefHeader* header = (msRefHeader*)mem;
     header->rc = 1;
-    header->root_idx = MS_NOT_IN_ROOTS;
+    header->flags.color = MS_COLOR_BLACK;
+    header->flags.buffered = 0;
+    header->flags._reserved = 0;
+    ms_set_type_id(header, 0);  // Unknown type for strings
 
     // Initialize msString
     msString* str = (msString*)((char*)mem + sizeof(msRefHeader));
@@ -145,10 +148,13 @@ static inline msString* ms_string_concat(msString* a, msString* b) {
     void* mem = malloc(total_size);
     if (mem == NULL) return NULL;
 
-    // Initialize RefHeader
+    // Initialize RefHeader (matches orc.h msRefHeader)
     msRefHeader* header = (msRefHeader*)mem;
     header->rc = 1;
-    header->root_idx = MS_NOT_IN_ROOTS;
+    header->flags.color = MS_COLOR_BLACK;
+    header->flags.buffered = 0;
+    header->flags._reserved = 0;
+    ms_set_type_id(header, 0);  // Unknown type for strings
 
     // Initialize msString
     msString* result = (msString*)((char*)mem + sizeof(msRefHeader));

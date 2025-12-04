@@ -1789,7 +1789,40 @@ pub const Server = struct {
             }
         }
 
-        // Second pass: find the definition of this name
+        // Try Trans-Am symbol table lookup first (type-aware, scope-aware)
+        if (self.transam_db) |*db| {
+            const symbol_opt = db.lookupSymbol(uri.string, target_name.?) catch null;
+            if (symbol_opt) |symbol| {
+                // Found symbol in type checker's symbol table
+                var buf = std.ArrayList(u8).init(self.allocator);
+                defer buf.deinit();
+
+                const writer = buf.writer();
+                try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+                try std.json.stringify(id, .{}, writer);
+                try writer.writeAll(",\"result\":{\"uri\":");
+                try std.json.stringify(uri.string, .{}, writer);
+
+                // SourceLocation uses 1-based lines, LSP uses 0-based
+                const def_line = if (symbol.location.start.line > 0) symbol.location.start.line - 1 else 0;
+                try writer.writeAll(",\"range\":{\"start\":{\"line\":");
+                try writer.print("{d}", .{def_line});
+                try writer.writeAll(",\"character\":");
+                try writer.print("{d}", .{symbol.location.start.column});
+                try writer.writeAll("},\"end\":{\"line\":");
+                const end_line = if (symbol.location.end.line > 0) symbol.location.end.line - 1 else def_line;
+                try writer.print("{d}", .{end_line});
+                try writer.writeAll(",\"character\":");
+                try writer.print("{d}", .{symbol.location.end.column});
+                try writer.writeAll("}}}}");
+
+                try jsonrpc.writeMessage(stdout, buf.items);
+                try stderr.print("[mls] Definition (Trans-Am): {s} at line {d}\n", .{ target_name.?, def_line + 1 });
+                return;
+            }
+        }
+
+        // Fallback: lexer-based search for definition of this name
         var lexer2 = lexer_mod.Lexer.init(self.allocator, text, 1) catch {
             try self.sendResponse(Response.nullResult(id), stdout, stderr);
             return;
@@ -2351,6 +2384,42 @@ pub const Server = struct {
                     .message = td.message,
                 });
             }
+
+            // Run type checker if no parse errors
+            if (transam_diags.len == 0) {
+                const parse_result = db.parse(uri) catch {
+                    break :blk true;
+                };
+
+                var type_checker = checker.TypeChecker.init(self.allocator) catch {
+                    break :blk true;
+                };
+                defer type_checker.deinit();
+
+                _ = type_checker.check(parse_result.tree) catch {
+                    break :blk true;
+                };
+
+                // Convert type errors to LSP diagnostics
+                for (type_checker.errors.items) |type_err| {
+                    try diagnostics.append(.{
+                        .range = .{
+                            .start = .{
+                                .line = if (type_err.location.start.line > 0) type_err.location.start.line - 1 else 0,
+                                .character = type_err.location.start.column,
+                            },
+                            .end = .{
+                                .line = if (type_err.location.end.line > 0) type_err.location.end.line - 1 else 0,
+                                .character = type_err.location.end.column,
+                            },
+                        },
+                        .severity = .@"error",
+                        .source = "mls-typecheck",
+                        .message = type_err.message,
+                    });
+                }
+            }
+
             break :blk true;
         } else false;
 

@@ -66,6 +66,55 @@ pub fn setup(
     spread_element_tests.root_module.addImport("src", src_module);
     const run_spread_element_tests = b.addRunArtifact(spread_element_tests);
 
+    // TypeChecker tests (extracted from src/checker/typechecker.zig)
+    const typechecker_tests = b.addTest(.{
+        .root_source_file = b.path("tests/unit/checker/typechecker_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    typechecker_tests.root_module.addImport("src", src_module);
+    const run_typechecker_tests = b.addRunArtifact(typechecker_tests);
+
+    // Ownership analysis tests (shared DRC infrastructure)
+    const ownership_tests = b.addTest(.{
+        .root_source_file = b.path("src/analysis/ownership.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_ownership_tests = b.addRunArtifact(ownership_tests);
+
+    // Cycle detection tests (shared DRC infrastructure)
+    const cycle_detection_tests = b.addTest(.{
+        .root_source_file = b.path("src/analysis/cycle_detection.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_cycle_detection_tests = b.addRunArtifact(cycle_detection_tests);
+
+    // RC trait tests (backend-agnostic RC interface)
+    const rc_trait_tests = b.addTest(.{
+        .root_source_file = b.path("src/codegen/rc_trait.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_rc_trait_tests = b.addRunArtifact(rc_trait_tests);
+
+    // RC annotation tests (AST-level RC op placement)
+    const rc_annotation_tests = b.addTest(.{
+        .root_source_file = b.path("src/analysis/rc_annotation.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_rc_annotation_tests = b.addRunArtifact(rc_annotation_tests);
+
+    // DRC unified module tests
+    const drc_tests = b.addTest(.{
+        .root_source_file = b.path("src/analysis/drc.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_drc_tests = b.addRunArtifact(drc_tests);
+
     // Default test step
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
@@ -74,6 +123,20 @@ pub fn setup(
     test_step.dependOn(&run_filestore_tests.step);
     test_step.dependOn(&run_normalize_tests.step);
     test_step.dependOn(&run_spread_element_tests.step);
+    test_step.dependOn(&run_typechecker_tests.step);
+    test_step.dependOn(&run_ownership_tests.step);
+    test_step.dependOn(&run_cycle_detection_tests.step);
+    test_step.dependOn(&run_rc_trait_tests.step);
+    test_step.dependOn(&run_rc_annotation_tests.step);
+    test_step.dependOn(&run_drc_tests.step);
+
+    // Analysis tests (DRC infrastructure)
+    const test_analysis_step = b.step("test-analysis", "Run DRC/ownership analysis tests");
+    test_analysis_step.dependOn(&run_ownership_tests.step);
+    test_analysis_step.dependOn(&run_cycle_detection_tests.step);
+    test_analysis_step.dependOn(&run_rc_trait_tests.step);
+    test_analysis_step.dependOn(&run_rc_annotation_tests.step);
+    test_analysis_step.dependOn(&run_drc_tests.step);
 
     // =========================================================================
     // Test Helpers
@@ -117,6 +180,116 @@ pub fn setup(
     test_property_step.dependOn(&run_property_tests.step);
 
     // =========================================================================
+    // Backend Tests (Phase 1 - Critical for TDD)
+    // =========================================================================
+
+    // Erlang backend tests
+    const erlang_backend_tests = b.addTest(.{
+        .root_source_file = b.path("tests/backends/erlang_codegen_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    erlang_backend_tests.root_module.addImport("src", src_module);
+    const run_erlang_backend_tests = b.addRunArtifact(erlang_backend_tests);
+
+    // C backend tests
+    const c_backend_tests = b.addTest(.{
+        .root_source_file = b.path("tests/backends/c_codegen_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    c_backend_tests.root_module.addImport("src", src_module);
+    const run_c_backend_tests = b.addRunArtifact(c_backend_tests);
+
+    // Cross-backend parity tests
+    const cross_backend_tests = b.addTest(.{
+        .root_source_file = b.path("tests/backends/cross_backend_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cross_backend_tests.root_module.addImport("src", src_module);
+    const run_cross_backend_tests = b.addRunArtifact(cross_backend_tests);
+
+    // Backend analytics test
+    const backend_analytics_tests = b.addTest(.{
+        .root_source_file = b.path("tests/backends/backend_analytics.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    backend_analytics_tests.root_module.addImport("src", src_module);
+    const run_backend_analytics_tests = b.addRunArtifact(backend_analytics_tests);
+
+    // Error detection test
+    const error_detection_tests = b.addTest(.{
+        .root_source_file = b.path("tests/backends/error_detection_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    error_detection_tests.root_module.addImport("src", src_module);
+    const run_error_detection_tests = b.addRunArtifact(error_detection_tests);
+
+    const test_error_detection_step = b.step("test-error-detection", "Test that error detection works");
+    test_error_detection_step.dependOn(&run_error_detection_tests.step);
+
+    // Trace test (debug flow)
+    const trace_tests = b.addTest(.{
+        .root_source_file = b.path("tests/backends/trace_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    trace_tests.root_module.addImport("src", src_module);
+    const run_trace_tests = b.addRunArtifact(trace_tests);
+
+    const test_trace_step = b.step("test-trace", "Trace compilation flow step by step");
+    test_trace_step.dependOn(&run_trace_tests.step);
+
+    // Test real fixtures
+    const test_real_fixture_tests = b.addTest(.{
+        .root_source_file = b.path("tests/backends/test_real_fixture.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_real_fixture_tests.root_module.addImport("src", src_module);
+    const run_test_real_fixture_tests = b.addRunArtifact(test_real_fixture_tests);
+
+    const test_real_fixture_step = b.step("test-real-fixture", "Test real fixtures individually");
+    test_real_fixture_step.dependOn(&run_test_real_fixture_tests.step);
+
+    // Test parser permissiveness
+    const test_should_fail_tests = b.addTest(.{
+        .root_source_file = b.path("tests/backends/test_should_fail.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_should_fail_tests.root_module.addImport("src", src_module);
+    const run_test_should_fail_tests = b.addRunArtifact(test_should_fail_tests);
+
+    const test_should_fail_step = b.step("test-should-fail", "Test that unsupported features actually fail");
+    test_should_fail_step.dependOn(&run_test_should_fail_tests.step);
+
+    // Backend test step
+    const test_backends_step = b.step("test-backends", "Run backend code generation tests (Phase 1 TDD)");
+    test_backends_step.dependOn(&run_erlang_backend_tests.step);
+    test_backends_step.dependOn(&run_c_backend_tests.step);
+    test_backends_step.dependOn(&run_cross_backend_tests.step);
+
+    // Backend analytics step (metrics only, always passes)
+    const test_analytics_step = b.step("test-analytics", "Run backend success rate analytics");
+    test_analytics_step.dependOn(&run_backend_analytics_tests.step);
+
+    // Enhanced execution analytics (Phase 2: compile + execute tests)
+    const execution_analytics_tests = b.addTest(.{
+        .root_source_file = b.path("tests/backends/execution_analytics.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    execution_analytics_tests.root_module.addImport("src", src_module);
+    const run_execution_analytics_tests = b.addRunArtifact(execution_analytics_tests);
+
+    const test_execution_step = b.step("test-execution", "Run enhanced execution analytics (compile + run generated code)");
+    test_execution_step.dependOn(&run_execution_analytics_tests.step);
+
+    // =========================================================================
     // Aggregate Test Steps
     // =========================================================================
 
@@ -136,6 +309,9 @@ pub fn setup(
     test_all_step.dependOn(&run_helper_tests.step);
     test_all_step.dependOn(&run_property_tests.step);
     test_all_step.dependOn(&run_e2e_tests.step);
+    test_all_step.dependOn(&run_erlang_backend_tests.step);
+    test_all_step.dependOn(&run_c_backend_tests.step);
+    test_all_step.dependOn(&run_cross_backend_tests.step);
 
     // Quick smoke test
     const test_quick_step = b.step("test-quick", "Run quick smoke tests");

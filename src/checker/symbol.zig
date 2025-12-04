@@ -296,21 +296,24 @@ fn defineBuiltins(scope: *Scope, type_arena: *std.heap.ArenaAllocator) !void {
     });
 }
 
-/// Create console type: { log: (msg: any) => void, ... }
+/// Create console type: { log: (...args: any[]) => void, ... }
+/// console.log is variadic - accepts any number of arguments of any type
 fn createConsoleType(allocator: std.mem.Allocator, void_type: *types.Type, any_type: *types.Type) !*types.Type {
-    // Create function type for log/error/warn: (msg: any) => void
-    const params_slice = try allocator.alloc(types.FunctionType.FunctionParam, 1);
-    params_slice[0] = .{
-        .name = "msg",
-        .type = any_type,
+    // Create rest parameter for variadic log/error/warn: (...args: any[]) => void
+    // No required params, just a rest param that accepts any type
+    const rest_param = try allocator.create(types.FunctionType.FunctionParam);
+    rest_param.* = .{
+        .name = "args",
+        .type = any_type, // Element type is 'any' (unknown)
         .optional = false,
     };
 
     const log_func_data = try allocator.create(types.FunctionType);
     log_func_data.* = .{
         .type_params = &[_]types.GenericParam{},
-        .params = params_slice,
+        .params = &[_]types.FunctionType.FunctionParam{}, // No required params
         .return_type = void_type,
+        .rest_param = rest_param, // Variadic!
     };
 
     const log_func_type = try allocator.create(types.Type);

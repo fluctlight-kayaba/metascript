@@ -3,7 +3,7 @@
  * Measures overhead in real-world string patterns
  */
 
-#include "string.h"
+#include "ms_string.h"
 #include <stdio.h>
 #include <time.h>
 #include <stdint.h>

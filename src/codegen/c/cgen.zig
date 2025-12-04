@@ -127,6 +127,9 @@ pub const CGenerator = struct {
         try self.emit("#include <stdbool.h>\n");
         try self.emit("#include <string.h>\n");
         try self.emit("#include <stdlib.h>\n");
+        try self.emit("\n// Metascript ORC Runtime (compile with: -I<metascript>/src/runtime)\n");
+        try self.emit("#include \"orc.h\"\n");
+        try self.emit("#include \"ms_string.h\"\n");
     }
 
     /// Main dispatch for node emission
@@ -381,11 +384,20 @@ pub const CGenerator = struct {
                 }
             } else {
                 // Normal initialization (constants only)
-                if (decl.type) |typ| {
-                    try self.emitType(typ);
-                } else if (decl.init) |init_expr| {
-                    // Try to use the inferred type from the initializer
-                    if (init_expr.type) |inferred_type| {
+                // Special case: new_expr gets ClassName* type (must check before decl.type)
+                if (decl.init) |init_expr| {
+                    if (init_expr.kind == .new_expr) {
+                        const new_e = &init_expr.data.new_expr;
+                        if (new_e.callee.kind == .identifier) {
+                            try self.emit(new_e.callee.data.identifier);
+                            try self.emit("*");
+                        } else {
+                            try self.emit("void*");
+                        }
+                    } else if (decl.type) |typ| {
+                        try self.emitType(typ);
+                    } else if (init_expr.type) |inferred_type| {
+                        // Try to use the inferred type from the initializer
                         try self.emitType(inferred_type);
                     } else if (init_expr.kind == .array_expr) {
                         try self.emit("double");
@@ -403,6 +415,9 @@ pub const CGenerator = struct {
                     } else {
                         try self.emit("void*");
                     }
+                } else if (decl.type) |typ| {
+                    // No initializer, but have explicit type
+                    try self.emitType(typ);
                 } else {
                     try self.emit("void*");
                 }
@@ -413,9 +428,9 @@ pub const CGenerator = struct {
                 // Emit array brackets if type is array
                 if (decl.type) |typ| {
                     if (typ.kind == .array) {
-                        if (decl.init) |init_expr| {
-                            if (init_expr.kind == .array_expr) {
-                                const array = &init_expr.data.array_expr;
+                        if (decl.init) |init_expr2| {
+                            if (init_expr2.kind == .array_expr) {
+                                const array = &init_expr2.data.array_expr;
                                 const len_str = try std.fmt.allocPrint(self.allocator, "{d}", .{array.elements.len});
                                 defer self.allocator.free(len_str);
                                 try self.emit("[");
@@ -718,7 +733,11 @@ pub const CGenerator = struct {
                         }
                         try format_parts.appendSlice("}");
                     },
-                    else => try format_parts.appendSlice("%p"),
+                    else => {
+                        // For unknown types, default to %g (number) as most common case
+                        // %p is rarely what we want for user-facing output
+                        try format_parts.appendSlice("%g");
+                    },
                 }
             } else {
                 // Default to number format (common case)
@@ -745,17 +764,31 @@ pub const CGenerator = struct {
                     }
                     continue;
                 }
-                // For generic 'number' type, cast to double to ensure correct printf behavior
+                // Strings: emit directly without cast
+                if (arg_type.kind == .string) {
+                    try self.emit(", ");
+                    try self.emitExpression(arg);
+                    continue;
+                }
+                // Booleans: emit directly without cast
+                if (arg_type.kind == .boolean) {
+                    try self.emit(", ");
+                    try self.emitExpression(arg);
+                    continue;
+                }
+                // For numeric types, cast to double to ensure correct printf behavior
                 // This handles the case where we emitted 'int' in C but printf expects 'double' for %g
-                if (arg_type.kind == .number) {
+                if (arg_type.kind == .number or arg_type.kind == .float32 or arg_type.kind == .float64 or
+                    arg_type.kind == .int32 or arg_type.kind == .int64)
+                {
                     try self.emit(", (double)(");
                     try self.emitExpression(arg);
                     try self.emit(")");
                     continue;
                 }
             }
-            // Even if type is unknown, cast identifiers to double for safety with %g format
-            // This prevents undefined behavior when int loop vars are printed with %g
+            // For unknown types, cast identifiers to double for safety with %g format
+            // (most unknown types are numbers in practice)
             if (arg.kind == .identifier) {
                 try self.emit(", (double)(");
                 try self.emitExpression(arg);
@@ -822,7 +855,16 @@ pub const CGenerator = struct {
                     try self.emitExpression(member.property);
                     try self.emit("]");
                 } else {
-                    try self.emit(".");
+                    // Use -> for pointer types (class instances allocated with ms_alloc)
+                    const is_pointer = if (member.object.type) |obj_type|
+                        obj_type.kind == .type_reference or obj_type.kind == .object
+                    else
+                        false;
+                    if (is_pointer) {
+                        try self.emit("->");
+                    } else {
+                        try self.emit(".");
+                    }
                     try self.emitExpression(member.property);
                 }
             },
@@ -844,6 +886,20 @@ pub const CGenerator = struct {
                     try self.emitExpression(elem);
                 }
                 try self.emit("}");
+            },
+            .new_expr => {
+                // Emit: (ClassName*)ms_alloc(sizeof(ClassName))
+                const new_e = &node.data.new_expr;
+                if (new_e.callee.kind == .identifier) {
+                    const class_name = new_e.callee.data.identifier;
+                    try self.emit("(");
+                    try self.emit(class_name);
+                    try self.emit("*)ms_alloc(sizeof(");
+                    try self.emit(class_name);
+                    try self.emit("))");
+                } else {
+                    try self.emit("/* unsupported: new with non-identifier */");
+                }
             },
             else => {
                 // Unsupported expression type

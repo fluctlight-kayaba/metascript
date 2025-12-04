@@ -129,6 +129,11 @@ pub const Type = struct {
 pub const ObjectType = struct {
     properties: []Property,
     methods: []Property,
+    /// Type name (for cyclicity detection and debugging)
+    name: ?[]const u8 = null,
+    /// Cached cyclicity result (computed lazily by type checker)
+    /// null = not computed, true = can form cycles, false = acyclic
+    is_cyclic: ?bool = null,
 
     pub const Property = struct {
         name: []const u8,
@@ -147,12 +152,20 @@ pub const FunctionType = struct {
     type_params: []GenericParam,
     params: []FunctionParam,
     return_type: *Type,
+    /// Rest parameter for variadic functions (...args: T[])
+    /// When set, the function accepts unlimited additional arguments of this type
+    rest_param: ?*FunctionParam = null,
 
     pub const FunctionParam = struct {
         name: []const u8,
         type: *Type,
         optional: bool,
     };
+
+    /// Check if this function is variadic (accepts unlimited args)
+    pub fn isVariadic(self: *const FunctionType) bool {
+        return self.rest_param != null;
+    }
 };
 
 /// Generic type parameter
@@ -248,6 +261,129 @@ pub fn follow(t: ?*Type) ?*Type {
         .uint8, .uint16, .uint32, .uint64,
         .float32, .float64,
         => typ,
+    };
+}
+
+// =============================================================================
+// Cyclicity Detection (for ORC optimization)
+// =============================================================================
+// A type is cyclic if it can transitively contain a reference to itself.
+// Examples:
+//   class Node { next: Node }  → cyclic (directly references self)
+//   class A { b: B } class B { a: A } → cyclic (A→B→A)
+//   class Point { x: number; y: number } → acyclic (no ref fields)
+//   class Container { items: number[] } → acyclic (array of primitives)
+//
+// This is a compile-time analysis used by codegen to decide:
+//   - Cyclic types: use ms_decref_typed() with type_info
+//   - Acyclic types: use ms_decref() (faster, no cycle check)
+
+/// Check if a type can form reference cycles.
+/// This is used for ORC optimization: acyclic types skip cycle detection.
+///
+/// Returns:
+///   true = type can form cycles (needs cycle collector)
+///   false = type cannot form cycles (fast path)
+pub fn isCyclic(t: ?*Type) bool {
+    return isCyclicWithVisited(t, &[_]*Type{});
+}
+
+/// Internal helper that tracks visited types to detect cycles
+fn isCyclicWithVisited(t: ?*Type, visited: []const *Type) bool {
+    if (t == null) return false;
+    const typ = t.?;
+
+    // Follow through type references and wrappers
+    const resolved = follow(typ);
+    if (resolved == null) return false;
+    const resolved_type = resolved.?;
+
+    // Check if we've already visited this type (cycle detected!)
+    for (visited) |v| {
+        if (v == resolved_type) return true;
+    }
+
+    return switch (resolved_type.kind) {
+        // Primitives cannot form cycles
+        .number, .string, .boolean, .void, .unknown, .never,
+        .int8, .int16, .int32, .int64,
+        .uint8, .uint16, .uint32, .uint64,
+        .float32, .float64,
+        => false,
+
+        // Object types: check all properties for cycles
+        .object => {
+            const obj = resolved_type.data.object;
+
+            // Use cached result if available
+            if (obj.is_cyclic) |cached| return cached;
+
+            // Build new visited list including this type
+            // Note: Using fixed buffer for simplicity; in production use allocator
+            var new_visited: [32]*Type = undefined;
+            var i: usize = 0;
+            for (visited) |v| {
+                if (i >= 31) break;
+                new_visited[i] = v;
+                i += 1;
+            }
+            new_visited[i] = resolved_type;
+            const new_slice = new_visited[0 .. i + 1];
+
+            // Check each property
+            for (obj.properties) |prop| {
+                if (isCyclicWithVisited(prop.type, new_slice)) {
+                    return true;
+                }
+            }
+            return false;
+        },
+
+        // Array types: check element type
+        .array => isCyclicWithVisited(resolved_type.data.array, visited),
+
+        // Tuple types: check all elements
+        .tuple => {
+            const tuple = resolved_type.data.tuple;
+            for (tuple.elements) |elem| {
+                if (isCyclicWithVisited(elem, visited)) return true;
+            }
+            return false;
+        },
+
+        // Function types generally don't cause cycles
+        // (closures may capture cyclic data, but that's handled at runtime)
+        .function => false,
+
+        // Generic instances: check base type
+        .generic_instance => {
+            const inst = resolved_type.data.generic_instance;
+            return isCyclicWithVisited(inst.base, visited);
+        },
+
+        // Generic params: conservative (may be cyclic when instantiated)
+        .generic_param => true,
+
+        // Union/intersection: any member being cyclic makes it cyclic
+        .@"union" => {
+            for (resolved_type.data.@"union".types) |member| {
+                if (isCyclicWithVisited(member, visited)) return true;
+            }
+            return false;
+        },
+        .intersection => {
+            for (resolved_type.data.intersection.types) |member| {
+                if (isCyclicWithVisited(member, visited)) return true;
+            }
+            return false;
+        },
+
+        // Type references should be resolved by now
+        .type_reference => false,
+
+        // ref/lent: check wrapped type
+        .ref => isCyclicWithVisited(resolved_type.data.ref, visited),
+        .lent => isCyclicWithVisited(resolved_type.data.lent, visited),
     };
 }
 
@@ -504,4 +640,93 @@ test "ownership: can be set to owned" {
         .ownership = .owned,
     };
     try std.testing.expectEqual(OwnershipKind.owned, num.ownership.?);
+}
+
+// =============================================================================
+// Cyclicity Detection Tests
+// =============================================================================
+
+test "isCyclic: primitive types are not cyclic" {
+    var num = Type{ .kind = .number, .location = location.SourceLocation.dummy(), .data = .{ .number = {} } };
+    var str = Type{ .kind = .string, .location = location.SourceLocation.dummy(), .data = .{ .string = {} } };
+    var boolean = Type{ .kind = .boolean, .location = location.SourceLocation.dummy(), .data = .{ .boolean = {} } };
+
+    try std.testing.expect(!isCyclic(&num));
+    try std.testing.expect(!isCyclic(&str));
+    try std.testing.expect(!isCyclic(&boolean));
+}
+
+test "isCyclic: null type is not cyclic" {
+    try std.testing.expect(!isCyclic(null));
+}
+
+test "isCyclic: object with only primitive properties is not cyclic" {
+    // class Point { x: number; y: number }
+    var num1 = Type{ .kind = .number, .location = location.SourceLocation.dummy(), .data = .{ .number = {} } };
+    var num2 = Type{ .kind = .number, .location = location.SourceLocation.dummy(), .data = .{ .number = {} } };
+
+    var props = [_]ObjectType.Property{
+        .{ .name = "x", .type = &num1, .optional = false },
+        .{ .name = "y", .type = &num2, .optional = false },
+    };
+
+    var obj = ObjectType{
+        .properties = &props,
+        .methods = &[_]ObjectType.Property{},
+        .name = "Point",
+    };
+
+    var point_type = Type{
+        .kind = .object,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .object = &obj },
+    };
+
+    try std.testing.expect(!isCyclic(&point_type));
+}
+
+test "isCyclic: self-referential type is cyclic" {
+    // class Node { next: Node }
+    var obj = ObjectType{
+        .properties = undefined, // Will be set below
+        .methods = &[_]ObjectType.Property{},
+        .name = "Node",
+    };
+
+    var node_type = Type{
+        .kind = .object,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .object = &obj },
+    };
+
+    var props = [_]ObjectType.Property{
+        .{ .name = "next", .type = &node_type, .optional = false },
+    };
+    obj.properties = &props;
+
+    try std.testing.expect(isCyclic(&node_type));
+}
+
+test "isCyclic: array of primitives is not cyclic" {
+    // number[]
+    var num = Type{ .kind = .number, .location = location.SourceLocation.dummy(), .data = .{ .number = {} } };
+    var arr = Type{
+        .kind = .array,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .array = &num },
+    };
+
+    try std.testing.expect(!isCyclic(&arr));
+}
+
+test "isCyclic: ref wrapper is checked for inner type" {
+    // ref number (not cyclic)
+    var num = Type{ .kind = .number, .location = location.SourceLocation.dummy(), .data = .{ .number = {} } };
+    var ref_num = Type{
+        .kind = .ref,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .ref = &num },
+    };
+
+    try std.testing.expect(!isCyclic(&ref_num));
 }

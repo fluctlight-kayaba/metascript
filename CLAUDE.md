@@ -128,6 +128,31 @@ REFACTOR → Clean up (tests protect you)
 
 **The Only Exception:** Exploratory spikes (throwaway code to understand a problem). Even then, write tests before integrating into main codebase.
 
+#### Real-World Use Cases: Our Best Friend
+
+**Critical Insight:** When reviewing code or designing systems, protect yourself through solid test cases that catch **real-world use cases first**. This gives you a ground to comeback, guards you from having no strong standpoint/root.
+
+| Approach | Problem | Better Approach |
+|----------|---------|-----------------|
+| Random spot checks | No systematic coverage, miss edge cases | Derive tests from real usage patterns |
+| Theoretical concerns | "This might be a problem" lacks proof | Write test that demonstrates the problem |
+| Code review only | Issues found but not verified | Each concern → test case → proven fix |
+
+**The Pattern:**
+```
+1. Review code critically → identify potential issues
+2. For EACH issue → design real-world test case that exercises it
+3. Run tests → prove issue exists (or doesn't!)
+4. Fix issue → test passes
+5. Tests remain → prevent regression forever
+```
+
+**Why This Matters:**
+- You can FEEL something is wrong, but without a test you can't PROVE it
+- Real-world scenarios beat synthetic benchmarks
+- Tests become your "ground truth" for future debates
+- Skepticism without tests is just opinion; skepticism with tests is engineering
+
 #### Red-Green-Refactor in Practice
 
 ```
@@ -572,7 +597,7 @@ Day 4:
 - TypeScript syntax (familiar, copy-paste friendly)
 - Compile-time macro system (bridge dynamic patterns to static code)
 - **Three backends:** C (90%+ of C perf), JavaScript (browser/npm), Erlang (OTP runtime)
-- Unified IR (one language, three runtimes)
+- Typed AST as IR (one language, three runtimes)
 - Strict static typing (no `any`)
 
 **Why This Matters:**
@@ -648,7 +673,7 @@ class User { name: string; }
 **Architecture:**
 ```
 TypeScript → AST → Macro expansion → Type checking →
-Unified IR → Backend Selection
+Typed AST (IR) → Backend Selection
     ├─ C backend → GCC/Clang → Native binary (90%+ of C)
     ├─ JavaScript backend → Modern JS (browser/npm compatible)
     └─ Erlang backend → BEAM bytecode (OTP fault tolerance)
@@ -660,9 +685,9 @@ Unified IR → Backend Selection
 - **Erlang backend:** OTP supervision, distributed systems, hot code reloading
 
 **Key Techniques:**
-- Unified IR validates abstraction across all backends
+- Typed AST validates abstraction across all backends (no separate IR layer)
 - Backend-specific optimizations (SIMD for C, tree-shaking for JS, process pooling for Erlang)
-- Macros generate IR (backend-agnostic), backends translate idiomatically
+- Macros generate AST (backend-agnostic), backends translate idiomatically
 - Cross-backend code sharing via common type system
 
 **See:** [Architecture](./docs/architecture.md), [Backends Guide](./docs/backends.md)
@@ -715,7 +740,7 @@ metascript expand --macro=derive main.mts
 metascript profile main.mts
 
 # Emit intermediate representations
-metascript emit-ir main.mts                     # Unified IR
+metascript emit-ast main.mts                    # Typed AST (IR)
 metascript emit-c main.mts                      # C code
 metascript emit-js main.mts                     # JavaScript code
 metascript emit-erl main.mts                    # Erlang code
@@ -729,7 +754,7 @@ metascript/
 │   ├── parser/       # TypeScript parser
 │   ├── checker/      # Type checker
 │   ├── macro/        # Macro expander
-│   ├── ir/           # Unified IR
+│   ├── ast/          # AST definitions
 │   └── backends/     # C, JavaScript, Erlang backends
 ├── runtime/          # Minimal runtime
 │   ├── gc/          # Garbage collector
@@ -869,10 +894,10 @@ We have production-grade source code to study locally:
 
 ### Year 1: Prove Multi-Backend Concept (Q1-Q4 2025)
 
-**Weeks 1-4: Unified IR Design**
+**Weeks 1-4: Core Pipeline Design**
 - Parser (TypeScript subset)
 - Type checker (strict static)
-- **Unified IR** (design for all 3 backends)
+- **Typed AST as IR** (design for all 3 backends)
 - Macro system foundation
 
 **Weeks 5-12: All 3 Backends in Parallel**
@@ -971,7 +996,7 @@ We have production-grade source code to study locally:
 
 **Reference:**
 - [Macro System](./docs/macro-system.md) - Compile-time metaprogramming
-- [Architecture](./docs/architecture.md) - Compiler internals & unified IR
+- [Architecture](./docs/architecture.md) - Compiler internals & typed AST
 - [Backends Guide](./docs/backends.md) - C, JavaScript, Erlang backends
 - [Performance Guide](./docs/performance-guide.md) - Optimization techniques
 

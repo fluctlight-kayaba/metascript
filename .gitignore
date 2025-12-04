@@ -25,6 +25,12 @@ metascript
 src/runtime/*_test
 src/runtime/*_bench
 src/runtime/*_benchmark
+src/runtime/*_asan
+src/runtime/*_debug
+src/runtime/drc_test
+
+# macOS debug symbols
+*.dSYM/
 
 # Test outputs
 *.test

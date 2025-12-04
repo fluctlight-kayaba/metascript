@@ -68,6 +68,18 @@ pub const TypeResolver = struct {
             .function_decl => {
                 const func = &node.data.function_decl;
 
+                // Enter function scope to register type parameters
+                try self.symbols.enterScope(.function);
+                defer self.symbols.exitScope();
+
+                // Register type parameters as type aliases in scope
+                for (func.type_params) |tp| {
+                    var tp_sym = symbol_mod.Symbol.init(tp.name, .type_alias, node.location);
+                    // Type parameters are valid types (will be resolved at instantiation)
+                    tp_sym.type = null; // Could create a generic_param type here
+                    self.symbols.define(tp_sym) catch {};
+                }
+
                 // Resolve parameter types
                 for (func.params) |*param| {
                     if (param.type) |type_ann| {
@@ -296,12 +308,38 @@ pub const TypeResolver = struct {
                 try self.resolveType(t.data.lent);
             },
 
-            // Type reference - look up in symbol table
+            // Type reference - look up in symbol table or resolve primitive
             .type_reference => {
                 const ref = t.data.type_reference;
                 const name = ref.name;
 
-                // Check if type exists in symbol table
+                // First, check if it's a builtin primitive type
+                if (getBuiltinPrimitiveKind(name)) |kind| {
+                    // Resolve to primitive type by transforming in-place
+                    t.kind = kind;
+                    t.data = switch (kind) {
+                        .string => .{ .string = {} },
+                        .number => .{ .number = {} },
+                        .boolean => .{ .boolean = {} },
+                        .void => .{ .void = {} },
+                        .unknown => .{ .unknown = {} },
+                        .never => .{ .never = {} },
+                        .int8 => .{ .int8 = {} },
+                        .int16 => .{ .int16 = {} },
+                        .int32 => .{ .int32 = {} },
+                        .int64 => .{ .int64 = {} },
+                        .uint8 => .{ .uint8 = {} },
+                        .uint16 => .{ .uint16 = {} },
+                        .uint32 => .{ .uint32 = {} },
+                        .uint64 => .{ .uint64 = {} },
+                        .float32 => .{ .float32 = {} },
+                        .float64 => .{ .float64 = {} },
+                        else => unreachable,
+                    };
+                    return; // Resolved to primitive
+                }
+
+                // Check if type exists in symbol table (classes, interfaces, etc.)
                 if (self.symbols.lookup(name)) |sym| {
                     // Verify it's a type (class, interface, type_alias)
                     switch (sym.kind) {
@@ -316,7 +354,7 @@ pub const TypeResolver = struct {
                         },
                     }
                 } else {
-                    // Unknown type - check if it's a built-in
+                    // Unknown type - check if it's a built-in object type (Array, etc.)
                     if (!isBuiltinType(name)) {
                         try self.errors.append(.{
                             .message = "unknown type",
@@ -395,6 +433,27 @@ pub const TypeResolver = struct {
                 }
             },
         }
+    }
+
+    /// Get the primitive TypeKind for a builtin type name, or null if not a primitive
+    fn getBuiltinPrimitiveKind(name: []const u8) ?types.TypeKind {
+        if (std.mem.eql(u8, name, "string")) return .string;
+        if (std.mem.eql(u8, name, "number")) return .number;
+        if (std.mem.eql(u8, name, "boolean")) return .boolean;
+        if (std.mem.eql(u8, name, "void")) return .void;
+        if (std.mem.eql(u8, name, "unknown") or std.mem.eql(u8, name, "any")) return .unknown;
+        if (std.mem.eql(u8, name, "never")) return .never;
+        if (std.mem.eql(u8, name, "int8")) return .int8;
+        if (std.mem.eql(u8, name, "int16")) return .int16;
+        if (std.mem.eql(u8, name, "int32") or std.mem.eql(u8, name, "int")) return .int32;
+        if (std.mem.eql(u8, name, "int64")) return .int64;
+        if (std.mem.eql(u8, name, "uint8")) return .uint8;
+        if (std.mem.eql(u8, name, "uint16")) return .uint16;
+        if (std.mem.eql(u8, name, "uint32")) return .uint32;
+        if (std.mem.eql(u8, name, "uint64")) return .uint64;
+        if (std.mem.eql(u8, name, "float32") or std.mem.eql(u8, name, "float")) return .float32;
+        if (std.mem.eql(u8, name, "float64") or std.mem.eql(u8, name, "double")) return .float64;
+        return null;
     }
 
     /// Check if a type name is a built-in type

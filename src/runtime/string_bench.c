@@ -3,7 +3,7 @@
  * Compares msString (with ORC) vs manual C strings
  */
 
-#include "string.h"
+#include "ms_string.h"
 #include <stdio.h>
 #include <time.h>
 #include <stdint.h>

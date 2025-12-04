@@ -418,7 +418,7 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
             });
         },
         .erlang => {
-            var gen = erlgen.ErlangGenerator.init(allocator);
+            var gen = try erlgen.ErlangGenerator.init(allocator, input_file);
             defer gen.deinit();
 
             const erl_code = gen.generate(final_ast) catch |err| {

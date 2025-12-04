@@ -3,7 +3,7 @@
  * Verifies that the C header works correctly
  */
 
-#include "string.h"
+#include "ms_string.h"
 #include <stdio.h>
 #include <assert.h>
 

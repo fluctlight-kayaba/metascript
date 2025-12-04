@@ -13,7 +13,10 @@ pub const file_store = @import("lsp/file_store.zig");
 pub const module = @import("module/module.zig");
 
 // Code generation backends
+// Code generators for all backends
 pub const jsgen = @import("codegen/js/jsgen.zig");
+pub const cgen = @import("codegen/c/cgen.zig");
+pub const erlgen = @import("codegen/erlang/erlgen.zig");
 
 // Import CLI commands
 const cli_dump_tokens = @import("cli/dump_tokens.zig");

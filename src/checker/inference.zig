@@ -19,6 +19,8 @@ pub const TypeInference = struct {
     symbols: *symbol_mod.SymbolTable,
     type_arena: std.heap.ArenaAllocator,
     errors: std.ArrayList(Error),
+    /// Current class type for `this` binding in methods
+    current_class_type: ?*types.Type = null,
 
     pub const Error = struct {
         message: []const u8,
@@ -31,6 +33,7 @@ pub const TypeInference = struct {
             .symbols = symbols,
             .type_arena = std.heap.ArenaAllocator.init(allocator),
             .errors = std.ArrayList(Error).init(allocator),
+            .current_class_type = null,
         };
     }
 
@@ -80,8 +83,9 @@ pub const TypeInference = struct {
                     // Macro-generated code may reference parameters/locals that aren't
                     // in the symbol table because we don't fully analyze method bodies
                     if (!node.location.isDummy()) {
+                        const msg = std.fmt.allocPrint(self.type_arena.allocator(), "undefined identifier '{s}'", .{name}) catch "undefined identifier";
                         try self.errors.append(.{
-                            .message = "undefined identifier",
+                            .message = msg,
                             .location = node.location,
                         });
                     }
@@ -114,13 +118,49 @@ pub const TypeInference = struct {
             // Member expression
             .member_expr => {
                 const member = &node.data.member_expr;
-                _ = try self.inferNode(member.object);
+                const object_type = try self.inferNode(member.object);
+
                 // Only resolve property as expression if computed (obj[expr])
                 // For non-computed (obj.prop), property is just an identifier name
                 if (member.computed) {
                     _ = try self.inferNode(member.property);
                 }
-                // TODO: look up property type from object type
+
+                // Look up property type from object type
+                if (object_type) |obj_type| {
+                    if (obj_type.kind == .object) {
+                        const obj_data = obj_type.data.object;
+                        // Get property name
+                        const prop_name = if (!member.computed and member.property.kind == .identifier)
+                            member.property.data.identifier
+                        else
+                            null;
+
+                        if (prop_name) |name| {
+                            // Search in properties
+                            for (obj_data.properties) |prop| {
+                                if (std.mem.eql(u8, prop.name, name)) {
+                                    node.type = prop.type;
+                                    return node.type;
+                                }
+                            }
+                            // Search in methods
+                            for (obj_data.methods) |method| {
+                                if (std.mem.eql(u8, method.name, name)) {
+                                    node.type = method.type;
+                                    return node.type;
+                                }
+                            }
+                        }
+                    } else if (obj_type.kind == .array) {
+                        // Array access returns element type
+                        if (member.computed) {
+                            node.type = obj_type.data.array;
+                            return node.type;
+                        }
+                    }
+                }
+
                 return null;
             },
 
@@ -235,7 +275,16 @@ pub const TypeInference = struct {
                     _ = try self.inferNode(arg);
                 }
                 // Type is the class being instantiated
-                // TODO: get class type from callee
+                // Look up the class name in the symbol table
+                const callee = node.data.new_expr.callee;
+                if (callee.kind == .identifier) {
+                    const class_name = callee.data.identifier;
+                    if (self.symbols.lookup(class_name)) |class_sym| {
+                        // The class symbol's type is the object type for instances
+                        node.type = class_sym.type;
+                        return node.type;
+                    }
+                }
                 return null;
             },
 
@@ -253,6 +302,7 @@ pub const TypeInference = struct {
                 return null;
             },
             .variable_stmt => {
+                const is_const = node.data.variable_stmt.kind == .@"const";
                 for (node.data.variable_stmt.declarations) |*decl| {
                     if (decl.init) |init_expr| {
                         const init_type = try self.inferNode(init_expr);
@@ -272,13 +322,16 @@ pub const TypeInference = struct {
                             decl.type = init_type;
                         }
 
-                        // Update symbol table with final type
-                        if (decl.type) |dt| {
-                            self.symbols.updateType(decl.name, dt) catch {
-                                // Symbol not found - this can happen for macro-generated code
-                                // Just continue without error
-                            };
-                        }
+                        // Register variable in symbol table
+                        var var_sym = symbol_mod.Symbol.init(decl.name, .variable, node.location);
+                        var_sym.type = decl.type;
+                        var_sym.mutable = !is_const;
+                        self.symbols.define(var_sym) catch {
+                            // Already defined - try to update type instead
+                            if (decl.type) |dt| {
+                                self.symbols.updateType(decl.name, dt) catch {};
+                            }
+                        };
                     }
                 }
                 return null;
@@ -301,6 +354,9 @@ pub const TypeInference = struct {
                 return null;
             },
             .for_stmt => {
+                try self.symbols.enterScope(.loop);
+                defer self.symbols.exitScope();
+
                 if (node.data.for_stmt.init) |for_init| _ = try self.inferNode(for_init);
                 if (node.data.for_stmt.condition) |cond| _ = try self.inferNode(cond);
                 if (node.data.for_stmt.update) |update| _ = try self.inferNode(update);
@@ -314,12 +370,32 @@ pub const TypeInference = struct {
                 return null;
             },
             .function_decl => {
-                if (node.data.function_decl.body) |body| {
+                const func = &node.data.function_decl;
+                if (func.body) |body| {
+                    // Enter function scope
+                    try self.symbols.enterScope(.function);
+                    defer self.symbols.exitScope();
+
+                    // Register parameters in scope
+                    for (func.params) |param| {
+                        var param_sym = symbol_mod.Symbol.init(param.name, .parameter, node.location);
+                        param_sym.type = param.type;
+                        self.symbols.define(param_sym) catch {}; // Ignore duplicate errors
+                    }
+
                     _ = try self.inferNode(body);
                 }
                 return null;
             },
             .class_decl => {
+                // Look up the class type from symbol table
+                const class_name = node.data.class_decl.name;
+                const saved_class_type = self.current_class_type;
+                if (self.symbols.lookup(class_name)) |class_sym| {
+                    self.current_class_type = class_sym.type;
+                }
+                defer self.current_class_type = saved_class_type;
+
                 for (node.data.class_decl.members) |member| {
                     _ = try self.inferNode(member);
                 }
@@ -341,7 +417,27 @@ pub const TypeInference = struct {
                 return null;
             },
             .method_decl => {
-                if (node.data.method_decl.body) |body| {
+                const method = &node.data.method_decl;
+                if (method.body) |body| {
+                    // Enter function scope
+                    try self.symbols.enterScope(.function);
+                    defer self.symbols.exitScope();
+
+                    // Register `this` with the current class type
+                    if (self.current_class_type) |class_type| {
+                        var this_sym = symbol_mod.Symbol.init("this", .variable, node.location);
+                        this_sym.type = class_type;
+                        this_sym.mutable = false;
+                        self.symbols.define(this_sym) catch {};
+                    }
+
+                    // Register parameters in scope
+                    for (method.params) |param| {
+                        var param_sym = symbol_mod.Symbol.init(param.name, .parameter, node.location);
+                        param_sym.type = param.type;
+                        self.symbols.define(param_sym) catch {}; // Ignore duplicate errors
+                    }
+
                     _ = try self.inferNode(body);
                 }
                 return null;
@@ -372,15 +468,24 @@ pub const TypeInference = struct {
         const expr = &node.data.binary_expr;
         const left_type = try self.inferNode(expr.left);
         const right_type = try self.inferNode(expr.right);
-        _ = left_type;
 
         // Determine result type based on operator
         node.type = switch (expr.op) {
             // Assignment → type of right-hand side
             .assign => right_type orelse try self.createPrimitive(.unknown, node.location),
 
-            // Arithmetic operators → number
-            .add, .sub, .mul, .div, .mod => try self.createPrimitive(.number, node.location),
+            // Add: string + string → string, otherwise → number
+            .add => blk: {
+                const is_left_string = if (left_type) |lt| lt.kind == .string else false;
+                const is_right_string = if (right_type) |rt| rt.kind == .string else false;
+                if (is_left_string or is_right_string) {
+                    break :blk try self.createPrimitive(.string, node.location);
+                }
+                break :blk try self.createPrimitive(.number, node.location);
+            },
+
+            // Other arithmetic operators → number
+            .sub, .mul, .div, .mod => try self.createPrimitive(.number, node.location),
 
             // Comparison operators → boolean
             .eq, .ne, .lt, .le, .gt, .ge => try self.createPrimitive(.boolean, node.location),
@@ -752,4 +857,132 @@ test "inference: macro-generated identifier skips error" {
 
     // Should NOT report error for macro-generated code
     try std.testing.expect(!inference.hasErrors());
+}
+
+test "inference: member expression resolves property type" {
+    const allocator = std.testing.allocator;
+
+    var symbols = try symbol_mod.SymbolTable.init(allocator);
+    defer symbols.deinit();
+
+    var inference = TypeInference.init(allocator, &symbols);
+    defer inference.deinit();
+
+    // Create object type { name: string }
+    var str_type = types.Type{
+        .kind = .string,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .string = {} },
+    };
+
+    var props = [_]types.ObjectType.Property{
+        .{ .name = "name", .type = &str_type, .optional = false },
+    };
+    var methods = [_]types.ObjectType.Property{};
+
+    var obj_data = types.ObjectType{
+        .properties = &props,
+        .methods = &methods,
+    };
+
+    var obj_type = types.Type{
+        .kind = .object,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .object = &obj_data },
+    };
+
+    // Create identifier for object
+    var obj_node = ast.Node{
+        .kind = .identifier,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .identifier = "user" },
+        .type = &obj_type,
+    };
+
+    // Register the object in symbol table
+    var sym = symbol_mod.Symbol.init("user", .variable, location.SourceLocation.dummy());
+    sym.type = &obj_type;
+    try symbols.define(sym);
+
+    // Create property access: user.name
+    var prop_node = ast.Node{
+        .kind = .identifier,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .identifier = "name" },
+    };
+
+    var member_node = ast.Node{
+        .kind = .member_expr,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .member_expr = .{
+            .object = &obj_node,
+            .property = &prop_node,
+            .computed = false,
+        } },
+    };
+
+    const result_type = try inference.inferNode(&member_node);
+
+    // Should resolve to string type
+    try std.testing.expect(result_type != null);
+    try std.testing.expectEqual(types.TypeKind.string, result_type.?.kind);
+}
+
+test "inference: array index access returns element type" {
+    const allocator = std.testing.allocator;
+
+    var symbols = try symbol_mod.SymbolTable.init(allocator);
+    defer symbols.deinit();
+
+    var inference = TypeInference.init(allocator, &symbols);
+    defer inference.deinit();
+
+    // Create array type number[]
+    var num_type = types.Type{
+        .kind = .number,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .number = {} },
+    };
+
+    var arr_type = types.Type{
+        .kind = .array,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .array = &num_type },
+    };
+
+    // Create identifier for array
+    var arr_node = ast.Node{
+        .kind = .identifier,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .identifier = "numbers" },
+        .type = &arr_type,
+    };
+
+    // Register the array in symbol table
+    var sym = symbol_mod.Symbol.init("numbers", .variable, location.SourceLocation.dummy());
+    sym.type = &arr_type;
+    try symbols.define(sym);
+
+    // Create index: numbers[0]
+    var index_node = ast.Node{
+        .kind = .number_literal,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .number_literal = 0 },
+    };
+
+    var member_node = ast.Node{
+        .kind = .member_expr,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .member_expr = .{
+            .object = &arr_node,
+            .property = &index_node,
+            .computed = true, // Array access is computed
+        } },
+    };
+
+    const result_type = try inference.inferNode(&member_node);
+
+    // Should resolve to number type (element type)
+    try std.testing.expect(result_type != null);
+    try std.testing.expectEqual(types.TypeKind.number, result_type.?.kind);
 }

@@ -26,6 +26,13 @@ const parser_mod = @import("../parser/parser.zig");
 const checker = @import("../checker/typechecker.zig");
 const vm = @import("../vm/vm.zig");
 
+// DRC (Deterministic Reference Counting) for memory analysis
+const drc_mod = @import("../analysis/drc.zig");
+const Drc = drc_mod.Drc;
+const DrcDiagnostic = drc_mod.DrcDiagnostic;
+const DrcVariable = drc_mod.Variable;
+const DrcAnalyzer = @import("../analysis/drc_analyzer.zig").DrcAnalyzer;
+
 // ===== SUBMODULES =====
 // Trans-Am is organized into focused submodules for maintainability.
 
@@ -84,6 +91,7 @@ pub const AsyncExpansionTask = types_mod.AsyncExpansionTask;
 pub const ThreadContext = types_mod.ThreadContext;
 pub const CachedSymbolTable = types_mod.CachedSymbolTable;
 pub const CachedFunctionCheck = types_mod.CachedFunctionCheck;
+pub const CachedDrcDiagnostics = types_mod.CachedDrcDiagnostics;
 pub const MacroCallInfo = types_mod.MacroCallInfo;
 pub const MacroCallSite = types_mod.MacroCallSite;
 pub const CachedMacroExpansion = types_mod.CachedMacroExpansion;
@@ -91,6 +99,9 @@ pub const TypeInference = types_mod.TypeInference;
 pub const UnifiedIR = types_mod.UnifiedIR;
 pub const AstIdMap = types_mod.AstIdMap;
 pub const classifyDurability = types_mod.classifyDurability;
+
+// From drc.zig (DRC diagnostics for LSP)
+pub const DrcDiagnosticType = DrcDiagnostic;
 
 // From cache.zig
 pub const LRUCache = cache_mod.LRUCache;
@@ -169,6 +180,13 @@ pub const TransAmDatabase = struct {
     symbol_interner: StringInterner,
     macro_call_interner: MacroCallInterner,
 
+    // MODULE DEPENDENCY GRAPH - Track which files import which
+    // Used for invalidation: when file B changes, files that import B should be re-analyzed
+    // Key: file_id, Value: list of files that file_id imports
+    module_imports: std.StringHashMap(std.ArrayList([]const u8)),
+    // Reverse map: Key: file_id, Value: list of files that import file_id
+    module_importers: std.StringHashMap(std.ArrayList([]const u8)),
+
     // INVALIDATION TRACKING
     dirty_files: std.AutoHashMap(u64, void),
     revision: u64 = 0, // Legacy field, synced with current_revision
@@ -213,7 +231,20 @@ pub const TransAmDatabase = struct {
     // Function type check cache (hash of file_id + func_name -> CachedFunctionCheck)
     function_check_cache: std.AutoHashMap(u64, CachedFunctionCheck),
 
+    // Phase 10: DRC Diagnostics Cache
+    // DRC analysis cache per file (file_hash -> CachedDrcDiagnostics)
+    drc_diagnostics_cache: std.AutoHashMap(u64, CachedDrcDiagnostics),
+    // DRC cache statistics
+    drc_cache_stats: DrcCacheStats = .{},
+
     const Self = @This();
+
+    /// Statistics for DRC cache performance
+    pub const DrcCacheStats = struct {
+        hits: u64 = 0,
+        misses: u64 = 0,
+        invalidations: u64 = 0,
+    };
 
     const CachedSyntaxTokens = struct {
         tokens: []SyntaxToken,
@@ -251,6 +282,9 @@ pub const TransAmDatabase = struct {
             // Interned layer
             .symbol_interner = StringInterner.init(allocator),
             .macro_call_interner = MacroCallInterner.init(allocator),
+            // Module dependency graph
+            .module_imports = std.StringHashMap(std.ArrayList([]const u8)).init(allocator),
+            .module_importers = std.StringHashMap(std.ArrayList([]const u8)).init(allocator),
             // Invalidation tracking
             .dirty_files = std.AutoHashMap(u64, void).init(allocator),
             .cancel_flag = cancel_flag,
@@ -271,6 +305,8 @@ pub const TransAmDatabase = struct {
             // Phase 9: Type Checker Integration
             .symbols_cache = std.AutoHashMap(u64, CachedSymbolTable).init(allocator),
             .function_check_cache = std.AutoHashMap(u64, CachedFunctionCheck).init(allocator),
+            // Phase 10: DRC Diagnostics Cache
+            .drc_diagnostics_cache = std.AutoHashMap(u64, CachedDrcDiagnostics).init(allocator),
         };
     }
 
@@ -305,6 +341,19 @@ pub const TransAmDatabase = struct {
         self.ir_cache.deinit();
         self.symbol_interner.deinit();
         self.macro_call_interner.deinit();
+
+        // Clean up module dependency graph
+        var mi_it = self.module_imports.valueIterator();
+        while (mi_it.next()) |list| {
+            list.deinit();
+        }
+        self.module_imports.deinit();
+        var mir_it = self.module_importers.valueIterator();
+        while (mir_it.next()) |list| {
+            list.deinit();
+        }
+        self.module_importers.deinit();
+
         self.dirty_files.deinit();
 
         // Phase 4: Clean up parallel highlighting state
@@ -385,11 +434,144 @@ pub const TransAmDatabase = struct {
             self.allocator.free(cached.func_name);
         }
         self.function_check_cache.deinit();
+
+        // Phase 10: Clean up DRC diagnostics cache
+        var drc_it = self.drc_diagnostics_cache.valueIterator();
+        while (drc_it.next()) |cached| {
+            // Don't free empty static slices
+            if (cached.diagnostics.len > 0) {
+                for (cached.diagnostics) |diag| {
+                    self.allocator.free(diag.message);
+                }
+                self.allocator.free(cached.diagnostics);
+            }
+        }
+        self.drc_diagnostics_cache.deinit();
     }
 
     /// Get the current revision
     pub fn getRevision(self: *Self) Revision {
         return self.current_revision;
+    }
+
+    // ===== MODULE DEPENDENCY TRACKING =====
+
+    /// Record that file_id imports imported_file
+    /// This builds the dependency graph for incremental invalidation
+    pub fn recordModuleImport(self: *Self, file_id: []const u8, imported_file: []const u8) !void {
+        // Add to forward map: file_id -> [imported_file, ...]
+        const imports_result = try self.module_imports.getOrPut(file_id);
+        if (!imports_result.found_existing) {
+            imports_result.value_ptr.* = std.ArrayList([]const u8).init(self.allocator);
+        }
+        // Check for duplicates before adding
+        for (imports_result.value_ptr.items) |existing| {
+            if (std.mem.eql(u8, existing, imported_file)) {
+                return; // Already recorded
+            }
+        }
+        try imports_result.value_ptr.append(imported_file);
+
+        // Add to reverse map: imported_file -> [file_id, ...]
+        const importers_result = try self.module_importers.getOrPut(imported_file);
+        if (!importers_result.found_existing) {
+            importers_result.value_ptr.* = std.ArrayList([]const u8).init(self.allocator);
+        }
+        // Check for duplicates
+        for (importers_result.value_ptr.items) |existing| {
+            if (std.mem.eql(u8, existing, file_id)) {
+                return; // Already recorded
+            }
+        }
+        try importers_result.value_ptr.append(file_id);
+    }
+
+    /// Get all files that import the given file (for invalidation propagation)
+    /// Returns null if no files import this module
+    pub fn getModuleImporters(self: *Self, file_id: []const u8) ?[]const []const u8 {
+        if (self.module_importers.get(file_id)) |list| {
+            if (list.items.len > 0) {
+                return list.items;
+            }
+        }
+        return null;
+    }
+
+    /// Get all files that the given file imports
+    /// Returns null if this file doesn't import any modules
+    pub fn getModuleImports(self: *Self, file_id: []const u8) ?[]const []const u8 {
+        if (self.module_imports.get(file_id)) |list| {
+            if (list.items.len > 0) {
+                return list.items;
+            }
+        }
+        return null;
+    }
+
+    /// Clear imports for a file (call before re-parsing to update the dependency graph)
+    /// This ensures the graph stays accurate when files are modified
+    pub fn clearModuleImports(self: *Self, file_id: []const u8) void {
+        // Get the files this module imports (need mutable pointer to clear it)
+        if (self.module_imports.getPtr(file_id)) |imports_list| {
+            // Remove this file from the importers list of each imported file
+            for (imports_list.items) |imported| {
+                if (self.module_importers.getPtr(imported)) |importers_list| {
+                    // Find and remove file_id from the importers list
+                    var i: usize = 0;
+                    while (i < importers_list.items.len) {
+                        if (std.mem.eql(u8, importers_list.items[i], file_id)) {
+                            _ = importers_list.swapRemove(i);
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            // Clear the imports list (but keep the ArrayList allocated)
+            imports_list.clearRetainingCapacity();
+        }
+    }
+
+    /// Invalidate all files that depend on the given file (transitive)
+    /// Returns the count of files invalidated
+    pub fn invalidateDependents(self: *Self, file_id: []const u8) !usize {
+        var invalidated: usize = 0;
+        var to_process = std.ArrayList([]const u8).init(self.allocator);
+        defer to_process.deinit();
+
+        try to_process.append(file_id);
+
+        // Track visited to avoid cycles
+        var visited = std.StringHashMap(void).init(self.allocator);
+        defer visited.deinit();
+        try visited.put(file_id, {});
+
+        while (to_process.items.len > 0) {
+            const current = to_process.pop().?;
+
+            // Get all files that import the current file
+            if (self.getModuleImporters(current)) |importers| {
+                for (importers) |importer| {
+                    if (!visited.contains(importer)) {
+                        try visited.put(importer, {});
+                        try to_process.append(importer);
+
+                        // Mark this file as dirty
+                        const importer_hash = hashString(importer);
+                        try self.dirty_files.put(importer_hash, {});
+
+                        // CRITICAL: Also invalidate symbol cache for dependent files
+                        // Without this, dependents return stale cached symbols even though
+                        // their imports changed. This ensures type checking is re-run.
+                        self.invalidateSymbolCache(importer);
+
+                        invalidated += 1;
+                    }
+                }
+            }
+        }
+
+        return invalidated;
     }
 
     // ===== INPUT QUERIES (never cached, set by LSP) =====
@@ -420,10 +602,16 @@ pub const TransAmDatabase = struct {
             }
         }
 
-        // Store new text
+        // Store new text (with proper error cleanup)
         const owned_text = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(owned_text);
+
         const owned_id = try self.allocator.dupe(u8, file_id);
+        errdefer self.allocator.free(owned_id);
+
         try self.file_texts.put(owned_id, owned_text);
+        errdefer _ = self.file_texts.remove(owned_id);
+
         try self.file_hashes.put(owned_id, new_hash);
 
         // Mark file as dirty
@@ -578,6 +766,7 @@ pub const TransAmDatabase = struct {
     ) !void {
         // Copy dependencies to owned memory
         const owned_deps = try self.allocator.dupe(QueryKey, dependencies);
+        errdefer self.allocator.free(owned_deps);
 
         const query_value = QueryValue{
             .value = value,
@@ -947,6 +1136,169 @@ pub const TransAmDatabase = struct {
         return symbols.lookupAtPosition(name, line, column);
     }
 
+    /// Run DRC (Deterministic Reference Counting) analysis and return diagnostics
+    /// This surfaces memory management issues like use-after-move and potential cycles
+    /// for LSP integration (warnings/hints in the editor).
+    pub fn getDrcDiagnostics(self: *Self, file_id: []const u8) ![]const DrcDiagnostic {
+        try self.checkCancellation();
+
+        // Check cache first (use optional properly, not sentinel value)
+        const maybe_file_hash = self.file_hashes.get(file_id);
+        if (maybe_file_hash) |file_hash| {
+            if (self.drc_diagnostics_cache.get(file_hash)) |cached| {
+                // Cache hit
+                self.drc_cache_stats.hits += 1;
+
+                // Return copy of cached diagnostics
+                if (cached.diagnostics.len == 0) {
+                    return &[_]DrcDiagnostic{};
+                }
+                return self.copyDrcDiagnostics(cached.diagnostics);
+            }
+        }
+
+        // Cache miss - compute DRC diagnostics
+        self.drc_cache_stats.misses += 1;
+
+        // Get the parsed AST
+        const parse_result = try self.parse(file_id);
+        if (parse_result.errors.len > 0) {
+            // Don't run DRC on files with parse errors
+            return &[_]DrcDiagnostic{};
+        }
+
+        // Run DRC analysis
+        var drc = Drc.init(self.allocator);
+        defer drc.deinit();
+
+        var analyzer = DrcAnalyzer.init(&drc);
+        analyzer.analyze(parse_result.tree) catch {
+            // DRC analysis failed (probably due to AST structure issues)
+            return &[_]DrcDiagnostic{};
+        };
+
+        try drc.finalize();
+
+        // Handle empty result
+        const source_diags = drc.getDiagnostics();
+        if (source_diags.len == 0) {
+            // Cache empty result if we have a file hash
+            if (maybe_file_hash) |file_hash| {
+                try self.drc_diagnostics_cache.put(file_hash, .{
+                    .diagnostics = &[_]DrcDiagnostic{},
+                    .file_hash = file_hash,
+                    .computed_at = std.time.milliTimestamp(),
+                });
+            }
+            return &[_]DrcDiagnostic{};
+        }
+
+        // Allocate and copy diagnostics for cache (with proper error cleanup)
+        const cache_diags = try self.copyDrcDiagnostics(source_diags);
+
+        // Store in cache if we have a file hash
+        if (maybe_file_hash) |file_hash| {
+            // errdefer: if put fails, we still own cache_diags and must free it
+            errdefer self.freeDrcDiagnostics(cache_diags);
+
+            try self.drc_diagnostics_cache.put(file_hash, .{
+                .diagnostics = cache_diags,
+                .file_hash = file_hash,
+                .computed_at = std.time.milliTimestamp(),
+            });
+            // Return another copy for caller (cache owns cache_diags)
+            return self.copyDrcDiagnostics(cache_diags);
+        } else {
+            // No caching possible, return the copy directly
+            return cache_diags;
+        }
+    }
+
+    /// Helper: Copy DRC diagnostics array with proper error cleanup
+    /// Caller owns the returned slice and must call freeDrcDiagnostics
+    fn copyDrcDiagnostics(self: *Self, source: []const DrcDiagnostic) ![]DrcDiagnostic {
+        const result = try self.allocator.alloc(DrcDiagnostic, source.len);
+        var initialized: usize = 0;
+
+        errdefer {
+            // Clean up partially initialized diagnostics on error
+            for (result[0..initialized]) |diag| {
+                self.allocator.free(diag.message);
+            }
+            self.allocator.free(result);
+        }
+
+        for (source, 0..) |diag, i| {
+            result[i] = .{
+                .line = diag.line,
+                .column = diag.column,
+                .end_line = diag.end_line,
+                .end_column = diag.end_column,
+                .severity = diag.severity,
+                .message = try self.allocator.dupe(u8, diag.message),
+                .code = diag.code,
+            };
+            initialized = i + 1;
+        }
+
+        return result;
+    }
+
+    /// Free DRC diagnostics returned by getDrcDiagnostics
+    /// Takes ownership and deallocates - caller must not use diags after this call.
+    /// Note: getDrcDiagnostics may return a static empty slice, so we must check length.
+    /// The const parameter is intentional: we're deallocating, not modifying contents.
+    pub fn freeDrcDiagnostics(self: *Self, diags: []const DrcDiagnostic) void {
+        // Don't try to free empty slices - they may be static constants
+        if (diags.len == 0) return;
+
+        for (diags) |diag| {
+            self.allocator.free(diag.message);
+        }
+        self.allocator.free(diags);
+    }
+
+    /// Variable ownership information for hover display
+    pub const VariableOwnership = struct {
+        ownership_state: DrcVariable.OwnershipState,
+        needs_rc: bool,
+        is_parameter: bool,
+        is_module_level: bool,
+    };
+
+    /// Get variable ownership information for hover display
+    /// Runs DRC analysis on-demand if not cached
+    pub fn getVariableOwnership(self: *Self, file_id: []const u8, var_name: []const u8) !?VariableOwnership {
+        try self.checkCancellation();
+
+        // Get the parsed AST
+        const parse_result = try self.parse(file_id);
+        if (parse_result.errors.len > 0) {
+            return null;
+        }
+
+        // Run DRC analysis
+        var drc = Drc.init(self.allocator);
+        defer drc.deinit();
+
+        var analyzer = DrcAnalyzer.init(&drc);
+        analyzer.analyze(parse_result.tree) catch {
+            return null;
+        };
+
+        try drc.finalize();
+
+        // Look up the variable
+        const variable = drc.variables.get(var_name) orelse return null;
+
+        return VariableOwnership{
+            .ownership_state = variable.ownership_state,
+            .needs_rc = variable.needs_rc,
+            .is_parameter = variable.is_parameter,
+            .is_module_level = variable.is_module_level,
+        };
+    }
+
     /// Invalidate type checker cache for a file (called when file changes)
     pub fn invalidateSymbolCache(self: *Self, file_id: []const u8) void {
         const file_hash = self.file_hashes.get(file_id) orelse return;
@@ -974,6 +1326,18 @@ pub const TransAmDatabase = struct {
                 self.allocator.free(removed.value.func_name);
             }
         }
+
+        // Also invalidate DRC diagnostics cache for this file
+        if (self.drc_diagnostics_cache.fetchRemove(file_hash)) |removed| {
+            self.drc_cache_stats.invalidations += 1;
+            // Free cached diagnostic messages (but not empty static slices)
+            if (removed.value.diagnostics.len > 0) {
+                for (removed.value.diagnostics) |diag| {
+                    self.allocator.free(diag.message);
+                }
+                self.allocator.free(removed.value.diagnostics);
+            }
+        }
     }
 
     // ===== PHASE 4: PARALLEL HIGHLIGHTING API =====
@@ -999,9 +1363,12 @@ pub const TransAmDatabase = struct {
         const text = self.getFileText(file_id) orelse return error.FileNotFound;
         const tokens = try self.generateSyntaxTokens(text);
 
-        // Update cache
+        // Update cache (with proper error cleanup)
+        const duped_tokens = try self.allocator.dupe(SyntaxToken, tokens);
+        errdefer self.allocator.free(duped_tokens);
+
         const cached_tokens = CachedSyntaxTokens{
-            .tokens = try self.allocator.dupe(SyntaxToken, tokens),
+            .tokens = duped_tokens,
             .file_hash = file_hash,
             .computed_at = std.time.milliTimestamp(),
         };
@@ -1013,6 +1380,8 @@ pub const TransAmDatabase = struct {
         }
 
         const owned_key = try self.allocator.dupe(u8, file_id);
+        errdefer self.allocator.free(owned_key);
+
         try self.syntax_token_cache.put(owned_key, cached_tokens);
 
         return tokens;
@@ -1147,6 +1516,8 @@ pub const TransAmDatabase = struct {
 
             // Create task entry
             owned_file_id = try self.allocator.dupe(u8, file_id);
+            errdefer self.allocator.free(owned_file_id);
+
             const task = AsyncExpansionTask{
                 .handle = handle,
                 .file_id = owned_file_id,
@@ -1477,6 +1848,8 @@ pub const TransAmDatabase = struct {
             self.allocator.free(old.key);
         }
         const owned_key = try self.allocator.dupe(u8, file_id);
+        errdefer self.allocator.free(owned_key);
+
         try self.semantic_token_versions.put(owned_key, version);
 
         return .{
@@ -1555,9 +1928,12 @@ pub const TransAmDatabase = struct {
         // Phase 6: Now uses generateDiagnosticsForFile which leverages the parsed AST
         const diagnostics = try self.generateDiagnosticsForFile(file_id);
 
-        // Update cache
+        // Update cache (with proper error cleanup)
+        const duped_diags = try self.dupeDiagnostics(diagnostics);
+        errdefer self.freeDiagnostics(duped_diags);
+
         const cached_diags = CachedDiagnostics{
-            .diagnostics = try self.dupeDiagnostics(diagnostics),
+            .diagnostics = duped_diags,
             .file_hash = file_hash,
             .computed_at = std.time.milliTimestamp(),
         };
@@ -1572,6 +1948,8 @@ pub const TransAmDatabase = struct {
         }
 
         const owned_key = try self.allocator.dupe(u8, file_id);
+        errdefer self.allocator.free(owned_key);
+
         try self.diagnostics_cache.put(owned_key, cached_diags);
 
         return diagnostics;
@@ -1603,13 +1981,16 @@ pub const TransAmDatabase = struct {
 
         // Convert lexer errors to diagnostics
         for (lexer.errors.items) |err| {
+            const message = try self.allocator.dupe(u8, err.message);
+            errdefer self.allocator.free(message);
+
             const diag = Diagnostic{
                 .start_line = if (err.loc.start.line > 0) err.loc.start.line - 1 else 0,
                 .start_col = err.loc.start.column,
                 .end_line = if (err.loc.end.line > 0) err.loc.end.line - 1 else 0,
                 .end_col = err.loc.end.column,
                 .severity = .@"error",
-                .message = try self.allocator.dupe(u8, err.message),
+                .message = message,
                 .source = "mls-lexer",
             };
             try diagnostics.append(diag);
@@ -1627,13 +2008,16 @@ pub const TransAmDatabase = struct {
         // Parse the file - this gives us both the AST and parse errors
         const parse_result = self.parse(file_id) catch |err| {
             // If parsing completely fails, return a single error diagnostic
+            const message = try self.allocator.dupe(u8, @errorName(err));
+            errdefer self.allocator.free(message);
+
             const diag = Diagnostic{
                 .start_line = 0,
                 .start_col = 0,
                 .end_line = 0,
                 .end_col = 0,
                 .severity = .@"error",
-                .message = try self.allocator.dupe(u8, @errorName(err)),
+                .message = message,
                 .source = "mls-parser",
             };
             try diagnostics.append(diag);
@@ -1642,13 +2026,16 @@ pub const TransAmDatabase = struct {
 
         // Convert parse errors to diagnostics
         for (parse_result.errors) |err| {
+            const message = try self.allocator.dupe(u8, err.message);
+            errdefer self.allocator.free(message);
+
             const diag = Diagnostic{
                 .start_line = if (err.location.start.line > 0) err.location.start.line - 1 else 0,
                 .start_col = err.location.start.column,
                 .end_line = if (err.location.end.line > 0) err.location.end.line - 1 else 0,
                 .end_col = err.location.end.column,
                 .severity = .@"error",
-                .message = try self.allocator.dupe(u8, err.message),
+                .message = message,
                 .source = "mls-parser",
             };
             try diagnostics.append(diag);
@@ -1908,6 +2295,18 @@ pub const TransAmDatabase = struct {
     /// Get macro cache hit rate
     pub fn getMacroCacheHitRate(self: *Self) f64 {
         return self.macro_output_cache.hitRate();
+    }
+
+    /// Get DRC diagnostics cache statistics
+    pub fn getDrcCacheStats(self: *Self) DrcCacheStats {
+        return self.drc_cache_stats;
+    }
+
+    /// Get DRC cache hit rate (0.0 to 1.0)
+    pub fn getDrcCacheHitRate(self: *Self) f64 {
+        const total = self.drc_cache_stats.hits + self.drc_cache_stats.misses;
+        if (total == 0) return 0.0;
+        return @as(f64, @floatFromInt(self.drc_cache_stats.hits)) / @as(f64, @floatFromInt(total));
     }
 
     // ===== PHASE 7: MACRO FIREWALL - ACTUAL EXPANSION =====
@@ -2248,8 +2647,12 @@ pub const TransAmDatabase = struct {
                     if (kind) |k| {
                         if (!seen.contains(tok.text)) {
                             try seen.put(tok.text, {});
+
+                            const label = try self.allocator.dupe(u8, tok.text);
+                            errdefer self.allocator.free(label);
+
                             try items.append(.{
-                                .label = try self.allocator.dupe(u8, tok.text),
+                                .label = label,
                                 .kind = k,
                                 .detail = null,
                             });

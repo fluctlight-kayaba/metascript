@@ -4,6 +4,7 @@
 const std = @import("std");
 const ast = @import("../ast/ast.zig");
 const checker = @import("../checker/typechecker.zig");
+const drc_mod = @import("../analysis/drc.zig");
 
 // ===== REVISION TRACKING =====
 
@@ -394,6 +395,13 @@ pub const CachedFunctionCheck = struct {
     result: TypeCheckResult,
     file_hash: u64,
     func_name: []const u8,
+    computed_at: i64,
+};
+
+/// Cached DRC analysis results for a file
+pub const CachedDrcDiagnostics = struct {
+    diagnostics: []drc_mod.DrcDiagnostic,
+    file_hash: u64,
     computed_at: i64,
 };
 

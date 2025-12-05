@@ -19,6 +19,7 @@ const Parser = @import("../parser/parser.zig").Parser;
 const disk_cache = @import("../transam/disk_cache.zig");
 const network_cache = @import("../transam/network_cache.zig");
 const bytecode_compiler = @import("../vm/bytecode_compiler.zig");
+const module_loader = @import("../module/loader.zig");
 
 /// Error set for macro expansion
 pub const MacroError = error{
@@ -167,9 +168,24 @@ pub const VMMacroContext = struct {
 /// VM-based Macro Expander - executes JavaScript macros via Hermes
 pub const VMMacroExpander = struct {
     ctx: *VMMacroContext,
+    loader: ?*module_loader.ModuleLoader = null,
+    current_file: ?[]const u8 = null,
 
     pub fn init(ctx: *VMMacroContext) VMMacroExpander {
-        return .{ .ctx = ctx };
+        return .{ .ctx = ctx, .loader = null, .current_file = null };
+    }
+
+    /// Initialize with ModuleLoader for better import resolution
+    pub fn initWithLoader(
+        ctx: *VMMacroContext,
+        loader_ptr: *module_loader.ModuleLoader,
+        file_path: []const u8,
+    ) VMMacroExpander {
+        return .{
+            .ctx = ctx,
+            .loader = loader_ptr,
+            .current_file = file_path,
+        };
     }
 
     /// Expand all macros in the AST using Hermes VM
@@ -238,6 +254,18 @@ pub const VMMacroExpander = struct {
 
     /// Resolve an import path like "std/macros/derive" to a file path
     fn resolveImportPath(self: *VMMacroExpander, source: []const u8) !?[]const u8 {
+        // If ModuleLoader is available, use its resolver for consistent resolution
+        if (self.loader) |loader_ptr| {
+            if (self.current_file) |from_path| {
+                const resolved = loader_ptr.resolver.resolve(source, from_path) catch null;
+                if (resolved) |path| {
+                    return path;
+                }
+            }
+        }
+
+        // Fallback: manual resolution when no ModuleLoader
+
         // Try source as-is first (if it ends with .ms)
         if (std.mem.endsWith(u8, source, ".ms")) {
             if (std.fs.cwd().access(source, .{})) |_| {
@@ -435,6 +463,39 @@ pub fn expandAllMacrosWithCaches(
     defer ctx.deinit();
 
     var exp = VMMacroExpander.init(&ctx);
+    return try exp.expandProgram(program);
+}
+
+/// Expand all macros using ModuleLoader for proper import resolution
+/// This enables correct resolution of cross-module macro imports
+pub fn expandAllMacrosWithLoader(
+    arena: *ast.ASTArena,
+    allocator: std.mem.Allocator,
+    program: *ast.Node,
+    loader: *module_loader.ModuleLoader,
+    file_path: []const u8,
+) !*ast.Node {
+    var ctx = try VMMacroContext.init(arena, allocator);
+    defer ctx.deinit();
+
+    var exp = VMMacroExpander.initWithLoader(&ctx, loader, file_path);
+    return try exp.expandProgram(program);
+}
+
+/// Expand macros with ModuleLoader and all caches
+pub fn expandAllMacrosWithLoaderAndCaches(
+    arena: *ast.ASTArena,
+    allocator: std.mem.Allocator,
+    program: *ast.Node,
+    loader: *module_loader.ModuleLoader,
+    file_path: []const u8,
+    bytecode_cache_ptr: ?*disk_cache.BytecodeCache,
+    net_cache_ptr: ?*network_cache.NetworkCache,
+) !*ast.Node {
+    var ctx = try VMMacroContext.initWithCaches(arena, allocator, bytecode_cache_ptr, net_cache_ptr);
+    defer ctx.deinit();
+
+    var exp = VMMacroExpander.initWithLoader(&ctx, loader, file_path);
     return try exp.expandProgram(program);
 }
 

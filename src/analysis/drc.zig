@@ -34,7 +34,6 @@
 
 const std = @import("std");
 const ownership = @import("ownership.zig");
-const rc_annotation = @import("rc_annotation.zig");
 const cycle_detection = @import("cycle_detection.zig");
 
 // ============================================================================
@@ -145,6 +144,30 @@ pub const Stats = struct {
     }
 };
 
+/// DRC Diagnostic for LSP integration
+pub const DrcDiagnostic = struct {
+    line: u32,
+    column: u32,
+    end_line: u32,
+    end_column: u32,
+    severity: Severity,
+    message: []const u8,
+    code: Code,
+
+    pub const Severity = enum {
+        @"error",
+        warning,
+        hint,
+    };
+
+    pub const Code = enum {
+        use_after_move,
+        potential_cycle,
+        uninitialized_use,
+        double_free_risk,
+    };
+};
+
 /// RC Operation with full context for codegen
 pub const RcOp = struct {
     /// The operation type
@@ -178,6 +201,10 @@ pub const RcOp = struct {
 
         /// RC -= 1, check for cycle root if non-zero
         decref_cycle_check,
+
+        /// Decref for reassignment - must save old value first, then assign, then decref
+        /// This prevents use-after-free when RHS references LHS (e.g., obj = obj.clone())
+        decref_reassign,
 
         /// Transfer ownership (no RC change)
         move,
@@ -222,6 +249,13 @@ pub const Variable = struct {
     /// Is this a parameter (borrowed by default)?
     is_parameter: bool = false,
 
+    /// Is this a module-level (global) variable?
+    /// Module-level variables have static lifetime and are never freed.
+    is_module_level: bool = false,
+
+    /// Has this variable been initialized (assigned a value)?
+    initialized: bool = false,
+
     /// Current ownership state
     ownership_state: OwnershipState = .owned,
 
@@ -234,17 +268,27 @@ pub const Variable = struct {
 };
 
 /// The main DRC orchestrator
+///
+/// Architecture:
+/// - `ownership_analyzer`: Computes semantic ownership (wants/provides) for last-use detection
+/// - `cycle_detector`: Tracks potential cycle roots for Bacon-Rajan collection
+/// - `variables`: Runtime state tracking (owned→moved→borrowed transitions)
+/// - `operations`: Final RC operations for codegen
+///
+/// Note on ownership concepts:
+/// - `ownership.Ownership` = semantic ownership (who should own the value)
+/// - `Variable.OwnershipState` = runtime state (has ownership been transferred?)
+/// These are complementary: semantic ownership guides decisions, state tracks execution.
 pub const Drc = struct {
     allocator: std.mem.Allocator,
     config: Config,
 
-    /// Ownership analyzer
+    /// Ownership analyzer - computes semantic ownership for Lobster-style last-use optimization.
+    /// Used for: isLastUse(), escapesScope(), computeOwnership()
     ownership_analyzer: ownership.OwnershipAnalyzer,
 
-    /// RC annotator
-    annotator: rc_annotation.RcAnnotator,
-
-    /// Cycle detector
+    /// Cycle detector - tracks potential cycle roots for deferred collection.
+    /// Used when decref leaves RC > 0 (potential cycle member).
     cycle_detector: cycle_detection.CycleDetector,
 
     /// All generated operations (sorted by line)
@@ -269,8 +313,18 @@ pub const Drc = struct {
     /// Current line being processed (for error messages)
     current_line: u32 = 0,
 
+    /// Loop scope stack - tracks scope depths where loops start
+    /// Used for break/continue to know which scopes to clean up
+    loop_scope_stack: std.ArrayList(u32),
+
     /// Statistics
     stats: Stats,
+
+    /// Diagnostics for LSP integration (use-after-move, cycle candidates, etc.)
+    diagnostics: std.ArrayList(DrcDiagnostic),
+
+    /// Counter for generating unique temporary names (instance-level, not global)
+    temp_counter: u32 = 0,
 
     /// A temporary value from a call expression that needs cleanup
     pub const Temporary = struct {
@@ -288,17 +342,22 @@ pub const Drc = struct {
         depth: u32,
         variables: std.ArrayList([]const u8),
         start_line: u32,
+        /// Variables from outer scopes that were shadowed by this scope.
+        /// These are restored when this scope exits.
+        shadowed_variables: std.StringHashMap(Variable),
 
         pub fn init(allocator: std.mem.Allocator, depth: u32, start_line: u32) Scope {
             return .{
                 .depth = depth,
                 .variables = std.ArrayList([]const u8).init(allocator),
                 .start_line = start_line,
+                .shadowed_variables = std.StringHashMap(Variable).init(allocator),
             };
         }
 
         pub fn deinit(self: *Scope) void {
             self.variables.deinit();
+            self.shadowed_variables.deinit();
         }
     };
 
@@ -311,7 +370,6 @@ pub const Drc = struct {
             .allocator = allocator,
             .config = config,
             .ownership_analyzer = ownership.OwnershipAnalyzer.init(allocator),
-            .annotator = rc_annotation.RcAnnotator.init(allocator),
             .cycle_detector = cycle_detection.CycleDetector.init(allocator),
             .operations = std.ArrayList(RcOp).init(allocator),
             .ops_by_line = std.AutoHashMap(u32, std.ArrayList(RcOp)).init(allocator),
@@ -319,13 +377,14 @@ pub const Drc = struct {
             .scope_stack = std.ArrayList(Scope).init(allocator),
             .borrow_stack = std.ArrayList(BorrowEntry).init(allocator),
             .statement_temporaries = std.ArrayList(Temporary).init(allocator),
+            .loop_scope_stack = std.ArrayList(u32).init(allocator),
             .stats = .{},
+            .diagnostics = std.ArrayList(DrcDiagnostic).init(allocator),
         };
     }
 
     pub fn deinit(self: *Drc) void {
         self.ownership_analyzer.deinit();
-        self.annotator.deinit();
         self.cycle_detector.deinit();
         self.operations.deinit();
 
@@ -342,7 +401,19 @@ pub const Drc = struct {
         }
         self.scope_stack.deinit();
         self.borrow_stack.deinit();
+
+        // Free temporary names (allocated via allocPrint in registerTemporary)
+        for (self.statement_temporaries.items) |temp| {
+            self.allocator.free(temp.name);
+        }
         self.statement_temporaries.deinit();
+        self.loop_scope_stack.deinit();
+
+        // Free diagnostic messages (allocated via allocPrint in emitUseAfterMove/emitPotentialCycle)
+        for (self.diagnostics.items) |diag| {
+            self.allocator.free(diag.message);
+        }
+        self.diagnostics.deinit();
     }
 
     // ========================================================================
@@ -374,8 +445,12 @@ pub const Drc = struct {
 
             for (scope.variables.items) |var_name| {
                 if (self.variables.get(var_name)) |v| {
-                    // Only decref if we still own it and it needs RC
-                    if (v.needs_rc and v.ownership_state == .owned and !v.escaped) {
+                    // Only decref if:
+                    // - It needs RC management
+                    // - We still own it (not moved/borrowed)
+                    // - It hasn't escaped
+                    // - It's NOT a module-level variable (static lifetime, never freed)
+                    if (v.needs_rc and v.ownership_state == .owned and !v.escaped and !v.is_module_level) {
                         try self.addOp(.{
                             .kind = if (self.config.enable_cycle_detection) .decref_cycle_check else .decref,
                             .target = var_name,
@@ -397,6 +472,13 @@ pub const Drc = struct {
                 .position = .before,
                 .reason = .scope_exit,
             });
+        }
+
+        // Restore any variables that were shadowed by this scope.
+        // This ensures outer scope variables are visible again after inner scope exits.
+        var iter = scope.shadowed_variables.iterator();
+        while (iter.next()) |entry| {
+            try self.variables.put(entry.key_ptr.*, entry.value_ptr.*);
         }
     }
 
@@ -426,7 +508,7 @@ pub const Drc = struct {
                     if (std.mem.eql(u8, var_name, ret_var)) continue;
                 }
 
-                if (self.variables.get(var_name)) |v| {
+                if (self.variables.getPtr(var_name)) |vptr| {
                     // Only decref non-parameter variables that need RC
                     // NOTE: We ONLY check is_parameter here, NOT ownership_state or escaped.
                     // - Parameters are borrowed (caller owns them) - never decref
@@ -434,7 +516,7 @@ pub const Drc = struct {
                     // - ownership_state might be .moved from a DIFFERENT branch
                     // - escaped might be true from a DIFFERENT branch where this var was returned
                     // Each return statement must independently clean up all vars it doesn't return.
-                    if (v.needs_rc and !v.is_parameter) {
+                    if (vptr.needs_rc and !vptr.is_parameter) {
                         try self.addOp(.{
                             .kind = if (self.config.enable_cycle_detection) .decref_cycle_check else .decref,
                             .target = var_name,
@@ -445,6 +527,97 @@ pub const Drc = struct {
                             .comment = if (self.config.debug_mode) "// DRC: early return cleanup" else null,
                         });
                         self.stats.decrefs += 1;
+
+                        // Mark as moved so exitScope doesn't emit duplicate decref
+                        // This is safe because return statements fully handle cleanup
+                        vptr.ownership_state = .moved;
+                    }
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // Loop Control Flow (break/continue)
+    // ========================================================================
+
+    /// Enter a loop context - records current scope depth for break/continue cleanup
+    pub fn enterLoop(self: *Drc) !void {
+        const current_depth: u32 = @intCast(self.scope_stack.items.len);
+        try self.loop_scope_stack.append(current_depth);
+    }
+
+    /// Exit a loop context
+    pub fn exitLoop(self: *Drc) void {
+        _ = self.loop_scope_stack.pop();
+    }
+
+    /// Emit cleanup for break statement
+    /// Cleans up variables from current scope down to (but not including) the loop scope
+    pub fn emitBreakCleanup(self: *Drc, line: u32, column: u32) !void {
+        if (self.loop_scope_stack.items.len == 0) return; // Not in a loop
+
+        const loop_scope_depth = self.loop_scope_stack.items[self.loop_scope_stack.items.len - 1];
+        const current_depth = self.scope_stack.items.len;
+
+        // Clean up scopes from current down to loop scope (exclusive)
+        // Iterate in reverse (innermost first)
+        var i: usize = current_depth;
+        while (i > loop_scope_depth) {
+            i -= 1;
+            const scope = self.scope_stack.items[i];
+            for (scope.variables.items) |var_name| {
+                if (self.variables.getPtr(var_name)) |vptr| {
+                    // Only decref if we still own it (not already moved/returned)
+                    if (vptr.needs_rc and !vptr.is_parameter and vptr.ownership_state == .owned) {
+                        try self.addOp(.{
+                            .kind = if (self.config.enable_cycle_detection) .decref_cycle_check else .decref,
+                            .target = var_name,
+                            .line = line,
+                            .column = column,
+                            .position = .before,
+                            .reason = .scope_exit,
+                            .comment = if (self.config.debug_mode) "// DRC: break cleanup" else null,
+                        });
+                        self.stats.decrefs += 1;
+                        // Mark as moved to prevent duplicate cleanup at scope exit
+                        vptr.ownership_state = .moved;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Emit cleanup for continue statement
+    /// Similar to break but only cleans the current iteration's scope
+    pub fn emitContinueCleanup(self: *Drc, line: u32, column: u32) !void {
+        if (self.loop_scope_stack.items.len == 0) return; // Not in a loop
+
+        const loop_scope_depth = self.loop_scope_stack.items[self.loop_scope_stack.items.len - 1];
+        const current_depth = self.scope_stack.items.len;
+
+        // Clean up scopes from current down to loop scope (exclusive)
+        // Same as break - both exit to loop header
+        var i: usize = current_depth;
+        while (i > loop_scope_depth) {
+            i -= 1;
+            const scope = self.scope_stack.items[i];
+            for (scope.variables.items) |var_name| {
+                if (self.variables.getPtr(var_name)) |vptr| {
+                    // Only decref if we still own it (not already moved/returned)
+                    if (vptr.needs_rc and !vptr.is_parameter and vptr.ownership_state == .owned) {
+                        try self.addOp(.{
+                            .kind = if (self.config.enable_cycle_detection) .decref_cycle_check else .decref,
+                            .target = var_name,
+                            .line = line,
+                            .column = column,
+                            .position = .before,
+                            .reason = .scope_exit,
+                            .comment = if (self.config.debug_mode) "// DRC: continue cleanup" else null,
+                        });
+                        self.stats.decrefs += 1;
+                        // Mark as moved to prevent duplicate cleanup at scope exit
+                        vptr.ownership_state = .moved;
                     }
                 }
             }
@@ -455,14 +628,11 @@ pub const Drc = struct {
     // Statement Temporary Management (for nested calls)
     // ========================================================================
 
-    /// Counter for generating unique temporary names
-    var temp_counter: u32 = 0;
-
     /// Register a temporary from a nested call expression
     /// Returns the temporary name for codegen to use
     pub fn registerTemporary(self: *Drc, line: u32, column: u32) ![]const u8 {
-        const name = try std.fmt.allocPrint(self.allocator, "_tmp_{d}", .{temp_counter});
-        temp_counter += 1;
+        const name = try std.fmt.allocPrint(self.allocator, "_tmp_{d}", .{self.temp_counter});
+        self.temp_counter += 1;
 
         try self.statement_temporaries.append(.{
             .name = name,
@@ -500,6 +670,8 @@ pub const Drc = struct {
                 });
                 self.stats.decrefs += 1;
             }
+            // Free the allocated temp name (allocated in registerTemporary via allocPrint)
+            self.allocator.free(temp.name);
         }
         self.statement_temporaries.clearRetainingCapacity();
     }
@@ -522,16 +694,36 @@ pub const Drc = struct {
         column: u32,
         is_parameter: bool,
     ) !void {
-        const needs_rc = type_kind != .value;
+        const needs_rc = type_kind.needsRc();
+        const current_scope_depth: u32 = @intCast(self.scope_stack.items.len);
+
+        // Check if a variable with this name exists in an outer scope.
+        // If so, save it to the current scope's shadowed_variables so we can
+        // restore it when this scope exits.
+        if (self.variables.get(name)) |existing| {
+            // Only save if it's from an outer scope (lower depth)
+            if (existing.scope_depth < current_scope_depth) {
+                if (self.scope_stack.items.len > 0) {
+                    const current = &self.scope_stack.items[self.scope_stack.items.len - 1];
+                    try current.shadowed_variables.put(name, existing);
+                }
+            }
+        }
+
+        // Module-level variables are at scope depth 1 (the global scope)
+        // They have static lifetime and should never be freed
+        const is_module_level = (current_scope_depth == 1) and !is_parameter;
 
         const variable = Variable{
             .name = name,
             .type_kind = type_kind,
-            .scope_depth = @intCast(self.scope_stack.items.len),
+            .scope_depth = current_scope_depth,
             .line = line,
             .column = column,
             .needs_rc = needs_rc,
             .is_parameter = is_parameter,
+            .is_module_level = is_module_level,
+            .initialized = is_parameter, // Parameters are initialized by caller
             .ownership_state = if (is_parameter) .borrowed else .owned,
         };
 
@@ -569,6 +761,11 @@ pub const Drc = struct {
             .reason = .allocation,
             .comment = if (self.config.debug_mode) "// DRC: RC=1 from allocation" else null,
         });
+
+        // Mark variable as initialized
+        if (self.variables.getPtr(var_name)) |vptr| {
+            vptr.initialized = true;
+        }
     }
 
     // ========================================================================
@@ -585,6 +782,17 @@ pub const Drc = struct {
     ) !void {
         const v = self.variables.get(var_name) orelse return;
         if (!v.needs_rc) return;
+
+        // DIAGNOSTIC: Check for use-after-move
+        if (v.ownership_state == .moved) {
+            try self.emitUseAfterMove(var_name, line, column);
+            // Continue processing - codegen may still need the op, but user is warned
+        }
+
+        // DIAGNOSTIC: Check for uninitialized use
+        if (!v.initialized and !v.is_parameter) {
+            try self.emitUninitializedUse(var_name, line, column);
+        }
 
         try self.ownership_analyzer.recordUse(var_name, line, column, toOwnershipContext(context));
 
@@ -638,6 +846,12 @@ pub const Drc = struct {
                     .comment = if (self.config.debug_mode) "// DRC: incref for field store" else null,
                 });
                 self.stats.increfs += 1;
+
+                // DIAGNOSTIC: Field stores to object types can form cycles
+                // Emit hint so user knows cycle detection is active
+                if (v.type_kind == .object and self.config.enable_cycle_detection) {
+                    try self.emitPotentialCycle(var_name, line, column);
+                }
             },
             .function_arg_owned => {
                 // Passing to function that takes ownership
@@ -659,6 +873,11 @@ pub const Drc = struct {
                         // CRITICAL: Returning a borrowed parameter!
                         // Must incref to give caller ownership, otherwise they get
                         // a dangling reference when our scope ends.
+                        //
+                        // IMPORTANT: We do NOT change ownership_state here!
+                        // The parameter remains borrowed - we're just giving the caller
+                        // a new reference. Other branches may also return this same
+                        // borrowed parameter and need to emit their own incref.
                         try self.addOp(.{
                             .kind = .incref,
                             .target = var_name,
@@ -669,12 +888,16 @@ pub const Drc = struct {
                             .comment = if (self.config.debug_mode) "// DRC: incref borrowed return" else null,
                         });
                         self.stats.increfs += 1;
+                        vptr.escaped = true;
+                        // Note: Do NOT set ownership_state = .moved for borrowed params!
+                        // They remain borrowed so other branches can also return them.
                     } else if (vptr.ownership_state == .owned) {
                         // Returning owned value - elide scope cleanup decref
+                        // For owned values, we DO mark as moved since we're transferring ownership
                         self.stats.ops_elided += 1;
+                        vptr.escaped = true;
+                        vptr.ownership_state = .moved;
                     }
-                    vptr.escaped = true;
-                    vptr.ownership_state = .moved;
                 }
                 try self.addOp(.{
                     .kind = .move,
@@ -898,7 +1121,11 @@ pub const Drc = struct {
     // ========================================================================
 
     /// Track a variable-to-variable copy: let target = source
-    /// This creates a shared reference - target needs incref after assignment
+    /// This creates a shared reference - we incref the value after assignment
+    ///
+    /// The incref is emitted for target_var because AFTER the assignment,
+    /// target_var points to the same object as source_var. Incrementing
+    /// target_var's refcount is equivalent to incrementing source_var's.
     pub fn trackVariableCopy(
         self: *Drc,
         target_var: []const u8,
@@ -906,13 +1133,21 @@ pub const Drc = struct {
         line: u32,
         column: u32,
     ) !void {
-        _ = source_var; // Source is used for documentation/debugging
-
         // Check if target is a reference type that needs RC
-        const v = self.variables.get(target_var) orelse return;
-        if (!v.needs_rc) return;
+        const target = self.variables.get(target_var) orelse return;
+        if (!target.needs_rc) return;
+
+        // Check if source is still valid (not moved)
+        // If source was moved, copying from it is a use-after-move error
+        if (self.variables.get(source_var)) |source| {
+            if (source.ownership_state == .moved) {
+                // Source was moved - emit use-after-move warning for LSP
+                try self.emitUseAfterMove(source_var, line, column);
+            }
+        }
 
         // Emit incref for the target variable after the assignment
+        // After `target = source`, target and source point to same object
         try self.addOp(.{
             .kind = .incref,
             .target = target_var,
@@ -930,28 +1165,51 @@ pub const Drc = struct {
     // ========================================================================
 
     /// Handle variable reassignment (decref old, incref new)
+    /// IMPORTANT: Only decref if we still own the old value
+    /// If the variable was moved (e.g., returned in a different branch),
+    /// we must NOT decref it again.
     pub fn trackReassignment(
         self: *Drc,
         var_name: []const u8,
         line: u32,
         column: u32,
     ) !void {
-        const v = self.variables.get(var_name) orelse return;
-        if (!v.needs_rc) return;
+        if (self.variables.getPtr(var_name)) |vptr| {
+            if (!vptr.needs_rc) return;
 
-        // Decref old value
-        try self.addOp(.{
-            .kind = .decref,
-            .target = var_name,
-            .line = line,
-            .column = column,
-            .position = .before,
-            .reason = .reassignment,
-            .comment = if (self.config.debug_mode) "// DRC: decref old value" else null,
-        });
-        self.stats.decrefs += 1;
+            // DIAGNOSTIC: Check for double-free risk
+            // If we're reassigning a variable that was already moved/freed,
+            // the old value path shouldn't be decreffed (it's already gone)
+            // But if somehow the old decref is still emitted, that's a double-free
+            if (vptr.ownership_state == .moved) {
+                // This is actually safe - we're just assigning to a moved variable
+                // But warn in case there's a code path that tries to decref the old value
+                try self.emitDoubleFreeRisk(var_name, line, column);
+            }
 
-        // New value will be increffed by assignment handling
+            // Only decref if we still own the old value
+            // If it was moved (returned/passed to ownership-taking function),
+            // we don't own it anymore and must not decref
+            if (vptr.ownership_state == .owned) {
+                // Use decref_reassign to handle self-referential assignments like:
+                //   obj = obj.clone()  -- RHS uses LHS, must evaluate RHS before decref
+                // The cgen will: save old ptr → emit assignment → decref saved ptr
+                try self.addOp(.{
+                    .kind = .decref_reassign,
+                    .target = var_name,
+                    .line = line,
+                    .column = column,
+                    .position = .before,
+                    .reason = .reassignment,
+                    .comment = if (self.config.debug_mode) "// DRC: decref old value (reassign)" else null,
+                });
+                self.stats.decrefs += 1;
+            }
+
+            // After reassignment, we own the new value
+            vptr.ownership_state = .owned;
+            vptr.initialized = true; // Reassignment initializes
+        }
     }
 
     // ========================================================================
@@ -979,7 +1237,10 @@ pub const Drc = struct {
                 result.append(op) catch {};
             }
         }
-        return result.toOwnedSlice() catch &[_]RcOp{};
+        return result.toOwnedSlice() catch {
+            result.deinit(); // Free ArrayList buffer on error
+            return &[_]RcOp{};
+        };
     }
 
     /// Get operations after a specific position
@@ -990,7 +1251,10 @@ pub const Drc = struct {
                 result.append(op) catch {};
             }
         }
-        return result.toOwnedSlice() catch &[_]RcOp{};
+        return result.toOwnedSlice() catch {
+            result.deinit(); // Free ArrayList buffer on error
+            return &[_]RcOp{};
+        };
     }
 
     /// Get statistics
@@ -1004,6 +1268,128 @@ pub const Drc = struct {
             return v.needs_rc;
         }
         return false;
+    }
+
+    /// Get diagnostics for LSP integration
+    pub fn getDiagnostics(self: *const Drc) []const DrcDiagnostic {
+        return self.diagnostics.items;
+    }
+
+    /// Emit a diagnostic (for use by DrcAnalyzer and internal methods)
+    pub fn emitDiagnostic(self: *Drc, diag: DrcDiagnostic) !void {
+        try self.diagnostics.append(diag);
+    }
+
+    /// Emit a use-after-move warning with rich explanation
+    pub fn emitUseAfterMove(self: *Drc, var_name: []const u8, line: u32, column: u32) !void {
+        const msg = try std.fmt.allocPrint(
+            self.allocator,
+            \\Use of moved value '{s}'
+            \\
+            \\The value was transferred to another owner (returned or passed to a function).
+            \\After a move, the original variable is no longer valid.
+            \\
+            \\Options:
+            \\  • Clone before move: use `{s}.clone()` if you need the value twice
+            \\  • Restructure: use '{s}' before the move happens
+            \\  • Change ownership: make the function borrow instead of take ownership
+        ,
+            .{ var_name, var_name, var_name },
+        );
+        try self.emitDiagnostic(.{
+            .line = line,
+            .column = column,
+            .end_line = line,
+            .end_column = column + @as(u32, @intCast(var_name.len)),
+            .severity = .warning,
+            .message = msg,
+            .code = .use_after_move,
+        });
+    }
+
+    /// Emit a potential cycle hint with explanation
+    pub fn emitPotentialCycle(self: *Drc, var_name: []const u8, line: u32, column: u32) !void {
+        const msg = try std.fmt.allocPrint(
+            self.allocator,
+            \\Potential reference cycle involving '{s}'
+            \\
+            \\Storing an object in a field can create cycles (A→B→A).
+            \\Cycles prevent automatic cleanup via reference counting.
+            \\
+            \\Options:
+            \\  • Use WeakRef for back-references: `parent: WeakRef<Node>`
+            \\  • Break cycle manually: set reference to null when done
+            \\  • Accept cycle: cycle collector will handle it (slight perf cost)
+        ,
+            .{var_name},
+        );
+        try self.emitDiagnostic(.{
+            .line = line,
+            .column = column,
+            .end_line = line,
+            .end_column = column + @as(u32, @intCast(var_name.len)),
+            .severity = .hint,
+            .message = msg,
+            .code = .potential_cycle,
+        });
+    }
+
+    /// Emit an uninitialized use warning with explanation
+    pub fn emitUninitializedUse(self: *Drc, var_name: []const u8, line: u32, column: u32) !void {
+        const msg = try std.fmt.allocPrint(
+            self.allocator,
+            \\Use of possibly uninitialized variable '{s}'
+            \\
+            \\This variable was declared but may not have been assigned a value
+            \\on all code paths before this use.
+            \\
+            \\Options:
+            \\  • Initialize at declaration: `let {s} = initialValue;`
+            \\  • Ensure all branches assign: check if/else paths
+            \\  • Use optional type: `let {s}: Type? = null;` if absence is valid
+        ,
+            .{ var_name, var_name, var_name },
+        );
+        try self.emitDiagnostic(.{
+            .line = line,
+            .column = column,
+            .end_line = line,
+            .end_column = column + @as(u32, @intCast(var_name.len)),
+            .severity = .warning,
+            .message = msg,
+            .code = .uninitialized_use,
+        });
+    }
+
+    /// Emit a double-free risk warning with explanation
+    pub fn emitDoubleFreeRisk(self: *Drc, var_name: []const u8, line: u32, column: u32) !void {
+        const msg = try std.fmt.allocPrint(
+            self.allocator,
+            \\Reassigning previously moved variable '{s}'
+            \\
+            \\This variable was moved earlier, so its old value is gone.
+            \\Reassigning is safe, but this pattern can indicate confusion
+            \\about ownership flow.
+            \\
+            \\This is usually fine if:
+            \\  • You're intentionally reusing the variable name
+            \\  • The move was conditional and you're on the non-moved path
+            \\
+            \\Review if:
+            \\  • You expected the old value to still exist
+            \\  • The move was unintentional
+        ,
+            .{var_name},
+        );
+        try self.emitDiagnostic(.{
+            .line = line,
+            .column = column,
+            .end_line = line,
+            .end_column = column + @as(u32, @intCast(var_name.len)),
+            .severity = .hint, // Downgrade to hint - this is usually safe
+            .message = msg,
+            .code = .double_free_risk,
+        });
     }
 
     // ========================================================================
@@ -1055,6 +1441,16 @@ pub const Drc = struct {
     // ========================================================================
 
     fn addOp(self: *Drc, op: RcOp) !void {
+        // Debug: print each op as it's added
+        if (self.config.debug_mode) {
+            std.debug.print("[DRC] Adding op: {s} {s} at line {d} reason={s}\n", .{
+                @tagName(op.kind),
+                op.target,
+                op.line,
+                @tagName(op.reason),
+            });
+        }
+
         try self.operations.append(op);
 
         // Index by line
@@ -1089,6 +1485,14 @@ pub fn emitCCode(op: RcOp, writer: anytype) !void {
             if (op.comment) |c| try writer.print("    {s}\n", .{c});
             try writer.print("    ms_decref_cycle_check({s});\n", .{op.target});
         },
+        .decref_reassign => {
+            // Reassignment decref: save old, assign new, decref old
+            // This is handled specially by cgen, here we just show the intent
+            if (op.comment) |c| try writer.print("    {s}\n", .{c});
+            try writer.print("    void* _old_{s} = {s}; /* save old */\n", .{ op.target, op.target });
+            try writer.print("    /* assignment happens here */\n", .{});
+            try writer.print("    ms_decref(_old_{s}); /* decref old */\n", .{op.target});
+        },
         .move => {
             // Move is a no-op in terms of RC, but we might want to track it
             if (op.comment) |c| try writer.print("    {s}\n", .{c});
@@ -1117,6 +1521,14 @@ pub fn emitZigCode(op: RcOp, writer: anytype) !void {
         .decref_cycle_check => {
             try writer.print("    const prev = @atomicSub(&{s}.rc, 1, .seq_cst);\n", .{op.target});
             try writer.print("    if (prev == 1) {s}.deinit() else cycle_detector.addRoot(@intFromPtr({s}));\n", .{ op.target, op.target });
+        },
+        .decref_reassign => {
+            // Reassignment decref: save old, assign new, decref old
+            // This prevents use-after-free when RHS references LHS
+            if (op.comment) |c| try writer.print("    {s}\n", .{c});
+            try writer.print("    const _old_{s} = {s}; // save old\n", .{ op.target, op.target });
+            try writer.print("    // assignment happens here\n", .{});
+            try writer.print("    if (@atomicSub(&_old_{s}.rc, 1, .seq_cst) == 1) _old_{s}.deinit(); // decref old\n", .{ op.target, op.target });
         },
         .move, .scope_cleanup_start, .scope_cleanup_end => {
             if (op.comment) |c| try writer.print("    {s}\n", .{c});
@@ -1289,6 +1701,9 @@ test "Drc borrowed args do NOT trigger move optimization" {
     var drc = Drc.initWithConfig(std.testing.allocator, .{ .enable_move_optimization = true });
     defer drc.deinit();
 
+    // Module scope (global) - required to prevent variables being marked as module-level
+    try drc.enterScope(0);
+    // Function scope (local)
     try drc.enterScope(1);
 
     // Create a heap-allocated variable
@@ -1299,6 +1714,7 @@ test "Drc borrowed args do NOT trigger move optimization" {
     try drc.trackUse("result", 3, 1, .function_arg_borrowed);
 
     try drc.exitScope(5, 1);
+    try drc.exitScope(6, 1); // Exit module scope
     try drc.finalize();
 
     // Should NOT have a move op (borrowed doesn't transfer ownership)
@@ -1328,6 +1744,9 @@ test "Drc read context does NOT trigger move optimization" {
     var drc = Drc.initWithConfig(std.testing.allocator, .{ .enable_move_optimization = true });
     defer drc.deinit();
 
+    // Module scope (global) - required to prevent variables being marked as module-level
+    try drc.enterScope(0);
+    // Function scope (local)
     try drc.enterScope(1);
     try drc.registerVariable("obj", .object, 2, 5, false);
     try drc.registerAllocation("obj", 2, 10);
@@ -1336,6 +1755,7 @@ test "Drc read context does NOT trigger move optimization" {
     try drc.trackUse("obj", 3, 1, .read);
 
     try drc.exitScope(5, 1);
+    try drc.exitScope(6, 1); // Exit module scope
     try drc.finalize();
 
     // Should NOT have a move op
@@ -1425,6 +1845,9 @@ test "Drc scope cleanup only for owned variables" {
     var drc = Drc.init(std.testing.allocator);
     defer drc.deinit();
 
+    // Module scope (global) - required to prevent variables being marked as module-level
+    try drc.enterScope(0);
+    // Function scope (local)
     try drc.enterScope(1);
 
     // Borrowed parameter - should not be decreffed
@@ -1435,6 +1858,7 @@ test "Drc scope cleanup only for owned variables" {
     try drc.registerAllocation("local", 2, 10);
 
     try drc.exitScope(5, 1);
+    try drc.exitScope(6, 1); // Exit module scope
     try drc.finalize();
 
     // Count scope cleanup decrefs per variable
@@ -1456,6 +1880,9 @@ test "Drc multiple variables in scope cleanup" {
     var drc = Drc.init(std.testing.allocator);
     defer drc.deinit();
 
+    // Module scope (global) - required to prevent variables being marked as module-level
+    try drc.enterScope(0);
+    // Function scope (local)
     try drc.enterScope(1);
     try drc.registerVariable("a", .string, 2, 5, false);
     try drc.registerAllocation("a", 2, 10);
@@ -1464,6 +1891,7 @@ test "Drc multiple variables in scope cleanup" {
     try drc.registerVariable("c", .object, 4, 5, false);
     try drc.registerAllocation("c", 4, 10);
     try drc.exitScope(10, 1);
+    try drc.exitScope(11, 1); // Exit module scope
     try drc.finalize();
 
     // Count scope cleanup decrefs
@@ -1488,18 +1916,22 @@ test "Drc nested scopes cleanup correctly" {
     var drc = Drc.init(std.testing.allocator);
     defer drc.deinit();
 
-    // Outer scope
+    // Module scope (global) - required to prevent variables being marked as module-level
+    try drc.enterScope(0);
+
+    // Outer scope (function level)
     try drc.enterScope(1);
     try drc.registerVariable("outer", .object, 2, 5, false);
     try drc.registerAllocation("outer", 2, 10);
 
-    // Inner scope
+    // Inner scope (block level)
     try drc.enterScope(3);
     try drc.registerVariable("inner", .object, 4, 5, false);
     try drc.registerAllocation("inner", 4, 10);
     try drc.exitScope(6, 1); // Inner scope exits at line 6
 
     try drc.exitScope(10, 1); // Outer scope exits at line 10
+    try drc.exitScope(11, 1); // Module scope exits
     try drc.finalize();
 
     // Check that inner is cleaned up at line 6, outer at line 10
@@ -1558,4 +1990,253 @@ test "Drc elision rate calculation" {
     try std.testing.expect(stats.moves >= 1);
     // elisionRate depends on implementation details, just check it's calculable
     _ = stats.elisionRate();
+}
+
+test "Drc variable shadowing restores outer variable" {
+    // Test that shadowing a variable in inner scope doesn't corrupt outer scope
+    // Bug: HashMap.put(name) would overwrite outer scope's variable info
+    // After inner scope exits, outer variable should still be tracked correctly
+    var drc = Drc.init(std.testing.allocator);
+    defer drc.deinit();
+
+    // Module scope (global) - required to prevent variables being marked as module-level
+    try drc.enterScope(0);
+
+    // Outer scope (function level)
+    try drc.enterScope(1);
+    try drc.registerVariable("x", .object, 2, 5, false);
+    try drc.registerAllocation("x", 2, 10);
+
+    // Verify outer x exists with scope_depth 2 (module + function)
+    const outer_x = drc.variables.get("x").?;
+    try std.testing.expectEqual(@as(u32, 2), outer_x.scope_depth);
+    try std.testing.expectEqual(Variable.OwnershipState.owned, outer_x.ownership_state);
+
+    // Inner scope with shadowing
+    try drc.enterScope(3);
+    try drc.registerVariable("x", .object, 4, 5, false); // Shadows outer x
+    try drc.registerAllocation("x", 4, 10);
+
+    // Verify inner x has scope_depth 3 (module + function + block)
+    const inner_x = drc.variables.get("x").?;
+    try std.testing.expectEqual(@as(u32, 3), inner_x.scope_depth);
+
+    // Exit inner scope - should restore outer x
+    try drc.exitScope(6, 1);
+
+    // Verify outer x is restored
+    const restored_x = drc.variables.get("x").?;
+    try std.testing.expectEqual(@as(u32, 2), restored_x.scope_depth);
+    try std.testing.expectEqual(Variable.OwnershipState.owned, restored_x.ownership_state);
+
+    // Exit outer scope (function)
+    try drc.exitScope(10, 1);
+    // Exit module scope
+    try drc.exitScope(11, 1);
+    try drc.finalize();
+
+    // Count decrefs for "x" - should have 2 (one for each scope exit)
+    var decref_count: usize = 0;
+    for (drc.getAllOps()) |op| {
+        if ((op.kind == .decref or op.kind == .decref_cycle_check) and
+            std.mem.eql(u8, op.target, "x"))
+        {
+            decref_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), decref_count);
+}
+
+// ============================================================================
+// Diagnostic Tests
+// ============================================================================
+
+test "Drc emits use-after-move diagnostic" {
+    var drc = Drc.initWithConfig(std.testing.allocator, .{ .enable_move_optimization = true });
+    defer drc.deinit();
+
+    try drc.enterScope(0); // Module
+    try drc.enterScope(1); // Function
+
+    try drc.registerVariable("obj", .object, 2, 5, false);
+    try drc.registerAllocation("obj", 2, 10);
+
+    // Move the variable (ownership transfer context)
+    try drc.trackUse("obj", 3, 1, .returned);
+
+    // Try to use after move - should emit diagnostic
+    try drc.trackUse("obj", 4, 1, .read);
+
+    try drc.exitScope(5, 1);
+    try drc.exitScope(6, 1);
+    try drc.finalize();
+
+    const diags = drc.getDiagnostics();
+    try std.testing.expectEqual(@as(usize, 1), diags.len);
+    try std.testing.expectEqual(DrcDiagnostic.Code.use_after_move, diags[0].code);
+    try std.testing.expect(std.mem.indexOf(u8, diags[0].message, "obj") != null);
+}
+
+test "Drc emits uninitialized-use diagnostic" {
+    var drc = Drc.init(std.testing.allocator);
+    defer drc.deinit();
+
+    try drc.enterScope(0); // Module
+    try drc.enterScope(1); // Function
+
+    // Register variable but DON'T allocate/initialize it
+    try drc.registerVariable("uninit", .object, 2, 5, false);
+
+    // Try to use it - should emit diagnostic
+    try drc.trackUse("uninit", 3, 1, .read);
+
+    try drc.exitScope(5, 1);
+    try drc.exitScope(6, 1);
+    try drc.finalize();
+
+    const diags = drc.getDiagnostics();
+    try std.testing.expectEqual(@as(usize, 1), diags.len);
+    try std.testing.expectEqual(DrcDiagnostic.Code.uninitialized_use, diags[0].code);
+}
+
+test "Drc emits potential-cycle hint for field stores" {
+    var drc = Drc.initWithConfig(std.testing.allocator, .{ .enable_cycle_detection = true });
+    defer drc.deinit();
+
+    try drc.enterScope(0); // Module
+    try drc.enterScope(1); // Function
+
+    try drc.registerVariable("node", .object, 2, 5, false);
+    try drc.registerAllocation("node", 2, 10);
+
+    // Store in field (potential cycle if self-referential)
+    try drc.trackUse("node", 3, 1, .field_store);
+
+    try drc.exitScope(5, 1);
+    try drc.exitScope(6, 1);
+    try drc.finalize();
+
+    const diags = drc.getDiagnostics();
+    try std.testing.expectEqual(@as(usize, 1), diags.len);
+    try std.testing.expectEqual(DrcDiagnostic.Code.potential_cycle, diags[0].code);
+    try std.testing.expectEqual(DrcDiagnostic.Severity.hint, diags[0].severity);
+}
+
+test "Drc emits double-free-risk for reassigning moved variable" {
+    var drc = Drc.initWithConfig(std.testing.allocator, .{ .enable_move_optimization = true });
+    defer drc.deinit();
+
+    try drc.enterScope(0); // Module
+    try drc.enterScope(1); // Function
+
+    try drc.registerVariable("x", .object, 2, 5, false);
+    try drc.registerAllocation("x", 2, 10);
+
+    // Move the variable
+    try drc.trackUse("x", 3, 1, .returned);
+
+    // Now reassign - variable was moved, emits warning
+    try drc.trackReassignment("x", 4, 1);
+
+    try drc.exitScope(5, 1);
+    try drc.exitScope(6, 1);
+    try drc.finalize();
+
+    const diags = drc.getDiagnostics();
+    try std.testing.expectEqual(@as(usize, 1), diags.len);
+    try std.testing.expectEqual(DrcDiagnostic.Code.double_free_risk, diags[0].code);
+}
+
+test "Drc parameters don't emit uninitialized-use" {
+    var drc = Drc.init(std.testing.allocator);
+    defer drc.deinit();
+
+    try drc.enterScope(0); // Module
+    try drc.enterScope(1); // Function
+
+    // Parameters are initialized by caller
+    try drc.registerVariable("param", .object, 1, 5, true); // is_parameter = true
+
+    // Use without explicit allocation - should NOT emit diagnostic
+    try drc.trackUse("param", 3, 1, .read);
+
+    try drc.exitScope(5, 1);
+    try drc.exitScope(6, 1);
+    try drc.finalize();
+
+    const diags = drc.getDiagnostics();
+    try std.testing.expectEqual(@as(usize, 0), diags.len); // No diagnostics
+}
+
+// ============================================================================
+// Error Path Tests
+// ============================================================================
+
+test "Drc deinit cleans up temporary names on success" {
+    // Verify that temporary names allocated via registerTemporary are freed
+    var drc = Drc.init(std.testing.allocator);
+
+    try drc.enterScope(1);
+    _ = try drc.registerTemporary(1, 1);
+    _ = try drc.registerTemporary(2, 1);
+    _ = try drc.registerTemporary(3, 1);
+    try drc.exitScope(5, 1);
+
+    // deinit should free all temporary names without leaking
+    drc.deinit();
+
+    // If we get here without the testing allocator complaining, no leaks!
+}
+
+test "Drc deinit cleans up diagnostics on success" {
+    // Verify that diagnostic messages are freed
+    var drc = Drc.initWithConfig(std.testing.allocator, .{ .enable_move_optimization = true });
+
+    try drc.enterScope(1);
+    try drc.registerVariable("obj", .object, 1, 5, false);
+    try drc.registerAllocation("obj", 1, 10);
+
+    // First use with 'returned' - triggers move optimization (marks as moved)
+    try drc.trackUse("obj", 2, 1, .returned);
+
+    // Second use after move - generates diagnostic with allocated message
+    try drc.trackUse("obj", 3, 1, .read);
+
+    try drc.exitScope(5, 1);
+    try drc.finalize();
+
+    // Verify we got a diagnostic
+    const diags = drc.getDiagnostics();
+    try std.testing.expect(diags.len >= 1);
+
+    // deinit should free diagnostic messages without leaking
+    drc.deinit();
+}
+
+test "Drc multiple scopes cleanup correctly" {
+    // Verify nested scopes are all cleaned up without leaking
+    var drc = Drc.init(std.testing.allocator);
+
+    try drc.enterScope(1);
+    try drc.registerVariable("a", .object, 1, 1, false);
+    _ = try drc.registerTemporary(1, 5);
+
+    try drc.enterScope(2);
+    try drc.registerVariable("b", .string, 2, 1, false);
+    _ = try drc.registerTemporary(2, 5);
+
+    try drc.enterScope(3);
+    try drc.registerVariable("c", .array, 3, 1, false);
+    _ = try drc.registerTemporary(3, 5);
+
+    // Exit all scopes
+    try drc.exitScope(4, 1);
+    try drc.exitScope(5, 1);
+    try drc.exitScope(6, 1);
+
+    try drc.finalize();
+
+    // deinit should free everything without leaking
+    drc.deinit();
+    // std.testing.allocator will panic if anything leaked
 }

@@ -201,6 +201,226 @@ if (ownership == .owned or ownership == .borrowed) {
 
 ---
 
+## LSP-DRC Integration
+
+### Overview
+
+Surface DRC ownership analysis to developers through LSP features:
+- **Diagnostics**: Warnings for unknown ownership, potential leaks, use-after-move
+- **Hover**: Show ownership state and cleanup location for variables
+- **Related Locations**: Link to move sites, definitions, cleanup points
+
+### Data Flow
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│   Parser    │────▶│ TypeChecker │────▶│     DRC     │
+└─────────────┘     └─────────────┘     └─────────────┘
+                                               │
+                                               ▼
+                                        ┌─────────────┐
+                                        │ DrcLspInfo  │
+                                        └─────────────┘
+                                               │
+                    ┌──────────────────────────┼──────────────────────────┐
+                    ▼                          ▼                          ▼
+             ┌─────────────┐           ┌─────────────┐           ┌─────────────┐
+             │ Diagnostics │           │   Hovers    │           │ Code Actions│
+             │ (warnings)  │           │ (ownership) │           │  (quick fix)│
+             └─────────────┘           └─────────────┘           └─────────────┘
+```
+
+### Core Data Structures
+
+```zig
+// src/analysis/drc_lsp.zig
+
+pub const DrcLspInfo = struct {
+    /// Variable ownership states at each scope point
+    variable_info: std.StringHashMap(VariableOwnershipInfo),
+
+    /// Detected issues (leaks, unknown ownership, use-after-move)
+    diagnostics: std.ArrayList(DrcDiagnostic),
+
+    /// Cleanup locations (where decref happens)
+    cleanup_locations: std.ArrayList(CleanupLocation),
+};
+
+pub const VariableOwnershipInfo = struct {
+    name: []const u8,
+    ownership: OwnershipState,     // owned, borrowed, moved, unknown
+    confidence: Confidence,         // high, medium, low
+    defined_at: SourceLocation,
+    cleanup_at: ?SourceLocation,    // null if leaked or moved
+    moved_to: ?SourceLocation,      // if ownership transferred
+    type_name: []const u8,
+    needs_rc: bool,
+};
+
+pub const Confidence = enum { high, medium, low };
+
+pub const DrcDiagnostic = struct {
+    kind: DiagnosticKind,
+    location: SourceLocation,
+    message: []const u8,
+    related: []RelatedLocation,
+    severity: Severity,  // error, warning, hint
+};
+
+pub const DiagnosticKind = enum {
+    unknown_ownership,    // Can't determine if owned/borrowed
+    potential_leak,       // RC type not cleaned up
+    use_after_move,       // Accessing moved value
+    double_free,          // Decref on already freed
+    escape_to_global,     // Local escapes to module scope
+};
+```
+
+### Diagnostic Detection
+
+```zig
+fn detectDiagnostics(self: *DrcLspInfo, drc: *DrcAnalyzer) void {
+    for (drc.variables.values()) |v| {
+        // Unknown ownership
+        if (v.ownership_state == .unknown and v.needs_rc) {
+            self.diagnostics.append(.{
+                .kind = .unknown_ownership,
+                .location = v.definition_location,
+                .message = "Cannot determine ownership - may leak or double-free",
+                .severity = .warning,
+            });
+        }
+
+        // Potential leak (owned but no cleanup)
+        if (v.ownership_state == .owned and v.needs_rc and !v.has_cleanup) {
+            self.diagnostics.append(.{
+                .kind = .potential_leak,
+                .location = v.definition_location,
+                .message = "Owned value may not be freed",
+                .severity = .warning,
+            });
+        }
+
+        // Use-after-move
+        for (v.uses_after_move) |use| {
+            self.diagnostics.append(.{
+                .kind = .use_after_move,
+                .location = use.location,
+                .message = "Value was moved, cannot access",
+                .severity = .@"error",
+                .related = &[_]RelatedLocation{
+                    .{ .location = v.moved_at, .message = "moved here" },
+                },
+            });
+        }
+    }
+}
+```
+
+### LSP Hover Format
+
+When hovering over a variable with RC type:
+
+```markdown
+**`userName`** `: string`
+
+| Property | Value |
+|----------|-------|
+| Ownership | `owned` |
+| Confidence | `high` |
+| Cleanup | Line 42 (scope exit) |
+| RC Type | Yes |
+
+---
+_DRC: This value will be automatically freed at scope exit._
+```
+
+For uncertain ownership:
+
+```markdown
+**`result`** `: User`
+
+| Property | Value |
+|----------|-------|
+| Ownership | `unknown` ⚠️ |
+| Confidence | `low` |
+| Cleanup | Unknown |
+| RC Type | Yes |
+
+---
+_DRC: Cannot determine ownership. Value returned from external function._
+```
+
+### LSP Server Integration
+
+```zig
+// src/lsp/server.zig
+
+const ServerState = struct {
+    // ... existing fields ...
+    drc_cache: std.StringHashMap(DrcLspInfo),
+};
+
+fn handleHover(self: *Server, params: HoverParams) ?Hover {
+    const uri = params.textDocument.uri;
+    const pos = params.position;
+
+    // Get DRC info for this file
+    const drc_info = self.state.drc_cache.get(uri) orelse return null;
+
+    // Find variable at position
+    const var_info = drc_info.findVariableAt(pos) orelse return null;
+
+    // Format hover content
+    return Hover{
+        .contents = .{
+            .kind = .markdown,
+            .value = formatOwnershipHover(var_info),
+        },
+    };
+}
+
+fn publishDrcDiagnostics(self: *Server, uri: []const u8) void {
+    const drc_info = self.state.drc_cache.get(uri) orelse return;
+
+    var diagnostics = std.ArrayList(lsp.Diagnostic).init(self.allocator);
+    for (drc_info.diagnostics.items) |diag| {
+        diagnostics.append(convertToLspDiagnostic(diag));
+    }
+
+    self.notify("textDocument/publishDiagnostics", .{
+        .uri = uri,
+        .diagnostics = diagnostics.items,
+    });
+}
+```
+
+### Configuration Options
+
+```json
+{
+  "metascript.drc.enabled": true,
+  "metascript.drc.showHoverInfo": true,
+  "metascript.drc.diagnosticSeverity": {
+    "unknownOwnership": "warning",
+    "potentialLeak": "warning",
+    "useAfterMove": "error"
+  },
+  "metascript.drc.showCleanupLocations": true
+}
+```
+
+### Implementation Phases
+
+| Phase | Scope | Deliverables |
+|-------|-------|--------------|
+| 1 | Data structures | `DrcLspInfo`, `collectLspInfo()`, cache integration |
+| 2 | Diagnostics | Detection logic, LSP diagnostic publishing |
+| 3 | Hover | Ownership display, markdown formatting |
+| 4 | Polish | Related locations, configuration, code actions |
+
+---
+
 ## Testing Strategy
 
 ### Unit Tests

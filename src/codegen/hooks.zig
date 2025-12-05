@@ -14,6 +14,8 @@ pub const Field = struct {
     name: []const u8,
     type_name: []const u8,
     kind: FieldKind,
+    /// For arrays, the element type name (e.g., "Post" for Array<Post>)
+    element_type: ?[]const u8 = null,
 };
 
 /// Class definition
@@ -83,8 +85,21 @@ pub const HookGenerator = struct {
                     try writer.writeAll("  }\n");
                 },
                 .array => {
-                    // TODO: Array cleanup (Week 5-6)
-                    try writer.print("  // TODO: Clean up array {s}\n", .{field.name});
+                    // Array cleanup: decref each element, then free the array
+                    if (field.element_type) |elem_type| {
+                        try writer.print("  if (self->{s} != NULL) {{\n", .{field.name});
+                        try writer.print("    for (size_t i = 0; i < self->{s}_len; i++) {{\n", .{field.name});
+                        try writer.print("      if (self->{s}[i] != NULL) {{\n", .{field.name});
+                        try writer.print("        {s}_destroy(self->{s}[i]);\n", .{ elem_type, field.name });
+                        try writer.print("        ms_decref(self->{s}[i]);\n", .{field.name});
+                        try writer.writeAll("      }\n");
+                        try writer.writeAll("    }\n");
+                        try writer.print("    free(self->{s});\n", .{field.name});
+                        try writer.writeAll("  }\n");
+                    } else {
+                        // Unknown element type - emit placeholder
+                        try writer.print("  // Array {s}: element type unknown, manual cleanup needed\n", .{field.name});
+                    }
                 },
             }
         }
@@ -116,7 +131,22 @@ pub const HookGenerator = struct {
                     try writer.print("  copy->{s} = {s}_copy(self->{s});\n", .{ field.name, field.type_name, field.name });
                 },
                 .array => {
-                    try writer.print("  // TODO: Copy array {s}\n", .{field.name});
+                    // Deep copy array: allocate new array and copy each element
+                    if (field.element_type) |elem_type| {
+                        try writer.print("  if (self->{s} != NULL && self->{s}_len > 0) {{\n", .{ field.name, field.name });
+                        try writer.print("    copy->{s}_len = self->{s}_len;\n", .{ field.name, field.name });
+                        try writer.print("    copy->{s} = ({s}**)malloc(sizeof({s}*) * self->{s}_len);\n", .{ field.name, elem_type, elem_type, field.name });
+                        try writer.print("    for (size_t i = 0; i < self->{s}_len; i++) {{\n", .{field.name});
+                        try writer.print("      copy->{s}[i] = {s}_copy(self->{s}[i]);\n", .{ field.name, elem_type, field.name });
+                        try writer.writeAll("    }\n");
+                        try writer.writeAll("  } else {\n");
+                        try writer.print("    copy->{s} = NULL;\n", .{field.name});
+                        try writer.print("    copy->{s}_len = 0;\n", .{field.name});
+                        try writer.writeAll("  }\n");
+                    } else {
+                        // Unknown element type - shallow copy pointer only
+                        try writer.print("  copy->{s} = self->{s};  // Shallow copy (element type unknown)\n", .{ field.name, field.name });
+                    }
                 },
             }
         }
@@ -158,7 +188,19 @@ pub const HookGenerator = struct {
                     has_traced = true;
                 },
                 .array => {
-                    try writer.print("  // TODO: Trace array {s}\n", .{field.name});
+                    // Trace each element in the array for cycle detection
+                    if (field.element_type) |elem_type| {
+                        try writer.print("  if (self->{s} != NULL) {{\n", .{field.name});
+                        try writer.print("    for (size_t i = 0; i < self->{s}_len; i++) {{\n", .{field.name});
+                        try writer.print("      if (self->{s}[i] != NULL) {{\n", .{field.name});
+                        try writer.print("        {s}_trace(self->{s}[i]);\n", .{ elem_type, field.name });
+                        try writer.writeAll("      }\n");
+                        try writer.writeAll("    }\n");
+                        try writer.writeAll("  }\n");
+                    } else {
+                        // Unknown element type - cannot trace
+                        try writer.print("  // Array {s}: element type unknown, cannot trace\n", .{field.name});
+                    }
                     has_traced = true;
                 },
             }

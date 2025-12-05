@@ -128,6 +128,9 @@ pub const CycleDetector = struct {
 };
 
 /// Cycle detection callbacks - backends implement this
+///
+/// Note: forEachRef uses context-passing pattern (standard Zig idiom)
+/// since Zig doesn't support closures that capture outer scope.
 pub const CycleCallbacks = struct {
     /// Get reference count of an object
     getRefCount: *const fn (ptr: usize) u32,
@@ -142,135 +145,164 @@ pub const CycleCallbacks = struct {
     setColor: *const fn (ptr: usize, color: Color) void,
 
     /// Iterate over references from an object
-    /// Callback receives each referenced pointer
-    forEachRef: *const fn (ptr: usize, callback: *const fn (usize) void) void,
+    /// Uses context-passing pattern: callback receives (context, child_ptr)
+    /// Context allows callbacks to access outer state without closures
+    forEachRef: *const fn (ptr: usize, ctx: ?*anyopaque, callback: *const fn (?*anyopaque, usize) void) void,
 
     /// Free an object
     free: *const fn (ptr: usize) void,
+};
+
+/// Traversal context passed to callbacks
+/// Bundles callbacks + stats so recursive traversal can access them
+const TraversalContext = struct {
+    callbacks: *const CycleCallbacks,
+    stats: ?*CycleDetector.Stats,
 };
 
 /// Run the Bacon-Rajan cycle collection algorithm
 /// This is the core algorithm - backends call this with their callbacks
 pub fn collectCycles(
     detector: *CycleDetector,
-    callbacks: CycleCallbacks,
+    callbacks: *const CycleCallbacks,
 ) void {
     detector.stats.runs += 1;
 
+    // Create traversal context for callback access
+    var ctx = TraversalContext{
+        .callbacks = callbacks,
+        .stats = &detector.stats,
+    };
+
     // Phase 1: Mark roots
-    markRoots(detector, callbacks);
+    markRoots(detector, &ctx);
 
     // Phase 2: Scan for garbage
-    scanRoots(detector, callbacks);
+    scanRoots(detector, &ctx);
 
     // Phase 3: Collect garbage
-    collectWhite(detector, callbacks);
+    collectWhite(detector, &ctx);
 }
 
 /// Phase 1: Mark all purple roots as gray and decrement their children
-fn markRoots(detector: *CycleDetector, callbacks: CycleCallbacks) void {
+fn markRoots(detector: *CycleDetector, ctx: *TraversalContext) void {
     for (detector.roots.items) |*root| {
-        if (callbacks.getColor(root.ptr) == .purple) {
-            markGray(root.ptr, callbacks);
+        if (ctx.callbacks.getColor(root.ptr) == .purple) {
+            markGray(root.ptr, ctx);
         } else {
             // Not purple anymore, remove from roots
             root.is_root = false;
         }
-        detector.stats.objects_scanned += 1;
+        if (ctx.stats) |stats| {
+            stats.objects_scanned += 1;
+        }
     }
 }
 
 /// Mark an object gray and decrement RC of its children
-fn markGray(ptr: usize, callbacks: CycleCallbacks) void {
-    if (callbacks.getColor(ptr) != .gray) {
-        callbacks.setColor(ptr, .gray);
+fn markGray(ptr: usize, ctx: *TraversalContext) void {
+    if (ctx.callbacks.getColor(ptr) != .gray) {
+        ctx.callbacks.setColor(ptr, .gray);
 
         // Decrement RC of children (trial deletion)
-        callbacks.forEachRef(ptr, struct {
-            fn callback(child: usize) void {
-                const child_rc = callbacks.getRefCount(child);
-                if (child_rc > 0) {
-                    callbacks.setRefCount(child, child_rc - 1);
-                }
-                markGray(child, callbacks);
-            }
-        }.callback);
+        ctx.callbacks.forEachRef(ptr, ctx, markGrayCallback);
     }
 }
 
+/// Callback for markGray - processes each child reference
+fn markGrayCallback(ctx_ptr: ?*anyopaque, child: usize) void {
+    const ctx: *TraversalContext = @ptrCast(@alignCast(ctx_ptr.?));
+    const child_rc = ctx.callbacks.getRefCount(child);
+    if (child_rc > 0) {
+        ctx.callbacks.setRefCount(child, child_rc - 1);
+    }
+    markGray(child, ctx);
+}
+
 /// Phase 2: Scan roots - mark live objects black, garbage white
-fn scanRoots(detector: *CycleDetector, callbacks: CycleCallbacks) void {
+fn scanRoots(detector: *CycleDetector, ctx: *TraversalContext) void {
     for (detector.roots.items) |*root| {
         if (root.is_root) {
-            scan(root.ptr, callbacks);
+            scan(root.ptr, ctx);
         }
     }
 }
 
 /// Scan an object - if RC > 0, it's live (mark black), else garbage (mark white)
-fn scan(ptr: usize, callbacks: CycleCallbacks) void {
-    if (callbacks.getColor(ptr) == .gray) {
-        if (callbacks.getRefCount(ptr) > 0) {
+fn scan(ptr: usize, ctx: *TraversalContext) void {
+    if (ctx.callbacks.getColor(ptr) == .gray) {
+        if (ctx.callbacks.getRefCount(ptr) > 0) {
             // Live - restore black and re-increment children
-            scanBlack(ptr, callbacks);
+            scanBlack(ptr, ctx);
         } else {
             // Garbage - mark white
-            callbacks.setColor(ptr, .white);
-            callbacks.forEachRef(ptr, struct {
-                fn callback(child: usize) void {
-                    scan(child, callbacks);
-                }
-            }.callback);
+            ctx.callbacks.setColor(ptr, .white);
+            ctx.callbacks.forEachRef(ptr, ctx, scanCallback);
         }
     }
 }
 
+/// Callback for scan - recursively scans children
+fn scanCallback(ctx_ptr: ?*anyopaque, child: usize) void {
+    const ctx: *TraversalContext = @ptrCast(@alignCast(ctx_ptr.?));
+    scan(child, ctx);
+}
+
 /// Mark an object and its children black (live)
-fn scanBlack(ptr: usize, callbacks: CycleCallbacks) void {
-    callbacks.setColor(ptr, .black);
-    callbacks.forEachRef(ptr, struct {
-        fn callback(child: usize) void {
-            const child_rc = callbacks.getRefCount(child);
-            callbacks.setRefCount(child, child_rc + 1);
-            if (callbacks.getColor(child) != .black) {
-                scanBlack(child, callbacks);
-            }
-        }
-    }.callback);
+fn scanBlack(ptr: usize, ctx: *TraversalContext) void {
+    ctx.callbacks.setColor(ptr, .black);
+    ctx.callbacks.forEachRef(ptr, ctx, scanBlackCallback);
+}
+
+/// Callback for scanBlack - increments RC and marks children black
+fn scanBlackCallback(ctx_ptr: ?*anyopaque, child: usize) void {
+    const ctx: *TraversalContext = @ptrCast(@alignCast(ctx_ptr.?));
+    const child_rc = ctx.callbacks.getRefCount(child);
+    ctx.callbacks.setRefCount(child, child_rc + 1);
+    if (ctx.callbacks.getColor(child) != .black) {
+        scanBlack(child, ctx);
+    }
 }
 
 /// Phase 3: Collect white (garbage) objects
-fn collectWhite(detector: *CycleDetector, callbacks: CycleCallbacks) void {
+fn collectWhite(detector: *CycleDetector, ctx: *TraversalContext) void {
     var i: usize = 0;
     while (i < detector.roots.items.len) {
         const root = detector.roots.items[i];
-        if (callbacks.getColor(root.ptr) == .white) {
+        if (ctx.callbacks.getColor(root.ptr) == .white) {
             // Garbage - free it
-            callbacks.setColor(root.ptr, .black); // Prevent double-free
-            collectWhiteChildren(root.ptr, callbacks, &detector.stats);
-            callbacks.free(root.ptr);
-            detector.stats.objects_freed += 1;
-            detector.stats.cycles_collected += 1;
+            ctx.callbacks.setColor(root.ptr, .black); // Prevent double-free
+            collectWhiteChildren(root.ptr, ctx);
+            ctx.callbacks.free(root.ptr);
+            if (ctx.stats) |stats| {
+                stats.objects_freed += 1;
+                stats.cycles_collected += 1;
+            }
             _ = detector.roots.swapRemove(i);
         } else {
             // Restore to black
-            callbacks.setColor(root.ptr, .black);
+            ctx.callbacks.setColor(root.ptr, .black);
             i += 1;
         }
     }
 }
 
-fn collectWhiteChildren(ptr: usize, callbacks: CycleCallbacks, stats: *CycleDetector.Stats) void {
-    callbacks.forEachRef(ptr, struct {
-        fn callback(child: usize) void {
-            if (callbacks.getColor(child) == .white) {
-                callbacks.setColor(child, .black);
-                collectWhiteChildren(child, callbacks, stats);
-                callbacks.free(child);
-                stats.objects_freed += 1;
-            }
+/// Recursively collect white children
+fn collectWhiteChildren(ptr: usize, ctx: *TraversalContext) void {
+    ctx.callbacks.forEachRef(ptr, ctx, collectWhiteChildrenCallback);
+}
+
+/// Callback for collectWhiteChildren
+fn collectWhiteChildrenCallback(ctx_ptr: ?*anyopaque, child: usize) void {
+    const ctx: *TraversalContext = @ptrCast(@alignCast(ctx_ptr.?));
+    if (ctx.callbacks.getColor(child) == .white) {
+        ctx.callbacks.setColor(child, .black);
+        collectWhiteChildren(child, ctx);
+        ctx.callbacks.free(child);
+        if (ctx.stats) |stats| {
+            stats.objects_freed += 1;
         }
-    }.callback);
+    }
 }
 
 // ============================================================================
@@ -298,4 +330,33 @@ test "CycleDetector stats" {
     try std.testing.expectEqual(@as(u64, 5), detector.getStats().runs);
     detector.resetStats();
     try std.testing.expectEqual(@as(u64, 0), detector.getStats().runs);
+}
+
+test "CycleCallbacks signature compiles" {
+    // This test verifies the callback signature is correct
+    // by creating mock implementations
+    const MockCallbacks = struct {
+        fn getRefCount(_: usize) u32 {
+            return 1;
+        }
+        fn setRefCount(_: usize, _: u32) void {}
+        fn getColor(_: usize) Color {
+            return .black;
+        }
+        fn setColor(_: usize, _: Color) void {}
+        fn forEachRef(_: usize, _: ?*anyopaque, _: *const fn (?*anyopaque, usize) void) void {}
+        fn free(_: usize) void {}
+    };
+
+    const callbacks = CycleCallbacks{
+        .getRefCount = MockCallbacks.getRefCount,
+        .setRefCount = MockCallbacks.setRefCount,
+        .getColor = MockCallbacks.getColor,
+        .setColor = MockCallbacks.setColor,
+        .forEachRef = MockCallbacks.forEachRef,
+        .free = MockCallbacks.free,
+    };
+
+    // Just verify it compiles - callbacks struct is valid
+    try std.testing.expect(callbacks.getRefCount(0) == 1);
 }

@@ -23,6 +23,14 @@ const checker = @import("../checker/typechecker.zig");
 const symbol_mod = @import("../checker/symbol.zig");
 const types_mod = @import("../ast/types.zig");
 
+// Module loader for cross-module symbol resolution
+const module_loader = @import("../module/loader.zig");
+const ast = @import("../ast/ast.zig");
+
+// DRC (Deferred Reference Counting) for ownership analysis
+const drc_mod = @import("../analysis/drc.zig");
+const drc_analyzer = @import("../analysis/drc_analyzer.zig");
+
 // ============================================================================
 // LSP Types - Structured JSON serialization
 // ============================================================================
@@ -959,12 +967,25 @@ pub const Server = struct {
     // Background worker for stale-while-revalidate pattern
     background_worker: ?BackgroundWorker = null,
 
+    // Module loader for cross-module symbol resolution (go-to-definition, hover)
+    module_arena: ?*ast.ASTArena = null,
+    loader: ?*module_loader.ModuleLoader = null,
+
+    // DRC cache - maps file URI to DRC analysis results
+    // Used for ownership diagnostics and hover information
+    drc_cache: std.StringHashMap(*drc_mod.Drc) = undefined,
+    drc_cache_initialized: bool = false,
+
     pub fn init(allocator: std.mem.Allocator) Server {
         return .{
             .allocator = allocator,
             .documents = file_store.FileStore.init(allocator),
             .transam_db = null,
             .background_worker = null,
+            .module_arena = null,
+            .loader = null,
+            .drc_cache = std.StringHashMap(*drc_mod.Drc).init(allocator),
+            .drc_cache_initialized = true,
         };
     }
 
@@ -979,6 +1000,165 @@ pub const Server = struct {
         }
     }
 
+    /// Initialize ModuleLoader for cross-module symbol resolution
+    pub fn initModuleLoader(self: *Server) !void {
+        if (self.loader != null) return;
+
+        // Create arena for module ASTs
+        const arena = try self.allocator.create(ast.ASTArena);
+        arena.* = ast.ASTArena.init(self.allocator);
+        self.module_arena = arena;
+
+        // Create module loader
+        const loader_ptr = try self.allocator.create(module_loader.ModuleLoader);
+        loader_ptr.* = module_loader.ModuleLoader.init(self.allocator, arena) catch |err| {
+            std.log.err("[mls] Failed to init ModuleLoader: {}", .{err});
+            self.allocator.destroy(arena);
+            self.module_arena = null;
+            return err;
+        };
+        self.loader = loader_ptr;
+
+        // Load standard library macros
+        loader_ptr.loadStdMacros() catch |err| {
+            std.log.warn("[mls] Failed to load std macros: {}", .{err});
+        };
+
+        std.log.info("[mls] ModuleLoader initialized", .{});
+    }
+
+    /// Load a module file into the module loader (for cross-module resolution)
+    /// Also loads all imported dependencies transitively and records in Trans-Am
+    pub fn loadModuleFile(self: *Server, file_path: []const u8) void {
+        const loader_ptr = self.loader orelse return;
+
+        // Load the main module
+        const module = loader_ptr.loadModule(file_path) catch |err| {
+            std.log.debug("[mls] Could not load module {s}: {}", .{ file_path, err });
+            return;
+        };
+
+        // Load all imported dependencies and record in Trans-Am for invalidation tracking
+        for (module.imports.items) |import_decl| {
+            if (import_decl.resolved_path) |resolved| {
+                // Record the import relationship in Trans-Am
+                if (self.transam_db) |*db| {
+                    db.recordModuleImport(file_path, resolved) catch {};
+                }
+
+                // Load the dependency if not already loaded
+                if (!loader_ptr.modules.contains(resolved)) {
+                    _ = loader_ptr.loadModule(resolved) catch |err| {
+                        std.log.debug("[mls] Could not load dependency {s}: {}", .{ resolved, err });
+                    };
+                }
+            }
+        }
+    }
+
+    /// Ensure an imported module is loaded (on-demand loading for lookups)
+    fn ensureImportedModuleLoaded(self: *Server, resolved_path: []const u8) ?*module_loader.Module {
+        const loader_ptr = self.loader orelse return null;
+
+        // Check if already loaded
+        if (loader_ptr.modules.get(resolved_path)) |module| {
+            return module;
+        }
+
+        // Try to load it on-demand
+        const module = loader_ptr.loadModule(resolved_path) catch |err| {
+            std.log.debug("[mls] On-demand load failed for {s}: {}", .{ resolved_path, err });
+            return null;
+        };
+
+        return module;
+    }
+
+    /// Reload a module after it has been modified
+    /// Uses in-memory content from Trans-Am (editor buffer) instead of disk
+    fn reloadModule(self: *Server, file_path: []const u8) void {
+        const loader_ptr = self.loader orelse return;
+
+        // Try to get content from Trans-Am (editor's in-memory buffer)
+        // This is critical: the editor may have unsaved changes
+        const source = if (self.transam_db) |*db|
+            db.getFileText(file_path)
+        else
+            null;
+
+        const module = if (source) |content| blk: {
+            // Use in-memory content (preferred - matches what user sees in editor)
+            std.log.debug("[mls] Reloading module from editor buffer: {s}", .{file_path});
+            break :blk loader_ptr.loadModuleFromSource(file_path, content) catch |err| {
+                std.log.debug("[mls] Failed to reload module from source {s}: {}", .{ file_path, err });
+                return;
+            };
+        } else blk: {
+            // Fallback to disk (for initial loads or when Trans-Am not available)
+            std.log.debug("[mls] Reloading module from disk: {s}", .{file_path});
+            break :blk loader_ptr.loadModule(file_path) catch |err| {
+                std.log.debug("[mls] Failed to reload module from disk {s}: {}", .{ file_path, err });
+                return;
+            };
+        };
+
+        // Re-record imports in Trans-Am
+        for (module.imports.items) |import_decl| {
+            if (import_decl.resolved_path) |resolved| {
+                if (self.transam_db) |*db| {
+                    db.recordModuleImport(file_path, resolved) catch {};
+                }
+            }
+        }
+
+        std.log.debug("[mls] Reloaded module: {s}", .{file_path});
+    }
+
+    /// Result of looking up a symbol in imported modules
+    const ImportedSymbolLookup = struct {
+        exported: module_loader.Module.ExportedSymbol,
+        source_path: []const u8, // The module path where the symbol is defined
+    };
+
+    /// Look up a symbol in imported modules
+    /// Returns both the exported symbol info and the source module path
+    fn lookupImportedSymbol(
+        self: *Server,
+        loader_ptr: *module_loader.ModuleLoader,
+        current_path: []const u8,
+        symbol_name: []const u8,
+    ) ?ImportedSymbolLookup {
+        // Get the current module to find its imports
+        const current_module = loader_ptr.modules.get(current_path) orelse return null;
+
+        // Check each import declaration for the symbol
+        for (current_module.imports.items) |import_decl| {
+            // Get the resolved path for this import
+            const resolved = import_decl.resolved_path orelse continue;
+
+            // Get the imported module (load on-demand if needed)
+            const imported_module = loader_ptr.modules.get(resolved) orelse
+                self.ensureImportedModuleLoaded(resolved) orelse continue;
+
+            // Check if it exports the symbol
+            if (imported_module.exports.get(symbol_name)) |exported| {
+                return .{
+                    .exported = exported,
+                    .source_path = resolved,
+                };
+            }
+        }
+
+        return null;
+    }
+
+    /// Get symbol info from an imported module (convenience wrapper)
+    pub fn getImportedSymbol(self: *Server, current_file: []const u8, symbol_name: []const u8) ?module_loader.Module.ExportedSymbol {
+        const loader_ptr = self.loader orelse return null;
+        const lookup = self.lookupImportedSymbol(loader_ptr, current_file, symbol_name) orelse return null;
+        return lookup.exported;
+    }
+
     pub fn deinit(self: *Server) void {
         // Clean up background worker first (before Trans-Am)
         if (self.background_worker) |*bw| {
@@ -986,6 +1166,24 @@ pub const Server = struct {
         }
         if (self.transam_db) |*db| {
             db.deinit();
+        }
+        // Clean up module loader
+        if (self.loader) |loader_ptr| {
+            loader_ptr.deinit();
+            self.allocator.destroy(loader_ptr);
+        }
+        if (self.module_arena) |arena| {
+            arena.deinit();
+            self.allocator.destroy(arena);
+        }
+        // Clean up DRC cache
+        if (self.drc_cache_initialized) {
+            var iter = self.drc_cache.valueIterator();
+            while (iter.next()) |drc_ptr| {
+                drc_ptr.*.deinit();
+                self.allocator.destroy(drc_ptr.*);
+            }
+            self.drc_cache.deinit();
         }
         self.documents.deinit();
     }
@@ -1130,7 +1328,11 @@ pub const Server = struct {
             self.initTransAm() catch |err| {
                 try stderr.print("[mls] Warning: Failed to init Trans-Am: {}\n", .{err});
             };
-            try stderr.writeAll("[mls] Client initialized (Trans-Am ready)\n");
+            // Initialize ModuleLoader for cross-module symbol resolution
+            self.initModuleLoader() catch |err| {
+                try stderr.print("[mls] Warning: Failed to init ModuleLoader: {}\n", .{err});
+            };
+            try stderr.writeAll("[mls] Client initialized (Trans-Am + ModuleLoader ready)\n");
         } else if (std.mem.eql(u8, method, "exit")) {
             try stderr.writeAll("[mls] Exit notification received\n");
             const exit_code: u8 = if (self.shutdown_requested) 0 else 1;
@@ -1210,6 +1412,17 @@ pub const Server = struct {
         const text = text_document.object.get("text") orelse return;
         const version = text_document.object.get("version") orelse return;
 
+        // Convert URI to file path FIRST for consistent keying across Trans-Am and ModuleLoader
+        // CRITICAL: Both handleDidOpen and handleDidChange must use file_path (not URI) for Trans-Am
+        // to ensure reloadModule can find content via getFileText(file_path)
+        const file_path = uriToPath(uri.string) orelse {
+            try stderr.print("[mls] Warning: Could not convert URI to path: {s}\n", .{uri.string});
+            // Still store in documents for basic LSP functionality
+            _ = try self.documents.set(uri.string, text.string, @intCast(version.integer));
+            try self.runDiagnostics(uri.string, stdout, stderr);
+            return;
+        };
+
         _ = try self.documents.set(
             uri.string,
             text.string,
@@ -1217,17 +1430,24 @@ pub const Server = struct {
         );
 
         // Feed into Trans-Am for incremental computation
+        // Use file_path (not uri.string) to match handleDidChange and reloadModule
         if (self.transam_db) |*db| {
-            const changed = db.setFileText(uri.string, text.string) catch false;
+            const changed = db.setFileText(file_path, text.string) catch false;
             if (changed) {
                 try stderr.print("[mls] Trans-Am: file registered (revision {d})\n", .{db.getRevision().value});
             }
         }
 
+        // Load module into ModuleLoader for cross-module resolution
+        if (self.loader != null) {
+            self.loadModuleFile(file_path);
+            try stderr.print("[mls] ModuleLoader: loaded {s}\n", .{file_path});
+        }
+
         // Queue background pre-warming for faster subsequent requests
         if (self.background_worker) |*bw| {
-            const file_hash = transam.hashString(uri.string);
-            bw.queue(.prewarm, .open, file_hash, uri.string) catch {};
+            const file_hash = transam.hashString(file_path);
+            bw.queue(.prewarm, .open, file_hash, file_path) catch {};
         }
 
         try stderr.print("[mls] Opened: {s} (version {d}, {d} bytes)\n", .{
@@ -1292,13 +1512,39 @@ pub const Server = struct {
 
         const content_len = if (entry.text) |t| t.len else 0;
 
+        // Convert URI to file path for consistent Trans-Am tracking
+        // C5 fix: Don't fallback to URI - skip Trans-Am ops if conversion fails
+        const file_path = uriToPath(uri.string) orelse {
+            try stderr.print("[mls] Warning: Could not convert URI to path: {s}\n", .{uri.string});
+            // Still run diagnostics but skip module tracking
+            try self.runDiagnostics(uri.string, stdout, stderr);
+            return;
+        };
+
         // Feed updated content into Trans-Am for incremental recomputation
+        var content_changed = false;
         if (self.transam_db) |*db| {
             if (entry.text) |current_text| {
-                const changed = db.setFileText(uri.string, current_text) catch false;
-                if (changed) {
+                content_changed = db.setFileText(file_path, current_text) catch false;
+                if (content_changed) {
                     try stderr.print("[mls] Trans-Am: revision {d}\n", .{db.getRevision().value});
+
+                    // Invalidate modules that depend on this file
+                    const invalidated = db.invalidateDependents(file_path) catch 0;
+                    if (invalidated > 0) {
+                        try stderr.print("[mls] Invalidated {d} dependent module(s)\n", .{invalidated});
+                    }
+
+                    // Clear old imports before reloading
+                    db.clearModuleImports(file_path);
                 }
+            }
+        }
+
+        // C6 fix: Only reload module when content actually changed
+        if (content_changed) {
+            if (self.loader != null) {
+                self.reloadModule(file_path);
             }
         }
 
@@ -1356,6 +1602,9 @@ pub const Server = struct {
 
         const line: u32 = @intCast(position.object.get("line").?.integer);
         const character: u32 = @intCast(position.object.get("character").?.integer);
+
+        // Convert URI to file path for Trans-Am queries (must match setFileText key)
+        const file_path = uriToPath(uri.string);
 
         const entry = self.documents.getEntry(uri.string) orelse {
             try self.sendResponse(Response.nullResult(id), stdout, stderr);
@@ -1435,19 +1684,51 @@ pub const Server = struct {
                     return;
                 }
 
+                // Try Trans-Am symbol lookup (use file_path to match setFileText key)
                 if (self.transam_db) |*db| {
-                    // Look up the symbol at the hover position (position-aware for shadowing)
-                    // This ensures we find the correct symbol when multiple variables share the same name
-                    // Note: LSP uses 0-based lines, our parser uses 1-based, so add 1 to convert
-                    const parser_line = line + 1;
-                    const symbol_result = db.lookupSymbolAtPosition(uri.string, tok.text, parser_line, character) catch null;
-                    if (symbol_result) |symbol| {
-                        const hover_text = formatSymbolHover(self.allocator, symbol) catch null;
-                        if (hover_text) |content| {
-                            defer self.allocator.free(content);
+                    if (file_path) |path| {
+                        // Look up the symbol at the hover position (position-aware for shadowing)
+                        // This ensures we find the correct symbol when multiple variables share the same name
+                        // Note: LSP uses 0-based lines, our parser uses 1-based, so add 1 to convert
+                        const parser_line = line + 1;
+                        const symbol_result = db.lookupSymbolAtPosition(path, tok.text, parser_line, character) catch null;
+                        if (symbol_result) |symbol| {
+                            const hover_text = formatSymbolHover(self.allocator, symbol) catch null;
+                            if (hover_text) |content| {
+                                // Append ownership info for variables (DRC analysis)
+                                var final_content: []const u8 = content;
+                                defer self.allocator.free(content);
+
+                                if (symbol.kind == .variable or symbol.kind == .parameter) {
+                                    if (self.getOwnershipHoverInfo(uri.string, tok.text)) |ownership_info| {
+                                        defer self.allocator.free(ownership_info);
+                                        // Combine hover content with ownership info
+                                        var combined = std.ArrayList(u8).init(self.allocator);
+                                        combined.appendSlice(content) catch {};
+                                        combined.appendSlice("\n\n---\n\n") catch {};
+                                        combined.appendSlice(ownership_info) catch {};
+                                        final_content = combined.toOwnedSlice() catch content;
+                                    }
+                                }
+
+                                const elapsed_ms = std.time.milliTimestamp() - start_time;
+                                try stderr.print("[mls] Hover: type info for '{s}' ({d}ms)\n", .{ tok.text, elapsed_ms });
+                                try self.sendHoverResponse(id, final_content, tok, stdout, stderr);
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                // Try cross-module lookup via ModuleLoader
+                if (self.loader) |loader_ptr| {
+                    if (file_path) |current_path| {
+                        const imported_hover = self.getImportedSymbolHover(loader_ptr, current_path, tok.text) catch null;
+                        if (imported_hover) |imported_content| {
+                            defer self.allocator.free(imported_content);
                             const elapsed_ms = std.time.milliTimestamp() - start_time;
-                            try stderr.print("[mls] Hover: type info for '{s}' ({d}ms)\n", .{ tok.text, elapsed_ms });
-                            try self.sendHoverResponse(id, content, tok, stdout, stderr);
+                            try stderr.print("[mls] Hover: cross-module '{s}' ({d}ms)\n", .{ tok.text, elapsed_ms });
+                            try self.sendHoverResponse(id, imported_content, tok, stdout, stderr);
                             return;
                         }
                     }
@@ -1701,6 +1982,34 @@ pub const Server = struct {
         }
 
         return null;
+    }
+
+    /// Get hover content for a symbol imported from another module
+    fn getImportedSymbolHover(
+        self: *Server,
+        loader_ptr: *module_loader.ModuleLoader,
+        current_path: []const u8,
+        symbol_name: []const u8,
+    ) !?[]const u8 {
+        // Use common lookup helper
+        const lookup = self.lookupImportedSymbol(loader_ptr, current_path, symbol_name) orelse return null;
+
+        // Build hover content based on the symbol kind
+        const kind_str = switch (lookup.exported.kind) {
+            .macro => "macro",
+            .function => "function",
+            .class => "class",
+            .variable => "const",
+        };
+
+        // Get the source file basename
+        const source_file = std.fs.path.basename(lookup.source_path);
+
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "```typescript\n{s} {s}\n```\n*Imported from `{s}`*",
+            .{ kind_str, symbol_name, source_file },
+        );
     }
 
     /// Check if identifier is preceded by @ (macro invocation)
@@ -2016,6 +2325,9 @@ pub const Server = struct {
         const line: u32 = @intCast(position.object.get("line").?.integer);
         const character: u32 = @intCast(position.object.get("character").?.integer);
 
+        // Convert URI to file path for Trans-Am queries (must match setFileText key)
+        const file_path = uriToPath(uri.string);
+
         const entry = self.documents.getEntry(uri.string) orelse {
             try self.sendResponse(Response.nullResult(id), stdout, stderr);
             return;
@@ -2082,38 +2394,51 @@ pub const Server = struct {
         }
 
         // Try Trans-Am symbol table lookup first (type-aware, scope-aware, position-aware)
+        // Use file_path (not uri.string) to match setFileText key
         if (self.transam_db) |*db| {
-            // Use position-aware lookup to handle shadowed variables correctly
-            // LSP uses 0-based lines, parser uses 1-based, so add 1 to convert
-            const parser_line = line + 1;
-            const symbol_opt = db.lookupSymbolAtPosition(uri.string, target_name.?, parser_line, character) catch null;
-            if (symbol_opt) |symbol| {
-                // Found symbol in type checker's symbol table
-                var buf = std.ArrayList(u8).init(self.allocator);
-                defer buf.deinit();
+            if (file_path) |path| {
+                // Use position-aware lookup to handle shadowed variables correctly
+                // LSP uses 0-based lines, parser uses 1-based, so add 1 to convert
+                const parser_line = line + 1;
+                const symbol_opt = db.lookupSymbolAtPosition(path, target_name.?, parser_line, character) catch null;
+                if (symbol_opt) |symbol| {
+                    // Found symbol in type checker's symbol table
+                    var buf = std.ArrayList(u8).init(self.allocator);
+                    defer buf.deinit();
 
-                const writer = buf.writer();
-                try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
-                try std.json.stringify(id, .{}, writer);
-                try writer.writeAll(",\"result\":{\"uri\":");
-                try std.json.stringify(uri.string, .{}, writer);
+                    const writer = buf.writer();
+                    try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+                    try std.json.stringify(id, .{}, writer);
+                    try writer.writeAll(",\"result\":{\"uri\":");
+                    try std.json.stringify(uri.string, .{}, writer);
 
-                // SourceLocation uses 1-based lines, LSP uses 0-based
-                const def_line = if (symbol.location.start.line > 0) symbol.location.start.line - 1 else 0;
-                try writer.writeAll(",\"range\":{\"start\":{\"line\":");
-                try writer.print("{d}", .{def_line});
-                try writer.writeAll(",\"character\":");
-                try writer.print("{d}", .{symbol.location.start.column});
-                try writer.writeAll("},\"end\":{\"line\":");
-                const end_line = if (symbol.location.end.line > 0) symbol.location.end.line - 1 else def_line;
-                try writer.print("{d}", .{end_line});
-                try writer.writeAll(",\"character\":");
-                try writer.print("{d}", .{symbol.location.end.column});
-                try writer.writeAll("}}}}");
+                    // SourceLocation uses 1-based lines, LSP uses 0-based
+                    const def_line = if (symbol.location.start.line > 0) symbol.location.start.line - 1 else 0;
+                    try writer.writeAll(",\"range\":{\"start\":{\"line\":");
+                    try writer.print("{d}", .{def_line});
+                    try writer.writeAll(",\"character\":");
+                    try writer.print("{d}", .{symbol.location.start.column});
+                    try writer.writeAll("},\"end\":{\"line\":");
+                    const end_line = if (symbol.location.end.line > 0) symbol.location.end.line - 1 else def_line;
+                    try writer.print("{d}", .{end_line});
+                    try writer.writeAll(",\"character\":");
+                    try writer.print("{d}", .{symbol.location.end.column});
+                    try writer.writeAll("}}}}");
 
-                try jsonrpc.writeMessage(stdout, buf.items);
-                try stderr.print("[mls] Definition (Trans-Am): {s} at line {d}\n", .{ target_name.?, def_line + 1 });
-                return;
+                    try jsonrpc.writeMessage(stdout, buf.items);
+                    try stderr.print("[mls] Definition (Trans-Am): {s} at line {d}\n", .{ target_name.?, def_line + 1 });
+                    return;
+                }
+            }
+        }
+
+        // Try cross-module lookup via ModuleLoader (file_path already computed above)
+        if (self.loader) |loader_ptr| {
+            if (file_path) |current_path| {
+                // Check if target is an imported symbol
+                if (try self.findImportedSymbolDefinition(loader_ptr, current_path, target_name.?, id, stdout, stderr)) {
+                    return;
+                }
             }
         }
 
@@ -2324,6 +2649,68 @@ pub const Server = struct {
         return false;
     }
 
+    /// Find definition of an imported symbol in its source module
+    fn findImportedSymbolDefinition(
+        self: *Server,
+        loader_ptr: *module_loader.ModuleLoader,
+        current_path: []const u8,
+        symbol_name: []const u8,
+        id: std.json.Value,
+        stdout: anytype,
+        stderr: anytype,
+    ) !bool {
+        // Use common lookup helper
+        const lookup = self.lookupImportedSymbol(loader_ptr, current_path, symbol_name) orelse return false;
+
+        // Get the declaration node's location
+        const node = lookup.exported.node;
+        const loc = node.location;
+
+        // Build file URI for the source module
+        var abs_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const abs_path = std.fs.cwd().realpath(lookup.source_path, &abs_path_buf) catch {
+            return false;
+        };
+
+        const file_uri = try std.fmt.allocPrint(
+            self.allocator,
+            "file://{s}",
+            .{abs_path},
+        );
+        defer self.allocator.free(file_uri);
+
+        // Send location response
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+
+        const writer = buf.writer();
+        try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+        try std.json.stringify(id, .{}, writer);
+        try writer.writeAll(",\"result\":{\"uri\":");
+        try std.json.stringify(file_uri, .{}, writer);
+
+        // SourceLocation uses 1-based lines, LSP uses 0-based
+        const def_line = if (loc.start.line > 0) loc.start.line - 1 else 0;
+        try writer.writeAll(",\"range\":{\"start\":{\"line\":");
+        try writer.print("{d}", .{def_line});
+        try writer.writeAll(",\"character\":");
+        try writer.print("{d}", .{loc.start.column});
+        try writer.writeAll("},\"end\":{\"line\":");
+        const end_line = if (loc.end.line > 0) loc.end.line - 1 else def_line;
+        try writer.print("{d}", .{end_line});
+        try writer.writeAll(",\"character\":");
+        try writer.print("{d}", .{loc.end.column});
+        try writer.writeAll("}}}}");
+
+        try jsonrpc.writeMessage(stdout, buf.items);
+        try stderr.print("[mls] Definition (cross-module): {s} in {s} at line {d}\n", .{
+            symbol_name,
+            lookup.source_path,
+            def_line + 1,
+        });
+        return true;
+    }
+
     // =========================================================================
     // Completion
     // =========================================================================
@@ -2348,11 +2735,14 @@ pub const Server = struct {
             return;
         };
 
+        // Convert URI to file path for Trans-Am queries (must match setFileText key)
+        const file_path = uriToPath(uri.string);
+
         const entry = self.documents.getEntry(uri.string) orelse {
             try self.sendResponse(Response.nullResult(id), stdout, stderr);
             return;
         };
-        _ = entry; // We use uri.string as file_id for Trans-Am
+        _ = entry;
 
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
@@ -2396,8 +2786,9 @@ pub const Server = struct {
         }
 
         // Add symbols from document using cached completions (L4)
+        // Use file_path (not uri.string) to match setFileText key
         if (self.transam_db) |*db| {
-            const completions = db.getCompletions(uri.string) catch null;
+            const completions = if (file_path) |path| db.getCompletions(path) catch null else null;
             if (completions) |result| {
                 defer self.allocator.free(result.items);
                 for (result.items) |item| {
@@ -2415,11 +2806,13 @@ pub const Server = struct {
                         item_count,
                         if (result.is_stale) ", stale" else "",
                     });
-                    // Queue background refresh if stale
+                    // Queue background refresh if stale (use file_path for consistency)
                     if (result.is_stale) {
                         if (self.background_worker) |*bw| {
-                            const file_hash = transam.hashString(uri.string);
-                            bw.queue(.completion_refresh, .visible, file_hash, uri.string) catch {};
+                            if (file_path) |path| {
+                                const file_hash = transam.hashString(path);
+                                bw.queue(.completion_refresh, .visible, file_hash, path) catch {};
+                            }
                         }
                     }
                 } else {
@@ -2462,14 +2855,18 @@ pub const Server = struct {
             return;
         };
 
+        // Convert URI to file path for Trans-Am queries (must match setFileText key)
+        const file_path = uriToPath(uri.string);
+
         // Convert to semantic token data
         // Each token is 5 integers: deltaLine, deltaStart, length, tokenType, tokenModifiers
         var data = std.ArrayList(u32).init(self.allocator);
         defer data.deinit();
 
-        // Try Trans-Am first (fast path with caching)
+        // Try Trans-Am first (fast path with caching) - use file_path to match setFileText key
         const used_transam = if (self.transam_db) |*db| blk: {
-            const syntax_tokens = db.getSyntaxTokens(uri.string) catch {
+            const path = file_path orelse break :blk false;
+            const syntax_tokens = db.getSyntaxTokens(path) catch {
                 break :blk false;
             };
             defer self.allocator.free(syntax_tokens);
@@ -2664,12 +3061,17 @@ pub const Server = struct {
     pub fn runDiagnostics(self: *Server, uri: []const u8, stdout: anytype, stderr: anytype) !void {
         const start_time = std.time.milliTimestamp();
 
+        // Convert URI to file path for Trans-Am queries (must match setFileText key)
+        // Keep uri for documents store and LSP responses
+        const file_path = uriToPath(uri);
+
         var diagnostics = std.ArrayList(Diagnostic).init(self.allocator);
         defer diagnostics.deinit();
 
-        // Try Trans-Am first (fast path with caching)
+        // Try Trans-Am first (fast path with caching) - use file_path to match setFileText key
         const used_transam = if (self.transam_db) |*db| blk: {
-            const transam_diags = db.getDiagnostics(uri) catch {
+            const path = file_path orelse break :blk false;
+            const transam_diags = db.getDiagnostics(path) catch {
                 break :blk false;
             };
             defer db.freeDiagnostics(transam_diags);
@@ -2696,7 +3098,7 @@ pub const Server = struct {
             // Run type checker using cached Trans-Am infrastructure
             // (avoids creating new TypeChecker each time)
             if (transam_diags.len == 0) {
-                const check_result = db.checkFile(uri) catch {
+                const check_result = db.checkFile(path) catch {
                     break :blk true;
                 };
 
@@ -2717,6 +3119,37 @@ pub const Server = struct {
                         .source = "mls-typecheck",
                         .message = type_err.message,
                     });
+                }
+
+                // Run DRC analysis for memory management diagnostics (use-after-move, cycles)
+                // Only run if no type errors - DRC needs a clean AST
+                if (check_result.errors.len == 0) {
+                    const drc_diags = db.getDrcDiagnostics(path) catch &[_]transam.DrcDiagnosticType{};
+                    defer db.freeDrcDiagnostics(drc_diags);
+
+                    for (drc_diags) |drc_diag| {
+                        // Copy message before freeDrcDiagnostics is called (defer above)
+                        const message_copy = try self.allocator.dupe(u8, drc_diag.message);
+                        try diagnostics.append(.{
+                            .range = .{
+                                .start = .{
+                                    .line = if (drc_diag.line > 0) drc_diag.line - 1 else 0,
+                                    .character = drc_diag.column,
+                                },
+                                .end = .{
+                                    .line = if (drc_diag.end_line > 0) drc_diag.end_line - 1 else 0,
+                                    .character = drc_diag.end_column,
+                                },
+                            },
+                            .severity = switch (drc_diag.severity) {
+                                .@"error" => .@"error",
+                                .warning => .warning,
+                                .hint => .hint,
+                            },
+                            .source = "mls-drc",
+                            .message = message_copy,
+                        });
+                    }
                 }
             }
 
@@ -2819,7 +3252,198 @@ pub const Server = struct {
 
         try jsonrpc.writeMessage(stdout, buf.items);
     }
+
+    // ========================================================================
+    // DRC (Ownership Analysis) Integration
+    // ========================================================================
+
+    /// Convert a DRC diagnostic to an LSP diagnostic
+    fn convertDrcDiagnostic(drc_diag: drc_mod.DrcDiagnostic) Diagnostic {
+        // Convert DRC severity to LSP severity
+        const severity: DiagnosticSeverity = switch (drc_diag.severity) {
+            .@"error" => .@"error",
+            .warning => .warning,
+            .hint => .hint,
+        };
+
+        // Convert DRC code to string
+        const code: []const u8 = switch (drc_diag.code) {
+            .use_after_move => "use-after-move",
+            .potential_cycle => "potential-cycle",
+            .uninitialized_use => "uninitialized-use",
+            .double_free_risk => "double-free-risk",
+        };
+
+        return Diagnostic{
+            .range = .{
+                .start = .{
+                    // DRC uses 1-based lines, LSP uses 0-based
+                    .line = if (drc_diag.line > 0) drc_diag.line - 1 else 0,
+                    .character = if (drc_diag.column > 0) drc_diag.column - 1 else 0,
+                },
+                .end = .{
+                    .line = if (drc_diag.end_line > 0) drc_diag.end_line - 1 else (if (drc_diag.line > 0) drc_diag.line - 1 else 0),
+                    .character = if (drc_diag.end_column > 0) drc_diag.end_column - 1 else (if (drc_diag.column > 0) drc_diag.column - 1 else 0),
+                },
+            },
+            .severity = severity,
+            .code = code,
+            .source = "drc",
+            .message = drc_diag.message,
+        };
+    }
+
+    /// Run DRC analysis on a typed AST and cache the results
+    /// Returns the DRC diagnostics converted to LSP format
+    pub fn runDrcAnalysis(self: *Server, uri: []const u8, typed_ast: *ast.Node) ![]Diagnostic {
+        // Remove old cached DRC if exists
+        if (self.drc_cache.get(uri)) |old_drc| {
+            old_drc.deinit();
+            self.allocator.destroy(old_drc);
+            _ = self.drc_cache.remove(uri);
+        }
+
+        // Create new DRC analyzer
+        const drc_ptr = try self.allocator.create(drc_mod.Drc);
+        drc_ptr.* = drc_mod.Drc.init(self.allocator);
+
+        // Run analysis
+        var analyzer = drc_analyzer.DrcAnalyzer.init(drc_ptr);
+        analyzer.analyze(typed_ast) catch |err| {
+            std.log.warn("[mls] DRC analysis failed: {}", .{err});
+            drc_ptr.deinit();
+            self.allocator.destroy(drc_ptr);
+            return &[_]Diagnostic{};
+        };
+
+        // Finalize DRC (compute diagnostics)
+        drc_ptr.finalize() catch |err| {
+            std.log.warn("[mls] DRC finalize failed: {}", .{err});
+        };
+
+        // Cache the DRC results (need to dupe the key since uri may be temporary)
+        const uri_copy = try self.allocator.dupe(u8, uri);
+        try self.drc_cache.put(uri_copy, drc_ptr);
+
+        // Convert diagnostics to LSP format
+        const drc_diags = drc_ptr.getDiagnostics();
+        var lsp_diags = std.ArrayList(Diagnostic).init(self.allocator);
+
+        for (drc_diags) |drc_diag| {
+            try lsp_diags.append(convertDrcDiagnostic(drc_diag));
+        }
+
+        return lsp_diags.toOwnedSlice();
+    }
+
+    /// Get cached DRC results for a file (for hover information)
+    pub fn getCachedDrc(self: *Server, uri: []const u8) ?*drc_mod.Drc {
+        return self.drc_cache.get(uri);
+    }
+
+    /// Get ownership information for a variable at a specific location
+    /// Returns formatted hover text or null if no ownership info available
+    pub fn getOwnershipHoverInfo(self: *Server, uri: []const u8, var_name: []const u8) ?[]const u8 {
+        // First try server-side DRC cache
+        if (self.getCachedDrc(uri)) |drc| {
+            if (drc.variables.get(var_name)) |variable| {
+                return self.formatOwnershipInfo(variable);
+            }
+        }
+
+        // Fall back to Trans-Am on-demand query
+        const file_path = uriToPath(uri) orelse return null;
+        if (self.transam_db) |*db| {
+            const ownership = db.getVariableOwnership(file_path, var_name) catch return null;
+            if (ownership) |o| {
+                // Create a temporary variable struct for formatting
+                const variable = drc_mod.Variable{
+                    .name = var_name,
+                    .type_kind = .unknown,
+                    .scope_depth = 0,
+                    .line = 0,
+                    .column = 0,
+                    .needs_rc = o.needs_rc,
+                    .is_parameter = o.is_parameter,
+                    .is_module_level = o.is_module_level,
+                    .ownership_state = o.ownership_state,
+                };
+                return self.formatOwnershipInfo(variable);
+            }
+        }
+
+        return null;
+    }
+
+    /// Format ownership information for hover display
+    fn formatOwnershipInfo(self: *Server, variable: drc_mod.Variable) ?[]const u8 {
+        var buf = std.ArrayList(u8).init(self.allocator);
+        const writer = buf.writer();
+
+        writer.print("**Ownership:** ", .{}) catch return null;
+
+        switch (variable.ownership_state) {
+            .owned => writer.writeAll("`owned`") catch return null,
+            .borrowed => writer.writeAll("`borrowed`") catch return null,
+            .moved => writer.writeAll("`moved` ⚠️") catch return null,
+            .unknown => writer.writeAll("`unknown`") catch return null,
+        }
+
+        writer.writeAll("\n") catch return null;
+
+        // Add RC info
+        if (variable.needs_rc) {
+            writer.writeAll("**RC managed:** Yes\n") catch return null;
+        } else {
+            writer.writeAll("**RC managed:** No (value type)\n") catch return null;
+        }
+
+        // Add cleanup info
+        if (variable.is_module_level) {
+            writer.writeAll("**Lifetime:** Static (module-level)\n") catch return null;
+        } else if (variable.is_parameter) {
+            writer.writeAll("**Lifetime:** Borrowed from caller\n") catch return null;
+        } else if (variable.ownership_state == .moved) {
+            writer.writeAll("**Lifetime:** Moved (do not use)\n") catch return null;
+        } else if (variable.needs_rc) {
+            writer.writeAll("**Lifetime:** Cleanup at scope exit\n") catch return null;
+        }
+
+        return buf.toOwnedSlice() catch return null;
+    }
 };
+
+// ============================================================================
+// URI Utilities
+// ============================================================================
+
+/// Convert a file:// URI to a file system path
+/// e.g., "file:///Users/foo/bar.ms" -> "/Users/foo/bar.ms"
+/// Handles URL-encoded characters (e.g., %20 → space)
+/// Note: On macOS/Linux, file:// URIs have format file:///path
+/// On Windows, they're file:///C:/path (but we don't handle Windows yet)
+fn uriToPath(uri: []const u8) ?[]const u8 {
+    const prefix = "file://";
+    if (!std.mem.startsWith(u8, uri, prefix)) {
+        return null;
+    }
+
+    const encoded_path = uri[prefix.len..];
+
+    // Fast path: if no % encoding, return as-is
+    if (std.mem.indexOf(u8, encoded_path, "%") == null) {
+        return encoded_path;
+    }
+
+    // For now, return the encoded path - full URL decoding would need allocation
+    // TODO: Implement proper URL decoding with allocator for paths with special characters
+    return encoded_path;
+}
+
+/// Convert a file system path to a file:// URI
+fn pathToUri(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "file://{s}", .{path});
+}
 
 // ============================================================================
 // Unit Tests

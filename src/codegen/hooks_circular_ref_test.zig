@@ -30,7 +30,7 @@ test "HookGenerator: circular reference User→Post→User" {
     // User_destroy should handle posts array
     try testing.expect(std.mem.indexOf(u8, generated_user, "User_destroy") != null);
     try testing.expect(std.mem.indexOf(u8, generated_user, "ms_string_decref(self->name)") != null);
-    try testing.expect(std.mem.indexOf(u8, generated_user, "// TODO: Clean up array posts") != null);
+    try testing.expect(std.mem.indexOf(u8, generated_user, "// Array posts: element type unknown") != null);
 
     const post_class = hooks.ClassDef{
         .name = "Post",
@@ -175,7 +175,7 @@ test "HookGenerator: graph node with multiple edges" {
 
     // GraphNode_destroy should handle neighbors array
     try testing.expect(std.mem.indexOf(u8, generated, "GraphNode_destroy") != null);
-    try testing.expect(std.mem.indexOf(u8, generated, "// TODO: Clean up array neighbors") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "// Array neighbors: element type unknown") != null);
 
     // GraphNode_trace should trace neighbors
     try testing.expect(std.mem.indexOf(u8, generated, "GraphNode_trace") != null);

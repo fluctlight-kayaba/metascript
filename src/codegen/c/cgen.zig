@@ -32,6 +32,10 @@ const node_mod = @import("../../ast/node.zig");
 const drc_mod = @import("../../analysis/drc.zig");
 const Drc = drc_mod.Drc;
 const RcOp = drc_mod.RcOp;
+const DrcAnalyzer = @import("../../analysis/drc_analyzer.zig").DrcAnalyzer;
+
+// Module system for multi-module compilation
+const module_loader = @import("../../module/loader.zig");
 
 pub const CGenerator = struct {
     allocator: std.mem.Allocator,
@@ -42,6 +46,14 @@ pub const CGenerator = struct {
     drc: *Drc,
     /// Current line being generated (for DRC queries)
     current_line: u32,
+
+    // ========================================================================
+    // Multi-Module Support - Name Mangling
+    // ========================================================================
+    /// Optional module prefix for name mangling (e.g., "moduleA_")
+    /// When set, all struct/function names are prefixed to avoid collisions
+    /// Format: If module_path is "/path/to/foo.ms", prefix becomes "foo_"
+    module_prefix: ?[]const u8,
 
     // ========================================================================
     // String Interning - Compile-time literal deduplication
@@ -84,12 +96,30 @@ pub const CGenerator = struct {
 
     /// Initialize C generator with DRC analysis results (required)
     pub fn init(allocator: std.mem.Allocator, drc: *Drc) Self {
+        return initWithModule(allocator, drc, null);
+    }
+
+    /// Initialize C generator with DRC analysis and optional module path for name mangling
+    pub fn initWithModule(allocator: std.mem.Allocator, drc: *Drc, module_path: ?[]const u8) Self {
+        // Derive module prefix from path: "/path/to/foo.ms" -> "foo_"
+        const prefix = if (module_path) |path| blk: {
+            const basename = std.fs.path.basename(path);
+            // Strip .ms extension if present
+            const name = if (std.mem.endsWith(u8, basename, ".ms"))
+                basename[0 .. basename.len - 3]
+            else
+                basename;
+            // Allocate prefix with underscore
+            break :blk std.fmt.allocPrint(allocator, "{s}_", .{name}) catch null;
+        } else null;
+
         return .{
             .allocator = allocator,
             .output = std.ArrayList(u8).init(allocator),
             .indent_level = 0,
             .drc = drc,
             .current_line = 0,
+            .module_prefix = prefix,
             .string_literals = std.StringHashMap(u32).init(allocator),
             .next_intern_id = 0,
             .enable_interning = true,
@@ -106,7 +136,20 @@ pub const CGenerator = struct {
         };
     }
 
+    /// Emit a name with module prefix for multi-module support
+    /// If no module prefix is set, emits the name as-is
+    fn emitMangledName(self: *Self, name: []const u8) !void {
+        if (self.module_prefix) |prefix| {
+            try self.emit(prefix);
+        }
+        try self.emit(name);
+    }
+
     pub fn deinit(self: *Self) void {
+        // Free module prefix if allocated
+        if (self.module_prefix) |prefix| {
+            self.allocator.free(prefix);
+        }
         // Free duplicated string keys from the intern pool
         var key_iter = self.string_literals.keyIterator();
         while (key_iter.next()) |key_ptr| {
@@ -174,6 +217,22 @@ pub const CGenerator = struct {
         }
     }
 
+    /// Emit deferred decrefs for reassignment operations
+    /// This is called AFTER the statement to decref the saved old value
+    /// The decref_reassign op saved the old pointer before assignment
+    fn emitReassignmentDecrefs(self: *Self, line: u32) !void {
+        const ops = self.drc.getOpsForLine(line);
+        for (ops) |op| {
+            if (op.kind == .decref_reassign) {
+                // Decref the saved old value
+                try self.emitIndent();
+                try self.emit("ms_decref(_old_");
+                try self.emit(op.target);
+                try self.emit(");\n");
+            }
+        }
+    }
+
     /// Emit a single RC operation from DRC
     fn emitRcOp(self: *Self, op: RcOp) !void {
         // Skip RC ops for StringBuilder variables - they manage their own memory
@@ -203,6 +262,19 @@ pub const CGenerator = struct {
                 try self.emit("ms_decref(");
                 try self.emit(op.target);
                 try self.emit(");\n");
+            },
+            .decref_reassign => {
+                // Reassignment decref: save old value before assignment, decref after
+                // This prevents use-after-free in self-referential assignments like:
+                //   obj = obj.clone()  -- RHS uses obj, must not free before RHS eval
+                // We save the old pointer here (before the assignment statement),
+                // then the caller will emit the actual decref after the statement.
+                try self.emitIndent();
+                try self.emit("void* _old_");
+                try self.emit(op.target);
+                try self.emit(" = ");
+                try self.emit(op.target);
+                try self.emit(";\n");
             },
             .move => {
                 // Transfer ownership - no RC change needed
@@ -338,6 +410,300 @@ pub const CGenerator = struct {
         return try self.output.toOwnedSlice();
     }
 
+    /// Generate C code for multiple modules bundled into a single file
+    /// Modules are emitted in dependency order (dependencies before dependents)
+    /// The entry_module_path specifies which module contains main()
+    pub fn generateMultiModule(
+        self: *Self,
+        loader: *module_loader.ModuleLoader,
+        entry_module_path: []const u8,
+    ) ![]const u8 {
+        // Step 1: Collect all modules in dependency order
+        var modules_in_order = std.ArrayList(*module_loader.Module).init(self.allocator);
+        defer modules_in_order.deinit();
+
+        // Get entry module
+        const entry_module = loader.modules.get(entry_module_path) orelse {
+            return error.EntryModuleNotFound;
+        };
+
+        // Topological sort: dependencies before dependents
+        var visited = std.StringHashMap(void).init(self.allocator);
+        defer visited.deinit();
+
+        try self.collectModulesInOrder(loader, entry_module, &modules_in_order, &visited);
+
+        // Step 1.5: Validate all imports are satisfied by exports
+        // This catches errors like `import { foo } from "./bar"` when bar doesn't export foo
+        for (modules_in_order.items) |mod| {
+            for (mod.imports.items) |imp| {
+                const dep_path = imp.resolved_path orelse continue;
+                const dep_module = loader.modules.get(dep_path) orelse continue;
+
+                // Check each imported symbol exists in the dependency's exports
+                for (imp.symbols) |symbol| {
+                    if (!dep_module.exports.contains(symbol)) {
+                        std.log.err("[CGenerator] Import error: '{s}' is not exported from '{s}'", .{ symbol, dep_path });
+                        return error.UnsatisfiedImport;
+                    }
+                }
+            }
+        }
+
+        // Step 2: Run DRC analysis on each module
+        // We need separate DRC instances for each module
+        var module_drcs = std.StringHashMap(*Drc).init(self.allocator);
+        defer {
+            var it = module_drcs.valueIterator();
+            while (it.next()) |drc_ptr| {
+                drc_ptr.*.deinit();
+                self.allocator.destroy(drc_ptr.*);
+            }
+            module_drcs.deinit();
+        }
+
+        for (modules_in_order.items) |mod| {
+            // Skip std library modules (they don't generate code)
+            if (std.mem.indexOf(u8, mod.path, "/std/") != null) {
+                continue;
+            }
+
+            var drc_instance = try self.allocator.create(Drc);
+            drc_instance.* = Drc.initWithConfig(self.allocator, .{
+                .enable_move_optimization = true,
+                .enable_cycle_detection = true,
+            });
+
+            var analyzer = DrcAnalyzer.init(drc_instance);
+            try analyzer.analyze(mod.ast);
+            try drc_instance.finalize();
+
+            try module_drcs.put(mod.path, drc_instance);
+        }
+
+        // Step 3: Collect string literals from all modules
+        for (modules_in_order.items) |mod| {
+            if (std.mem.indexOf(u8, mod.path, "/std/") != null) continue;
+            if (self.enable_interning) {
+                try self.collectStringLiterals(mod.ast);
+            }
+        }
+
+        // Step 4: Check for StringBuilder usage across all modules
+        var uses_stringbuilder = false;
+        if (self.enable_stringbuilder) {
+            for (modules_in_order.items) |mod| {
+                if (std.mem.indexOf(u8, mod.path, "/std/") != null) continue;
+                if (self.hasStringBuilderCandidates(mod.ast)) {
+                    uses_stringbuilder = true;
+                    break;
+                }
+            }
+        }
+
+        // Step 5: Emit common headers
+        try self.emitIncludesWithStringBuilder(uses_stringbuilder);
+        try self.emitNewline();
+
+        // Emit string literal pool
+        try self.emitStringLiteralPool();
+
+        // Step 6: Emit forward declarations for all modules
+        try self.emit("// ========================================================================\n");
+        try self.emit("// Forward Declarations (all modules)\n");
+        try self.emit("// ========================================================================\n\n");
+
+        for (modules_in_order.items) |mod| {
+            if (std.mem.indexOf(u8, mod.path, "/std/") != null) continue;
+
+            // Emit module comment
+            try self.emit("// Module: ");
+            try self.emit(mod.path);
+            try self.emit("\n");
+
+            // Emit struct forward declarations
+            for (mod.ast.data.program.statements) |stmt| {
+                const decl = unwrapExportDecl(stmt);
+                if (decl.kind == .class_decl) {
+                    try self.emit("struct ");
+                    try self.emit(decl.data.class_decl.name);
+                    try self.emit(";\n");
+                }
+            }
+        }
+        try self.emitNewline();
+
+        // Step 7: Emit struct definitions for all modules
+        try self.emit("// ========================================================================\n");
+        try self.emit("// Struct Definitions (all modules)\n");
+        try self.emit("// ========================================================================\n\n");
+
+        for (modules_in_order.items) |mod| {
+            if (std.mem.indexOf(u8, mod.path, "/std/") != null) continue;
+
+            for (mod.ast.data.program.statements) |stmt| {
+                const decl = unwrapExportDecl(stmt);
+                if (decl.kind == .class_decl) {
+                    try self.emitClassDecl(decl);
+                }
+            }
+        }
+
+        // Step 8: Emit function prototypes for all modules
+        try self.emit("// ========================================================================\n");
+        try self.emit("// Function Prototypes (all modules)\n");
+        try self.emit("// ========================================================================\n\n");
+
+        for (modules_in_order.items) |mod| {
+            if (std.mem.indexOf(u8, mod.path, "/std/") != null) continue;
+
+            for (mod.ast.data.program.statements) |stmt| {
+                const decl = unwrapExportDecl(stmt);
+                if (decl.kind == .function_decl) {
+                    try self.emitFunctionPrototype(decl);
+                }
+            }
+        }
+        try self.emitNewline();
+
+        // Step 9: Emit function definitions for all modules
+        try self.emit("// ========================================================================\n");
+        try self.emit("// Function Definitions (all modules)\n");
+        try self.emit("// ========================================================================\n\n");
+
+        for (modules_in_order.items) |mod| {
+            if (std.mem.indexOf(u8, mod.path, "/std/") != null) continue;
+
+            // Switch DRC context for this module
+            if (module_drcs.get(mod.path)) |mod_drc| {
+                self.drc = mod_drc;
+            }
+
+            try self.emit("// --- ");
+            try self.emit(mod.path);
+            try self.emit(" ---\n");
+
+            for (mod.ast.data.program.statements) |stmt| {
+                const decl = unwrapExportDecl(stmt);
+                if (decl.kind == .function_decl) {
+                    try self.emitFunctionDecl(decl);
+                }
+            }
+        }
+
+        // Step 10: Emit main() wrapper with entry module's top-level code
+        // Restore entry module's DRC
+        if (module_drcs.get(entry_module_path)) |entry_drc| {
+            self.drc = entry_drc;
+        }
+
+        // Check if entry module has user-defined main
+        var has_user_main = false;
+        for (entry_module.ast.data.program.statements) |stmt| {
+            if (stmt.kind == .function_decl) {
+                if (std.mem.eql(u8, stmt.data.function_decl.name, "main")) {
+                    has_user_main = true;
+                    break;
+                }
+            }
+        }
+
+        if (!has_user_main) {
+            try self.emit("int main(void) {\n");
+            self.indent_level += 1;
+
+            // Emit top-level statements from entry module
+            for (entry_module.ast.data.program.statements) |stmt| {
+                if (stmt.kind != .class_decl and stmt.kind != .function_decl) {
+                    try self.emitIndent();
+                    try self.emitNode(stmt);
+                }
+            }
+
+            try self.emitIndent();
+            try self.emit("return 0;\n");
+            self.indent_level -= 1;
+            try self.emit("}\n");
+        }
+
+        return try self.output.toOwnedSlice();
+    }
+
+    /// Helper: Unwrap export declaration to get the actual declaration node
+    /// export class Foo { } -> class_decl node
+    /// export function bar() { } -> function_decl node
+    /// For non-export nodes, returns the node unchanged
+    fn unwrapExportDecl(node: *ast.Node) *ast.Node {
+        if (node.kind == .export_decl) {
+            if (node.data.export_decl.declaration) |decl| {
+                return decl;
+            }
+        }
+        return node;
+    }
+
+    /// Helper: Recursively collect modules in dependency order (dependencies first)
+    fn collectModulesInOrder(
+        self: *Self,
+        loader: *module_loader.ModuleLoader,
+        module: *module_loader.Module,
+        result: *std.ArrayList(*module_loader.Module),
+        visited: *std.StringHashMap(void),
+    ) anyerror!void {
+        // Skip if already visited
+        if (visited.contains(module.path)) return;
+        try visited.put(module.path, {});
+
+        // Visit dependencies first
+        for (module.imports.items) |imp| {
+            if (imp.resolved_path) |dep_path| {
+                if (loader.modules.get(dep_path)) |dep_module| {
+                    try self.collectModulesInOrder(loader, dep_module, result, visited);
+                }
+            }
+        }
+
+        // Add this module after its dependencies
+        try result.append(module);
+    }
+
+    /// Emit function prototype (declaration without body)
+    fn emitFunctionPrototype(self: *Self, node: *ast.Node) !void {
+        const func = &node.data.function_decl;
+
+        // Skip main - it's special
+        if (std.mem.eql(u8, func.name, "main")) return;
+
+        // Return type
+        if (func.return_type) |ret| {
+            try self.emitType(ret);
+        } else {
+            try self.emit("void");
+        }
+
+        try self.emit(" ");
+        try self.emit(func.name);
+        try self.emit("(");
+
+        // Parameters
+        if (func.params.len == 0) {
+            try self.emit("void");
+        } else {
+            for (func.params, 0..) |param, i| {
+                if (i > 0) try self.emit(", ");
+                if (param.type) |ptype| {
+                    try self.emitType(ptype);
+                } else {
+                    try self.emit("void*");
+                }
+                try self.emit(" ");
+                try self.emit(param.name);
+            }
+        }
+
+        try self.emit(");\n");
+    }
+
     /// Pass 1: Collect all string literals for interning
     fn collectStringLiterals(self: *Self, node: *ast.Node) !void {
         switch (node.kind) {
@@ -450,6 +816,13 @@ pub const CGenerator = struct {
                 const method = &node.data.method_decl;
                 if (method.body) |body| {
                     try self.collectStringLiterals(body);
+                }
+            },
+            .export_decl => {
+                // Unwrap export declaration and collect from inner declaration
+                const exp = &node.data.export_decl;
+                if (exp.declaration) |decl| {
+                    try self.collectStringLiterals(decl);
                 }
             },
             // Terminals that don't contain string literals
@@ -948,8 +1321,8 @@ pub const CGenerator = struct {
             .while_stmt => try self.emitWhileStmt(node),
             .for_stmt => try self.emitForStmt(node),
             .return_stmt => try self.emitReturnStmt(node),
-            .break_stmt => try self.emitBreakStmt(),
-            .continue_stmt => try self.emitContinueStmt(),
+            .break_stmt => try self.emitBreakStmt(node),
+            .continue_stmt => try self.emitContinueStmt(node),
 
             // Skip type-only declarations
             .interface_decl, .type_alias_decl => {},
@@ -1591,6 +1964,9 @@ pub const CGenerator = struct {
 
             // Emit DRC ops that should come AFTER this statement
             try self.emitDrcOpsForLine(stmt_line, .after);
+
+            // Emit deferred decrefs for reassignment ops (decref the saved old value)
+            try self.emitReassignmentDecrefs(stmt_line);
         }
 
         // Update current_line to block's end for scope exit ops
@@ -1988,6 +2364,9 @@ pub const CGenerator = struct {
             // Emit DRC ops that should come AFTER this statement
             // This includes incref for variable copies (let x = y)
             try self.emitDrcOpsForLine(stmt_line, .after);
+
+            // Emit deferred decrefs for reassignment ops (decref the saved old value)
+            try self.emitReassignmentDecrefs(stmt_line);
         }
 
         // Update current_line to block's end for scope exit ops
@@ -2172,13 +2551,19 @@ pub const CGenerator = struct {
         }
     }
 
-    /// Emit a break statement
-    fn emitBreakStmt(self: *Self) !void {
+    /// Emit a break statement with cleanup
+    fn emitBreakStmt(self: *Self, node: *ast.Node) !void {
+        const line = node.location.start.line;
+        // Emit DRC cleanup ops for variables in loop scope before breaking
+        try self.emitDrcOpsForLine(line, .before);
         try self.emit("break;\n");
     }
 
-    /// Emit a continue statement
-    fn emitContinueStmt(self: *Self) !void {
+    /// Emit a continue statement with cleanup
+    fn emitContinueStmt(self: *Self, node: *ast.Node) !void {
+        const line = node.location.start.line;
+        // Emit DRC cleanup ops for variables in loop scope before continuing
+        try self.emitDrcOpsForLine(line, .before);
         try self.emit("continue;\n");
     }
 
@@ -2300,9 +2685,16 @@ pub const CGenerator = struct {
     }
 
     /// Emit cleanup for all scopes (used for early return)
+    /// Only emits scope_exit ops - return_value ops are handled by emitBlockStmt
     fn emitAllScopeCleanup(self: *Self) !void {
-        // Emit all DRC cleanup ops for current line
-        try self.emitAllDrcOpsForLine(self.current_line);
+        // Only emit scope_exit ops for current line
+        // Return-value ops (incref/move for returned vars) are already emitted by emitBlockStmt
+        const ops = self.drc.getOpsForLine(self.current_line);
+        for (ops) |op| {
+            if (op.reason == .scope_exit) {
+                try self.emitRcOp(op);
+            }
+        }
     }
 
     /// Emit console.log/error/warn as printf

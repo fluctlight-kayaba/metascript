@@ -155,8 +155,13 @@ pub const TypeKind = enum {
     /// Primitive value type (number, boolean) - no RC needed
     value,
 
-    /// String - needs RC
+    /// String - needs RC (dynamically allocated)
     string,
+
+    /// Interned string literal - NO RC needed
+    /// These are compile-time constants with static lifetime.
+    /// ms_intern_get() returns borrowed reference to static storage.
+    interned_string,
 
     /// Object/class instance - needs RC
     object,
@@ -169,6 +174,14 @@ pub const TypeKind = enum {
 
     /// Unknown - treat conservatively
     unknown,
+
+    /// Returns true if this type requires reference counting
+    pub fn needsRc(self: TypeKind) bool {
+        return switch (self) {
+            .value, .interned_string => false,
+            .string, .object, .array, .function, .unknown => true,
+        };
+    }
 };
 
 /// Ownership analyzer - computes ownership info for AST nodes
@@ -297,8 +310,8 @@ pub const OwnershipAnalyzer = struct {
 
             var info = OwnershipInfo{};
 
-            // Value types don't need RC
-            if (def.type_kind == .value) {
+            // Check if this type needs RC (value and interned_string don't)
+            if (!def.type_kind.needsRc()) {
                 info.needs_rc = false;
                 info.wants = .borrowed;
                 info.provides = .borrowed;

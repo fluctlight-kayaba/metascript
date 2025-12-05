@@ -11,6 +11,7 @@ const checker = @import("../checker/typechecker.zig");
 const vm_expander = @import("../macro/vm_expander.zig");
 const normalize = @import("../macro/normalize.zig");
 const colors = @import("colors.zig");
+const module_loader = @import("../module/loader.zig");
 
 // DRC (Deferred Reference Counting) analysis - optional, disabled by default
 const Drc = @import("../analysis/drc.zig").Drc;
@@ -103,14 +104,52 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
         return;
     };
 
-    // Run macro expansion with bytecode cache for speed
+    // Initialize module loader for import resolution and standard library macros
+    var loader = module_loader.ModuleLoader.init(allocator, parse_result.arena) catch |err| {
+        std.debug.print("{s}error:{s} Module loader init failed: {s}\n", .{
+            colors.error_color.code(),
+            colors.Color.reset.code(),
+            @errorName(err),
+        });
+        return;
+    };
+    defer loader.deinit();
+
+    // Load standard library macros (@derive, etc.)
+    loader.loadStdMacros() catch |err| {
+        std.debug.print("{s}[2/5]{s} Standard macros {s}warning{s}: {s} (continuing without std macros)\n", .{
+            colors.warning.code(),
+            colors.Color.reset.code(),
+            colors.Color.bright_yellow.code(),
+            colors.Color.reset.code(),
+            @errorName(err),
+        });
+        // Continue without std macros - they might not be needed
+    };
+
+    // Load the entry module (this triggers loading of all imported dependencies)
+    _ = loader.loadModule(input_file) catch |err| {
+        std.debug.print("{s}[2/5]{s} Module loading {s}warning{s}: {s} (continuing with parsed AST)\n", .{
+            colors.warning.code(),
+            colors.Color.reset.code(),
+            colors.Color.bright_yellow.code(),
+            colors.Color.reset.code(),
+            @errorName(err),
+        });
+        // Continue with just the parsed AST - imports may not be resolvable
+    };
+
+    // Run macro expansion with bytecode cache and ModuleLoader for proper import resolution
     const bytecode_cache = if (db.bytecode_cache) |*bc| bc else null;
     const program_ast = blk: {
-        const expanded = vm_expander.expandAllMacrosWithCache(
+        const expanded = vm_expander.expandAllMacrosWithLoaderAndCaches(
             parse_result.arena,
             allocator,
             parse_result.tree,
+            &loader,
+            input_file,
             bytecode_cache,
+            null, // network cache not used in CLI compile
         ) catch |err| {
             std.debug.print("{s}[2/5]{s} Macro expansion {s}warning{s}: {s}\n", .{
                 colors.warning.code(),
@@ -148,6 +187,10 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
         return;
     };
     defer type_checker.deinit();
+
+    // Wire module loader for cross-module import resolution
+    type_checker.setModuleLoader(&loader);
+    type_checker.setCurrentModulePath(input_file);
 
     const type_check_ok = type_checker.check(program_ast) catch |err| {
         std.debug.print("{s}error:{s} Type checking failed: {s}\n", .{
@@ -425,13 +468,34 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
             var gen = cgen.CGenerator.init(allocator, drc.?);
             defer gen.deinit();
 
-            const c_code = gen.generate(final_ast) catch |err| {
-                std.debug.print("{s}error:{s} C generation failed: {s}\n", .{
-                    colors.error_color.code(),
+            // Check if we have multiple modules loaded (imports present)
+            const has_imports = loader.modules.count() > 1;
+
+            const c_code = if (has_imports) blk: {
+                // Multi-module: bundle all imported modules into one C file
+                std.debug.print("{s}  Multi-module:{s} bundling {d} modules\n", .{
+                    colors.dim_text.code(),
                     colors.Color.reset.code(),
-                    @errorName(err),
+                    loader.modules.count(),
                 });
-                return;
+                break :blk gen.generateMultiModule(&loader, input_file) catch |err| {
+                    std.debug.print("{s}error:{s} C generation failed: {s}\n", .{
+                        colors.error_color.code(),
+                        colors.Color.reset.code(),
+                        @errorName(err),
+                    });
+                    return;
+                };
+            } else blk: {
+                // Single module: use original generate
+                break :blk gen.generate(final_ast) catch |err| {
+                    std.debug.print("{s}error:{s} C generation failed: {s}\n", .{
+                        colors.error_color.code(),
+                        colors.Color.reset.code(),
+                        @errorName(err),
+                    });
+                    return;
+                };
             };
             defer allocator.free(c_code);
 

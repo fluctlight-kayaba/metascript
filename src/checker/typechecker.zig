@@ -2,6 +2,7 @@ const std = @import("std");
 const ast = @import("../ast/ast.zig");
 const types = @import("../ast/types.zig");
 const location = @import("../ast/location.zig");
+const module_loader = @import("../module/loader.zig");
 
 // Re-export checker submodules
 pub const symbol = @import("symbol.zig");
@@ -47,6 +48,10 @@ pub const TypeChecker = struct {
     type_arena: std.heap.ArenaAllocator,
     /// Current class type for `this` binding in methods
     current_class_type: ?*types.Type = null,
+    /// Module loader for resolving imports across modules
+    loader: ?*module_loader.ModuleLoader = null,
+    /// Current module path being type-checked (for import resolution)
+    current_module_path: ?[]const u8 = null,
 
     pub fn init(allocator: std.mem.Allocator) !TypeChecker {
         return .{
@@ -56,7 +61,19 @@ pub const TypeChecker = struct {
             .message_arena = std.heap.ArenaAllocator.init(allocator),
             .type_arena = std.heap.ArenaAllocator.init(allocator),
             .current_class_type = null,
+            .loader = null,
+            .current_module_path = null,
         };
+    }
+
+    /// Set the module loader for cross-module import resolution
+    pub fn setModuleLoader(self: *TypeChecker, loader: *module_loader.ModuleLoader) void {
+        self.loader = loader;
+    }
+
+    /// Set the current module path being type-checked
+    pub fn setCurrentModulePath(self: *TypeChecker, path: []const u8) void {
+        self.current_module_path = path;
     }
 
     pub fn deinit(self: *TypeChecker) void {
@@ -402,13 +419,9 @@ pub const TypeChecker = struct {
                 }
                 // Named exports (export { foo, bar }) just verify names exist later
             },
-            // Import declarations - stub for now (needs module registry)
+            // Import declarations - resolve imported symbols via ModuleLoader
             .import_decl => {
-                // TODO: When module registry is implemented:
-                // 1. Resolve the import path
-                // 2. Load the module
-                // 3. Register imported symbols in current scope
-                // For now, we just skip processing (no error - imports may be resolved elsewhere)
+                try self.processImportDecl(node);
             },
             // Expression statements may contain function expressions (named nested functions)
             .expression_stmt => {
@@ -450,6 +463,134 @@ pub const TypeChecker = struct {
             // Other nodes don't introduce declarations
             else => {},
         }
+    }
+
+    /// Process an import declaration: resolve the module and register imported symbols
+    fn processImportDecl(self: *TypeChecker, node: *ast.Node) !void {
+        const import_data = &node.data.import_decl;
+
+        // Need module loader to resolve imports
+        const loader = self.loader orelse {
+            // No module loader - imports can't be resolved at type-check time
+            // This is OK during single-file compilation or when imports are handled elsewhere
+            return;
+        };
+
+        // Need current module path for relative import resolution
+        const from_path = self.current_module_path orelse {
+            // No current path - can't resolve relative imports
+            return;
+        };
+
+        // Strip surrounding quotes from import source if present
+        var source = import_data.source;
+        if (source.len >= 2) {
+            if ((source[0] == '"' and source[source.len - 1] == '"') or
+                (source[0] == '\'' and source[source.len - 1] == '\''))
+            {
+                source = source[1 .. source.len - 1];
+            }
+        }
+
+        // Resolve the import specifier to a module path
+        const resolved_path = loader.resolver.resolve(source, from_path) catch |err| {
+            const arena_alloc = self.message_arena.allocator();
+            const msg = std.fmt.allocPrint(arena_alloc, "failed to resolve import '{s}': {s}", .{ source, @errorName(err) }) catch "failed to resolve import";
+            try self.errors.append(.{
+                .message = msg,
+                .location = node.location,
+                .kind = .undefined_variable,
+            });
+            return;
+        } orelse {
+            const arena_alloc = self.message_arena.allocator();
+            const msg = std.fmt.allocPrint(arena_alloc, "cannot resolve module '{s}'", .{source}) catch "cannot resolve module";
+            try self.errors.append(.{
+                .message = msg,
+                .location = node.location,
+                .kind = .undefined_variable,
+            });
+            return;
+        };
+
+        // Get the loaded module (should already be loaded by ModuleLoader)
+        const imported_module = loader.modules.get(resolved_path) orelse {
+            const arena_alloc = self.message_arena.allocator();
+            const msg = std.fmt.allocPrint(arena_alloc, "module '{s}' not loaded", .{source}) catch "module not loaded";
+            try self.errors.append(.{
+                .message = msg,
+                .location = node.location,
+                .kind = .undefined_variable,
+            });
+            return;
+        };
+
+        // Register each imported symbol in the current scope
+        for (import_data.specifiers) |spec| {
+            // Look up the symbol in the imported module's exports
+            if (imported_module.exports.get(spec.imported)) |exported_sym| {
+                // Create symbol in current scope with the local name
+                var sym = symbol.Symbol.init(spec.local, symbolKindFromModuleKind(exported_sym.kind), node.location);
+                sym.decl_node = exported_sym.node;
+
+                // Try to infer type from the exported node
+                sym.type = self.inferTypeFromNode(exported_sym.node);
+
+                self.symbols.define(sym) catch {
+                    const arena_alloc = self.message_arena.allocator();
+                    const msg = std.fmt.allocPrint(arena_alloc, "import '{s}' conflicts with existing definition", .{spec.local}) catch "import conflicts with existing definition";
+                    try self.errors.append(.{
+                        .message = msg,
+                        .location = node.location,
+                        .kind = .duplicate_definition,
+                    });
+                };
+            } else {
+                // Symbol not found in module exports
+                const arena_alloc = self.message_arena.allocator();
+                const msg = std.fmt.allocPrint(arena_alloc, "'{s}' is not exported from '{s}'", .{ spec.imported, import_data.source }) catch "symbol not exported";
+                try self.errors.append(.{
+                    .message = msg,
+                    .location = node.location,
+                    .kind = .undefined_variable,
+                });
+            }
+        }
+    }
+
+    /// Convert module loader symbol kind to type checker symbol kind
+    fn symbolKindFromModuleKind(kind: module_loader.Module.SymbolKind) symbol.SymbolKind {
+        return switch (kind) {
+            .macro => .macro,
+            .function => .function,
+            .class => .class,
+            .variable => .variable,
+        };
+    }
+
+    /// Attempt to infer type from an AST node
+    fn inferTypeFromNode(self: *TypeChecker, node: *ast.Node) ?*types.Type {
+        return switch (node.kind) {
+            .function_decl => blk: {
+                const func = &node.data.function_decl;
+                break :blk self.createFunctionType(
+                    func.type_params,
+                    func.params,
+                    func.return_type,
+                    node.location,
+                ) catch null;
+            },
+            .class_decl => blk: {
+                const class_data = &node.data.class_decl;
+                break :blk self.createClassTypeNamed(
+                    class_data.name,
+                    class_data.members,
+                    node.location,
+                ) catch null;
+            },
+            .macro_decl => null, // Macros don't have runtime types
+            else => null,
+        };
     }
 
     /// Check type compatibility throughout the AST

@@ -56,6 +56,8 @@ pub const DrcAnalyzer = struct {
             .while_stmt => try self.analyzeWhileStmt(node),
             .for_stmt => try self.analyzeForStmt(node),
             .return_stmt => try self.analyzeReturnStmt(node),
+            .break_stmt => try self.analyzeBreakStmt(node),
+            .continue_stmt => try self.analyzeContinueStmt(node),
             .expression_stmt => try self.analyzeExpressionStmt(node),
             else => {},
         }
@@ -113,16 +115,13 @@ pub const DrcAnalyzer = struct {
                     // String literals are INTERNED - they don't need RC!
                     // The interned string pool manages them statically with infinite lifetime.
                     //
-                    // NOTE: This is semantically a "hack" - string literals produce msString*
-                    // which is technically a reference type. However, since interned strings:
+                    // Interned strings:
                     // 1. Are allocated at compile-time in static storage
                     // 2. Never need to be freed (program lifetime)
                     // 3. Have RC that's never modified (conceptually infinite)
-                    // We mark them as .value to skip RC operations entirely.
                     //
-                    // This is safe because ms_intern_get() returns a borrowed reference
-                    // to statically-allocated storage.
-                    type_kind = .value; // Treat as value type to skip RC
+                    // ms_intern_get() returns a borrowed reference to statically-allocated storage.
+                    type_kind = .interned_string;
                 } else if (init_expr.kind == .identifier) {
                     // Variable-to-variable copy: let x = y
                     type_kind = self.getExprTypeKind(init_expr);
@@ -219,8 +218,24 @@ pub const DrcAnalyzer = struct {
     fn analyzeWhileStmt(self: *DrcAnalyzer, node: *ast.Node) anyerror!void {
         const while_stmt = &node.data.while_stmt;
 
+        // Enter loop context for break/continue cleanup
+        try self.drc.enterLoop();
+
         try self.analyzeExpression(while_stmt.condition);
-        try self.analyzeNode(while_stmt.body);
+
+        // Wrap single-statement bodies in implicit scope for proper break/continue cleanup
+        if (while_stmt.body.kind != .block_stmt) {
+            const body_start = while_stmt.body.location.start.line;
+            try self.drc.enterScope(body_start);
+            try self.analyzeNode(while_stmt.body);
+            const body_end = self.getLastLine(while_stmt.body);
+            try self.drc.exitScope(body_end, 1);
+        } else {
+            try self.analyzeNode(while_stmt.body);
+        }
+
+        // Exit loop context
+        self.drc.exitLoop();
     }
 
     /// Analyze a for statement
@@ -242,11 +257,42 @@ pub const DrcAnalyzer = struct {
             try self.analyzeExpression(update);
         }
 
-        // Analyze body
-        try self.analyzeNode(for_stmt.body);
+        // Enter loop context for break/continue cleanup
+        // (after init so loop variable is in scope but break/continue clean body vars)
+        try self.drc.enterLoop();
+
+        // Analyze body - wrap single-statement bodies in implicit scope
+        // This ensures break/continue properly cleans up variables declared in
+        // single-statement loop bodies (e.g., `for (...) let x = ...;`)
+        if (for_stmt.body.kind != .block_stmt) {
+            const body_start = for_stmt.body.location.start.line;
+            try self.drc.enterScope(body_start);
+            try self.analyzeNode(for_stmt.body);
+            const body_end = self.getLastLine(for_stmt.body);
+            try self.drc.exitScope(body_end, 1);
+        } else {
+            try self.analyzeNode(for_stmt.body);
+        }
+
+        // Exit loop context
+        self.drc.exitLoop();
 
         const end_line = self.getLastLine(node);
         try self.drc.exitScope(end_line, 1);
+    }
+
+    /// Analyze a break statement
+    fn analyzeBreakStmt(self: *DrcAnalyzer, node: *ast.Node) anyerror!void {
+        const line = node.location.start.line;
+        const col = node.location.start.column;
+        try self.drc.emitBreakCleanup(line, col);
+    }
+
+    /// Analyze a continue statement
+    fn analyzeContinueStmt(self: *DrcAnalyzer, node: *ast.Node) anyerror!void {
+        const line = node.location.start.line;
+        const col = node.location.start.column;
+        try self.drc.emitContinueCleanup(line, col);
     }
 
     /// Analyze a return statement

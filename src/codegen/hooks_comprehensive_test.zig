@@ -83,7 +83,7 @@ test "HookGenerator: class with all field types" {
     try testing.expect(std.mem.indexOf(u8, generated, "// id: value type, no cleanup") != null);
     try testing.expect(std.mem.indexOf(u8, generated, "ms_string_decref(self->name)") != null);
     try testing.expect(std.mem.indexOf(u8, generated, "User_destroy(self->owner)") != null);
-    try testing.expect(std.mem.indexOf(u8, generated, "// TODO: Clean up array tags") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "// Array tags: element type unknown") != null);
     try testing.expect(std.mem.indexOf(u8, generated, "// score: value type, no cleanup") != null);
 }
 

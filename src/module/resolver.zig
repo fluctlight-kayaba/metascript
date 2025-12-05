@@ -25,10 +25,11 @@ pub const ModuleResolver = struct {
     }
 
     pub fn deinit(self: *ModuleResolver) void {
-        // Free cached paths
-        var it = self.resolved_cache.valueIterator();
-        while (it.next()) |path| {
-            self.allocator.free(path.*);
+        // Free both keys AND values from the cache
+        var it = self.resolved_cache.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*); // Free cache key
+            self.allocator.free(entry.value_ptr.*); // Free resolved path
         }
         self.resolved_cache.deinit();
     }
@@ -78,18 +79,19 @@ pub const ModuleResolver = struct {
         // Strip "std/" prefix
         const subpath = specifier[4..];
 
-        // Try index.ms first, then .ms extension
-        const candidates = [_][]const u8{
-            try std.fmt.allocPrint(self.allocator, "{s}/{s}/index.ms", .{ self.std_lib_path, subpath }),
-            try std.fmt.allocPrint(self.allocator, "{s}/{s}.ms", .{ self.std_lib_path, subpath }),
-        };
-
-        for (candidates) |candidate| {
-            if (self.fileExists(candidate)) {
-                return candidate;
-            }
-            self.allocator.free(candidate);
+        // Try index.ms first (allocate sequentially to avoid leaks)
+        const index_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}/index.ms", .{ self.std_lib_path, subpath });
+        if (self.fileExists(index_path)) {
+            return index_path;
         }
+        self.allocator.free(index_path);
+
+        // Try .ms extension
+        const direct_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.ms", .{ self.std_lib_path, subpath });
+        if (self.fileExists(direct_path)) {
+            return direct_path;
+        }
+        self.allocator.free(direct_path);
 
         std.log.warn("Could not resolve std module: {s}", .{specifier});
         return null;
@@ -145,8 +147,8 @@ pub fn getStdLibPath(allocator: std.mem.Allocator) ![]const u8 {
     } else |_| {}
 
     // Check relative to executable
-    if (std.fs.selfExeDirPath(allocator)) |exe_dir| {
-        defer allocator.free(exe_dir);
+    var exe_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (std.fs.selfExeDirPath(&exe_dir_buf)) |exe_dir| {
         const std_path = try std.fs.path.join(allocator, &[_][]const u8{ exe_dir, "..", "std" });
         if (std.fs.cwd().access(std_path, .{})) |_| {
             return std_path;

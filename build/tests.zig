@@ -99,15 +99,7 @@ pub fn setup(
     });
     const run_rc_trait_tests = b.addRunArtifact(rc_trait_tests);
 
-    // RC annotation tests (AST-level RC op placement)
-    const rc_annotation_tests = b.addTest(.{
-        .root_source_file = b.path("src/analysis/rc_annotation.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const run_rc_annotation_tests = b.addRunArtifact(rc_annotation_tests);
-
-    // DRC unified module tests
+    // DRC unified module tests (Lobster-style ownership + cycle detection)
     const drc_tests = b.addTest(.{
         .root_source_file = b.path("src/analysis/drc.zig"),
         .target = target,
@@ -127,7 +119,6 @@ pub fn setup(
     test_step.dependOn(&run_ownership_tests.step);
     test_step.dependOn(&run_cycle_detection_tests.step);
     test_step.dependOn(&run_rc_trait_tests.step);
-    test_step.dependOn(&run_rc_annotation_tests.step);
     test_step.dependOn(&run_drc_tests.step);
 
     // Analysis tests (DRC infrastructure)
@@ -135,7 +126,6 @@ pub fn setup(
     test_analysis_step.dependOn(&run_ownership_tests.step);
     test_analysis_step.dependOn(&run_cycle_detection_tests.step);
     test_analysis_step.dependOn(&run_rc_trait_tests.step);
-    test_analysis_step.dependOn(&run_rc_annotation_tests.step);
     test_analysis_step.dependOn(&run_drc_tests.step);
 
     // =========================================================================

@@ -1,6 +1,7 @@
 # Zig build artifacts
 .zig-cache/
 .metascript-cache/
+.score-codegen
 zig-out/
 
 # IDE
@@ -45,7 +46,19 @@ src/runtime/drc_test
 # Generated C/JS files from .ms sources
 examples/*.c
 examples/*.js
+examples/*.erl
+examples/*.dump
+examples/*.beam
 !examples/README.md
+
+/tests/fixtures/**/*.c
+/tests/fixtures/**/*.js
+/tests/fixtures/**/*.erl
+/tests/fixtures/**/*.dump
+/tests/fixtures/**/*.beam
+
+# Generated JS files in std (from .ms sources)
+std/**/*.js
 
 # Session notes and temporary documentation
 .backend-status.md

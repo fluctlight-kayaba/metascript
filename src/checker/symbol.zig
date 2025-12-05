@@ -18,20 +18,23 @@ pub const SymbolKind = enum {
     parameter,
     property,
     method,
+    macro, // Compile-time macro function
 };
 
 /// A symbol represents a named entity in the program
 pub const Symbol = struct {
     name: []const u8,
     kind: SymbolKind,
-    type: ?*types.Type,
+    type: ?*types.Type = null,
     location: location.SourceLocation,
     /// For variables: is it const or let?
-    mutable: bool,
+    mutable: bool = false,
     /// For class members: visibility
-    visibility: Visibility,
+    visibility: Visibility = .public,
     /// The AST node that declared this symbol (if any)
-    decl_node: ?*ast.Node,
+    decl_node: ?*ast.Node = null,
+    /// JSDoc comment preceding this declaration (if any)
+    doc_comment: ?[]const u8 = null,
 
     pub const Visibility = enum {
         public,
@@ -52,6 +55,7 @@ pub const Symbol = struct {
             .mutable = false,
             .visibility = .public,
             .decl_node = null,
+            .doc_comment = null,
         };
     }
 };
@@ -63,6 +67,9 @@ pub const Scope = struct {
     kind: ScopeKind,
     /// For function scopes: the return type
     return_type: ?*types.Type,
+    /// Source location of this scope (start = open brace, end = close brace)
+    /// Used by lookupAtPosition to determine if cursor is within this scope
+    start_location: ?location.SourceLocation,
 
     pub const ScopeKind = enum {
         global,
@@ -78,7 +85,28 @@ pub const Scope = struct {
             .parent = parent,
             .kind = kind,
             .return_type = null,
+            .start_location = null,
         };
+    }
+
+    /// Check if a position (line, column) is within this scope's boundaries
+    /// Returns true if:
+    /// - Scope has no location (backward compatibility - assume position is within)
+    /// - Position is between scope's start and end locations
+    pub fn containsPosition(self: *const Scope, line: u32, column: u32) bool {
+        const loc = self.start_location orelse return true; // No boundary = assume within
+
+        const start_line = loc.start.line;
+        const start_col = loc.start.column;
+        const end_line = loc.end.line;
+        const end_col = loc.end.column;
+
+        // Check if position is after start
+        const after_start = (line > start_line) or (line == start_line and column >= start_col);
+        // Check if position is before end
+        const before_end = (line < end_line) or (line == end_line and column <= end_col);
+
+        return after_start and before_end;
     }
 
     pub fn deinit(self: *Scope) void {
@@ -121,8 +149,12 @@ pub const Scope = struct {
     }
 
     /// Check if we're inside a loop (for break/continue validation)
+    /// Note: Function boundaries stop the search - a break inside a nested
+    /// function cannot target a loop in the enclosing function.
     pub fn isInLoop(self: *Scope) bool {
         if (self.kind == .loop) return true;
+        // Stop at function boundaries - break/continue cannot cross functions
+        if (self.kind == .function) return false;
         if (self.parent) |parent| {
             return parent.isInLoop();
         }
@@ -185,6 +217,22 @@ pub const SymbolTable = struct {
         scope.* = Scope.init(self.allocator, self.current, kind);
         try self.scopes.append(scope);
         self.current = scope;
+    }
+
+    /// Enter a new scope with source location boundaries
+    /// The location's start marks where the scope begins, end marks where it ends
+    /// This enables position-aware symbol lookup to correctly handle shadowing
+    pub fn enterScopeWithLocation(self: *SymbolTable, kind: Scope.ScopeKind, loc: location.SourceLocation) !void {
+        const scope = try self.allocator.create(Scope);
+        scope.* = Scope.init(self.allocator, self.current, kind);
+        scope.start_location = loc;
+        try self.scopes.append(scope);
+        self.current = scope;
+    }
+
+    /// Set the current scope's location (for cases where location is known after entering)
+    pub fn setCurrentScopeLocation(self: *SymbolTable, loc: location.SourceLocation) void {
+        self.current.start_location = loc;
     }
 
     /// Exit the current scope
@@ -263,12 +311,34 @@ pub const SymbolTable = struct {
     /// Look up a symbol at a specific position (line, column)
     /// This is position-aware: it finds the symbol whose declaration is
     /// visible at the given position (declared before, in enclosing scope)
+    ///
+    /// IMPORTANT: This function respects scope boundaries. A symbol is only
+    /// visible if:
+    /// 1. It was declared BEFORE the cursor position
+    /// 2. The cursor is WITHIN the scope that contains the symbol
+    ///
+    /// This correctly handles shadowing across nested scopes:
+    /// ```
+    /// function outer() {
+    ///     let x = 1;           // visible at line 10
+    ///     function inner() {
+    ///         let x = 2;       // NOT visible at line 10 (scope ended)
+    ///     }
+    ///     return x;            // line 10: finds outer's x, not inner's x
+    /// }
+    /// ```
     pub fn lookupAtPosition(self: *SymbolTable, name: []const u8, line: u32, column: u32) ?Symbol {
         var best_match: ?Symbol = null;
         var best_line: u32 = 0;
 
         // Search all scopes for symbols with matching name
         for (self.scopes.items) |scope| {
+            // CRITICAL: Only consider symbols in scopes that contain the cursor position
+            // This prevents finding variables from inner scopes that have already ended
+            if (!scope.containsPosition(line, column)) {
+                continue;
+            }
+
             if (scope.lookupLocal(name)) |sym| {
                 const sym_line = sym.location.start.line;
                 const sym_col = sym.location.start.column;
@@ -667,6 +737,31 @@ test "symbol table: loop detection" {
     try std.testing.expect(!table.isInLoop()); // Out of loop
 }
 
+test "symbol table: loop detection stops at function boundary" {
+    const allocator = std.testing.allocator;
+    var table = try SymbolTable.init(allocator);
+    defer table.deinit();
+
+    // Structure: function outer() { while(true) { function inner() { /* here */ } } }
+    try table.enterScope(.function); // outer
+    try table.enterScope(.loop); // while
+    try std.testing.expect(table.isInLoop()); // In loop
+
+    // Enter nested function - this should "reset" loop context
+    try table.enterScope(.function); // inner
+    try std.testing.expect(!table.isInLoop()); // NOT in loop from inner's perspective
+
+    // Even entering a block inside the nested function shouldn't find the outer loop
+    try table.enterScope(.block);
+    try std.testing.expect(!table.isInLoop()); // Still not in loop
+
+    table.exitScope(); // exit block
+    table.exitScope(); // exit inner function
+
+    // Back in the loop scope
+    try std.testing.expect(table.isInLoop()); // In loop again
+}
+
 test "symbol table: builtins are defined" {
     const allocator = std.testing.allocator;
     var table = try SymbolTable.init(allocator);
@@ -923,4 +1018,279 @@ test "updateTypeAll: returns error for unknown symbol" {
     // Try to update non-existent symbol
     const result = table.updateTypeAll("nonexistent", &int_type);
     try std.testing.expectError(error.SymbolNotFound, result);
+}
+
+// ============================================================================
+// Tests for scope boundary bugs - lookupAtPosition must respect scope end
+// ============================================================================
+
+test "lookupAtPosition: CRITICAL - cursor outside inner scope must find outer variable" {
+    // This is the critical bug test case:
+    //
+    // function outer(): number {
+    //     let x = 1;           // Line 3, outer scope
+    //     function inner() {
+    //         let x = 2;       // Line 6, inner scope
+    //     }                    // Line 7, inner scope ENDS here
+    //     return x;            // Line 10, cursor here should find OUTER x (line 3)
+    // }
+    //
+    // Bug: lookupAtPosition was returning inner x (line 6) because it only
+    // checked if declaration was BEFORE cursor, not if cursor was WITHIN scope.
+
+    const allocator = std.testing.allocator;
+    var table = try SymbolTable.init(allocator);
+    defer table.deinit();
+
+    // Enter outer function scope (lines 2-11)
+    try table.enterScope(.function);
+    table.scopes.items[table.scopes.items.len - 1].start_location = location.SourceLocation.init(
+        1,
+        .{ .line = 2, .column = 0 },
+        .{ .line = 11, .column = 1 },
+    );
+
+    // Outer x at line 3
+    const outer_x = Symbol.init("x", .variable, location.SourceLocation.init(
+        1,
+        .{ .line = 3, .column = 8 },
+        .{ .line = 3, .column = 9 },
+    ));
+    try table.define(outer_x);
+
+    // Enter inner function scope (lines 5-7)
+    try table.enterScope(.function);
+    table.scopes.items[table.scopes.items.len - 1].start_location = location.SourceLocation.init(
+        1,
+        .{ .line = 5, .column = 4 },
+        .{ .line = 7, .column = 5 },
+    );
+
+    // Inner x at line 6
+    const inner_x = Symbol.init("x", .variable, location.SourceLocation.init(
+        1,
+        .{ .line = 6, .column = 12 },
+        .{ .line = 6, .column = 13 },
+    ));
+    try table.define(inner_x);
+
+    table.exitScope(); // exit inner
+    table.exitScope(); // exit outer
+
+    // At line 10 (OUTSIDE inner scope, but INSIDE outer scope):
+    // Should find OUTER x (line 3), NOT inner x (line 6)
+    const at_line_10 = table.lookupAtPosition("x", 10, 0);
+    try std.testing.expect(at_line_10 != null);
+    try std.testing.expectEqual(@as(u32, 3), at_line_10.?.location.start.line);
+
+    // At line 6 (INSIDE inner scope): should find inner x
+    const at_line_6 = table.lookupAtPosition("x", 6, 15);
+    try std.testing.expect(at_line_6 != null);
+    try std.testing.expectEqual(@as(u32, 6), at_line_6.?.location.start.line);
+}
+
+test "lookupAtPosition: block scope shadowing - cursor after block must find outer" {
+    // {
+    //     let y = 10;      // Line 2, outer block
+    //     {
+    //         let y = 20;  // Line 4, inner block
+    //     }                // Line 5, inner block ENDS
+    //     return y;        // Line 6, should find outer y (line 2)
+    // }
+
+    const allocator = std.testing.allocator;
+    var table = try SymbolTable.init(allocator);
+    defer table.deinit();
+
+    // Outer block (lines 1-7)
+    try table.enterScope(.block);
+    table.scopes.items[table.scopes.items.len - 1].start_location = location.SourceLocation.init(
+        1,
+        .{ .line = 1, .column = 0 },
+        .{ .line = 7, .column = 1 },
+    );
+
+    // Outer y at line 2
+    const outer_y = Symbol.init("y", .variable, location.SourceLocation.init(
+        1,
+        .{ .line = 2, .column = 8 },
+        .{ .line = 2, .column = 9 },
+    ));
+    try table.define(outer_y);
+
+    // Inner block (lines 3-5)
+    try table.enterScope(.block);
+    table.scopes.items[table.scopes.items.len - 1].start_location = location.SourceLocation.init(
+        1,
+        .{ .line = 3, .column = 4 },
+        .{ .line = 5, .column = 5 },
+    );
+
+    // Inner y at line 4
+    const inner_y = Symbol.init("y", .variable, location.SourceLocation.init(
+        1,
+        .{ .line = 4, .column = 12 },
+        .{ .line = 4, .column = 13 },
+    ));
+    try table.define(inner_y);
+
+    table.exitScope(); // exit inner
+    table.exitScope(); // exit outer
+
+    // At line 6 (after inner block ends): should find outer y (line 2)
+    const at_line_6 = table.lookupAtPosition("y", 6, 0);
+    try std.testing.expect(at_line_6 != null);
+    try std.testing.expectEqual(@as(u32, 2), at_line_6.?.location.start.line);
+
+    // At line 4 col 15 (inside inner block): should find inner y
+    const at_line_4 = table.lookupAtPosition("y", 4, 15);
+    try std.testing.expect(at_line_4 != null);
+    try std.testing.expectEqual(@as(u32, 4), at_line_4.?.location.start.line);
+}
+
+test "lookupAtPosition: loop scope - cursor after loop must find outer variable" {
+    // let i = 100;         // Line 1, outer
+    // for (let i = 0; ...) // Line 2, loop scope
+    // {                    // Line 3
+    // }                    // Line 4, loop ends
+    // console.log(i);      // Line 5, should find outer i (line 1)
+
+    const allocator = std.testing.allocator;
+    var table = try SymbolTable.init(allocator);
+    defer table.deinit();
+
+    // Outer i at line 1 (global scope)
+    const outer_i = Symbol.init("i", .variable, location.SourceLocation.init(
+        1,
+        .{ .line = 1, .column = 4 },
+        .{ .line = 1, .column = 5 },
+    ));
+    try table.define(outer_i);
+
+    // Loop scope (lines 2-4)
+    try table.enterScope(.loop);
+    table.scopes.items[table.scopes.items.len - 1].start_location = location.SourceLocation.init(
+        1,
+        .{ .line = 2, .column = 0 },
+        .{ .line = 4, .column = 1 },
+    );
+
+    // Loop i at line 2
+    const loop_i = Symbol.init("i", .variable, location.SourceLocation.init(
+        1,
+        .{ .line = 2, .column = 9 },
+        .{ .line = 2, .column = 10 },
+    ));
+    try table.define(loop_i);
+
+    table.exitScope();
+
+    // At line 5 (after loop): should find outer i (line 1)
+    const at_line_5 = table.lookupAtPosition("i", 5, 0);
+    try std.testing.expect(at_line_5 != null);
+    try std.testing.expectEqual(@as(u32, 1), at_line_5.?.location.start.line);
+
+    // At line 3 (inside loop): should find loop i (line 2)
+    const at_line_3 = table.lookupAtPosition("i", 3, 0);
+    try std.testing.expect(at_line_3 != null);
+    try std.testing.expectEqual(@as(u32, 2), at_line_3.?.location.start.line);
+}
+
+test "lookupAtPosition: deeply nested scopes - must respect all boundaries" {
+    // function a() {           // Line 1, scope A
+    //     let x = 1;           // Line 2
+    //     function b() {       // Line 3, scope B
+    //         let x = 2;       // Line 4
+    //         function c() {   // Line 5, scope C
+    //             let x = 3;   // Line 6
+    //         }                // Line 7, scope C ends
+    //         return x;        // Line 8, should find B's x (line 4)
+    //     }                    // Line 9, scope B ends
+    //     return x;            // Line 10, should find A's x (line 2)
+    // }
+
+    const allocator = std.testing.allocator;
+    var table = try SymbolTable.init(allocator);
+    defer table.deinit();
+
+    // Scope A (lines 1-11)
+    try table.enterScope(.function);
+    table.scopes.items[table.scopes.items.len - 1].start_location = location.SourceLocation.init(
+        1,
+        .{ .line = 1, .column = 0 },
+        .{ .line = 11, .column = 1 },
+    );
+    const x_a = Symbol.init("x", .variable, location.SourceLocation.init(
+        1,
+        .{ .line = 2, .column = 8 },
+        .{ .line = 2, .column = 9 },
+    ));
+    try table.define(x_a);
+
+    // Scope B (lines 3-9)
+    try table.enterScope(.function);
+    table.scopes.items[table.scopes.items.len - 1].start_location = location.SourceLocation.init(
+        1,
+        .{ .line = 3, .column = 4 },
+        .{ .line = 9, .column = 5 },
+    );
+    const x_b = Symbol.init("x", .variable, location.SourceLocation.init(
+        1,
+        .{ .line = 4, .column = 12 },
+        .{ .line = 4, .column = 13 },
+    ));
+    try table.define(x_b);
+
+    // Scope C (lines 5-7)
+    try table.enterScope(.function);
+    table.scopes.items[table.scopes.items.len - 1].start_location = location.SourceLocation.init(
+        1,
+        .{ .line = 5, .column = 8 },
+        .{ .line = 7, .column = 9 },
+    );
+    const x_c = Symbol.init("x", .variable, location.SourceLocation.init(
+        1,
+        .{ .line = 6, .column = 16 },
+        .{ .line = 6, .column = 17 },
+    ));
+    try table.define(x_c);
+
+    table.exitScope(); // exit C
+    table.exitScope(); // exit B
+    table.exitScope(); // exit A
+
+    // Line 10 (inside A, outside B): should find A's x (line 2)
+    const at_line_10 = table.lookupAtPosition("x", 10, 0);
+    try std.testing.expect(at_line_10 != null);
+    try std.testing.expectEqual(@as(u32, 2), at_line_10.?.location.start.line);
+
+    // Line 8 (inside B, outside C): should find B's x (line 4)
+    const at_line_8 = table.lookupAtPosition("x", 8, 0);
+    try std.testing.expect(at_line_8 != null);
+    try std.testing.expectEqual(@as(u32, 4), at_line_8.?.location.start.line);
+
+    // Line 6 col 20 (inside C): should find C's x (line 6)
+    const at_line_6 = table.lookupAtPosition("x", 6, 20);
+    try std.testing.expect(at_line_6 != null);
+    try std.testing.expectEqual(@as(u32, 6), at_line_6.?.location.start.line);
+}
+
+test "lookupAtPosition: no scope boundary - falls back to line-based lookup" {
+    // Test backward compatibility: if scope has no start_location, use line-based logic
+    const allocator = std.testing.allocator;
+    var table = try SymbolTable.init(allocator);
+    defer table.deinit();
+
+    // Define x without scope boundaries (old behavior)
+    const sym_x = Symbol.init("x", .variable, location.SourceLocation.init(
+        1,
+        .{ .line = 5, .column = 4 },
+        .{ .line = 5, .column = 5 },
+    ));
+    try table.define(sym_x);
+
+    // Should still find x at line 10 (line-based fallback)
+    const found = table.lookupAtPosition("x", 10, 0);
+    try std.testing.expect(found != null);
+    try std.testing.expectEqualStrings("x", found.?.name);
 }

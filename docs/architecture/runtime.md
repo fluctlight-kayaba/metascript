@@ -360,6 +360,79 @@ test "ORC: cycle detection" {
 
 ---
 
+## Global Builtins & Stdlib
+
+### Design Principles
+
+1. **Global builtins** (Math, Array, console) - no import, TypeScript compatible
+2. **Stdlib modules** (`std/`) - explicit import, cross-backend
+3. **Backend-specific** (`c/`, `erl/`, `js/`) - explicit import, single backend
+
+### Module Prefix Convention
+
+| Prefix | Scope | Example |
+|--------|-------|---------|
+| *(none)* | Global builtins | `Math.floor()`, `console.log()` |
+| `std/` | Cross-backend stdlib | `import { readFile } from 'std/fs'` |
+| `c/` | C backend only | `import { mmap } from 'c/posix'` |
+| `erl/` | Erlang only | `import { GenServer } from 'erl/otp'` |
+| `js/` | JS only | `import { document } from 'js/dom'` |
+
+### Global Builtins
+
+No import required - matches TypeScript behavior:
+
+```typescript
+const x = Math.floor(3.5);
+const arr = [1, 2, 3];
+arr.push(4);
+console.log("hello");
+```
+
+**C Backend Mapping:**
+
+| MetaScript | C Output | Header |
+|------------|----------|--------|
+| `Math.floor(x)` | `floor(x)` | `<math.h>` |
+| `Math.sqrt(x)` | `sqrt(x)` | `<math.h>` |
+| `Math.abs(x)` | `fabs(x)` | `<math.h>` |
+| `Math.PI` | `M_PI` | `<math.h>` |
+| `console.log(x)` | `printf(...)` | `<stdio.h>` |
+| `arr.push(x)` | `ms_array_push(arr, x)` | `ms_array.h` |
+| `arr.length` | `arr->len` | `ms_array.h` |
+
+**Lazy Include:** Headers only included if builtin is actually used.
+
+### msArray (Planned)
+
+Dynamic array with ORC integration:
+
+```c
+typedef struct {
+    size_t len;
+    size_t capacity;
+    ms_TypeInfo* element_type;
+    void* data;  // Type-specific storage
+} msArray;
+
+msArray* ms_array_new(size_t capacity, ms_TypeInfo* elem_type);
+void ms_array_push(msArray* arr, void* element);
+void* ms_array_get(msArray* arr, size_t index);
+size_t ms_array_len(msArray* arr);
+void ms_array_free(msArray* arr);
+```
+
+### TypeScript Features NOT Supported (v1)
+
+- `any` type
+- `eval()` / `Function()` constructor
+- Prototype manipulation (`__proto__`, `setPrototypeOf`)
+- Dynamic `import()`
+- `with` statement
+- Runtime decorators (use `@derive` macros)
+
+---
+
 ## References
 
 - **Lobster optimizations:** `./lobster.md`

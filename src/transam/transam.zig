@@ -1077,7 +1077,7 @@ pub const TransAmDatabase = struct {
             .keyword_float32, .keyword_float64,
             .keyword_int, .keyword_float, .keyword_double,
             .keyword_defer, .keyword_distinct,
-            .keyword_macro, .keyword_quote,
+            .keyword_macro, .keyword_quote, .keyword_extern,
             => .keyword,
 
             // Macros - only @ sign now
@@ -1105,6 +1105,9 @@ pub const TransAmDatabase = struct {
             .left_paren, .right_paren, .left_brace, .right_brace,
             .left_bracket, .right_bracket, .semicolon, .colon, .comma,
             => .punctuation,
+
+            // Comments
+            .doc_comment => .comment,
 
             // Skip
             .newline, .end_of_file, .syntax_error, .regex,
@@ -1823,6 +1826,7 @@ pub const TransAmDatabase = struct {
         for (macro_args) |arg| {
             switch (arg) {
                 .identifier => |id| try args.append(id),
+                .string_literal => |s| try args.append(s),
                 .type => {
                     // For type arguments, we'd need to stringify the type
                     // For now, just use placeholder
@@ -1846,6 +1850,7 @@ pub const TransAmDatabase = struct {
         for (args) |arg| {
             switch (arg) {
                 .identifier => |id| hasher.update(id),
+                .string_literal => |s| hasher.update(s),
                 .type => hasher.update("<type>"),
                 .expression => hasher.update("<expr>"),
             }

@@ -58,7 +58,10 @@ pub const Lexer = struct {
 
     /// Get next token
     pub fn next(self: *Self) !Token {
-        self.skipWhitespaceAndComments();
+        // Skip whitespace and regular comments, but capture JSDoc comments
+        if (self.skipWhitespaceAndComments()) |doc_token| {
+            return doc_token;
+        }
         self.start = self.current;
         self.start_column = self.column;
         self.start_line = self.line;
@@ -310,8 +313,8 @@ pub const Lexer = struct {
         return self.makeToken(.template_string);
     }
 
-    /// Skip whitespace and comments
-    fn skipWhitespaceAndComments(self: *Self) void {
+    /// Skip whitespace and comments, returning JSDoc comment token if found
+    fn skipWhitespaceAndComments(self: *Self) ?Token {
         while (true) {
             const c = self.peek();
             switch (c) {
@@ -326,33 +329,66 @@ pub const Lexer = struct {
                 },
                 '/' => {
                     if (self.peekNext() == '/') {
-                        // Line comment
+                        // Line comment - skip
                         while (!self.isAtEnd() and self.peek() != '\n') {
                             _ = self.advance();
                         }
                     } else if (self.peekNext() == '*') {
-                        // Block comment
-                        _ = self.advance();  // /
-                        _ = self.advance();  // *
-                        while (!self.isAtEnd()) {
-                            if (self.peek() == '*' and self.peekNext() == '/') {
-                                _ = self.advance();  // *
-                                _ = self.advance();  // /
-                                break;
+                        // Check if this is a JSDoc comment (/**)
+                        const is_jsdoc = self.current + 2 < self.source.len and
+                            self.source[self.current + 2] == '*' and
+                            (self.current + 3 >= self.source.len or self.source[self.current + 3] != '/');
+
+                        if (is_jsdoc) {
+                            // JSDoc comment - capture it as a token
+                            self.start = self.current;
+                            self.start_column = self.column;
+                            self.start_line = self.line;
+
+                            _ = self.advance();  // /
+                            _ = self.advance();  // *
+                            _ = self.advance();  // * (second asterisk for JSDoc)
+
+                            while (!self.isAtEnd()) {
+                                if (self.peek() == '*' and self.peekNext() == '/') {
+                                    _ = self.advance();  // *
+                                    _ = self.advance();  // /
+                                    break;
+                                }
+                                if (self.peek() == '\n') {
+                                    _ = self.advance();
+                                    self.line += 1;
+                                    self.column = 0;
+                                } else {
+                                    _ = self.advance();
+                                }
                             }
-                            if (self.peek() == '\n') {
-                                _ = self.advance();
-                                self.line += 1;
-                                self.column = 0;
-                            } else {
-                                _ = self.advance();
+
+                            return self.makeToken(.doc_comment);
+                        } else {
+                            // Regular block comment - skip
+                            _ = self.advance();  // /
+                            _ = self.advance();  // *
+                            while (!self.isAtEnd()) {
+                                if (self.peek() == '*' and self.peekNext() == '/') {
+                                    _ = self.advance();  // *
+                                    _ = self.advance();  // /
+                                    break;
+                                }
+                                if (self.peek() == '\n') {
+                                    _ = self.advance();
+                                    self.line += 1;
+                                    self.column = 0;
+                                } else {
+                                    _ = self.advance();
+                                }
                             }
                         }
                     } else {
-                        return;
+                        return null;
                     }
                 },
-                else => return,
+                else => return null,
             }
         }
     }
@@ -649,4 +685,41 @@ test "lexer: comments" {
     const tok7 = try lexer.next();
     try std.testing.expect(tok7.kind == .identifier);
     try std.testing.expectEqualStrings("y", tok7.text);
+}
+
+test "lexer: JSDoc comments" {
+    const source =
+        \\/** This is a JSDoc comment */
+        \\function foo() {}
+    ;
+    var lexer = try Lexer.init(std.testing.allocator, source, 1);
+    defer lexer.deinit();
+
+    // JSDoc comment should be captured as a token
+    const doc_tok = try lexer.next();
+    try std.testing.expect(doc_tok.kind == .doc_comment);
+    try std.testing.expectEqualStrings("/** This is a JSDoc comment */", doc_tok.text);
+
+    // Then the function declaration
+    const func_tok = try lexer.next();
+    try std.testing.expect(func_tok.kind == .keyword_function);
+}
+
+test "lexer: regular block comment vs JSDoc" {
+    const source =
+        \\/* Regular comment */
+        \\/** JSDoc comment */
+        \\const x = 1;
+    ;
+    var lexer = try Lexer.init(std.testing.allocator, source, 1);
+    defer lexer.deinit();
+
+    // JSDoc should be captured, regular comment skipped
+    const doc_tok = try lexer.next();
+    try std.testing.expect(doc_tok.kind == .doc_comment);
+    try std.testing.expectEqualStrings("/** JSDoc comment */", doc_tok.text);
+
+    // Then const
+    const const_tok = try lexer.next();
+    try std.testing.expect(const_tok.kind == .keyword_const);
 }

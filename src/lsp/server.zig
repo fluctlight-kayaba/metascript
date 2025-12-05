@@ -256,6 +256,7 @@ fn tokenKindToSemanticType(kind: token_mod.TokenKind) ?SemanticTokenType {
         .keyword_distinct, // Metascript: distinct types
         .keyword_macro,    // Metascript: macro definition
         .keyword_quote,    // Metascript: quote expression
+        .keyword_extern,   // Metascript: extern declaration
         => .keyword,
 
         // Type-related keywords
@@ -371,6 +372,9 @@ fn tokenKindToSemanticType(kind: token_mod.TokenKind) ?SemanticTokenType {
         // Identifiers are handled separately (could be variable, function, etc.)
         .identifier => .variable,
 
+        // Doc comments
+        .doc_comment => .comment,
+
         // Skip punctuation and special tokens
         .left_paren,
         .right_paren,
@@ -394,8 +398,8 @@ fn tokenKindToSemanticType(kind: token_mod.TokenKind) ?SemanticTokenType {
 fn getHoverContent(kind: token_mod.TokenKind, text: []const u8) ?[]const u8 {
     _ = text;
     return switch (kind) {
-        // @ sign - macro prefix (actual macro name is in following identifier)
-        .at_sign => "**@** - Macro prefix\n\nUsed to invoke compile-time macros from `std/macros/*.ms`.\n\nCommon macros: `@derive`, `@comptime`, `@serialize`, `@ffi`",
+        // @ sign - compiler intrinsic prefix
+        .at_sign => "**@** - Compiler intrinsic prefix\n\nUsed with compiler-provided macros (defined via `extern macro @name`).\n\nIntrinsics: `@target`, `@emit`, `@comptime`, `@sizeof`, `@alignof`\n\nNote: User macros are called without `@` prefix.",
 
         // Keywords with descriptions
         .keyword_class => "**class** - Class declaration\n\nDefines a class with properties and methods.",
@@ -444,6 +448,13 @@ fn getHoverContent(kind: token_mod.TokenKind, text: []const u8) ?[]const u8 {
         .keyword_namespace => "**namespace** - Namespace declaration\n\nGroups related declarations.",
         .keyword_never => "**never** - Never type\n\nType that never occurs.",
         .keyword_unknown => "**unknown** - Unknown type\n\nType-safe alternative to any.",
+
+        // Metascript-specific
+        .keyword_macro => "**macro** - Macro declaration\n\nDefines a compile-time macro with zero runtime cost.\n\n```typescript\nmacro function deriveEq(target) {\n    // Compile-time code\n    return target;\n}\n\n// Usage: called like normal function\nderiveEq(User);\n```",
+        .keyword_defer => "**defer** - Defer statement\n\nExecutes cleanup code when scope exits.",
+        .keyword_distinct => "**distinct** - Distinct type\n\nCreates a nominally distinct type.",
+        .keyword_quote => "**quote** - Quote expression\n\nConverts code to AST at compile-time.",
+        .keyword_extern => "**extern** - External declaration\n\nDeclares implementation provided externally.\n\n```typescript\nextern function printf(fmt: string): i32;\nextern class FILE;\nextern macro @target(...platforms: string[]): void;\n```",
 
         // Types
         .number => "**number** - Numeric literal",
@@ -566,6 +577,30 @@ fn formatType(allocator: std.mem.Allocator, typ: ?*types_mod.Type) ![]const u8 {
     };
 }
 
+/// Format function signature: name(param1: Type1, param2: Type2): ReturnType
+/// Shared by .function, .method, and .macro symbol formatting
+fn formatFunctionSignature(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    name: []const u8,
+    func: types_mod.FunctionType,
+) !void {
+    try buf.appendSlice(name);
+    try buf.append('(');
+    for (func.params, 0..) |param, i| {
+        if (i > 0) try buf.appendSlice(", ");
+        try buf.appendSlice(param.name);
+        try buf.appendSlice(": ");
+        const param_type = try formatType(allocator, param.type);
+        defer allocator.free(param_type);
+        try buf.appendSlice(param_type);
+    }
+    try buf.appendSlice("): ");
+    const ret_type = try formatType(allocator, func.return_type);
+    defer allocator.free(ret_type);
+    try buf.appendSlice(ret_type);
+}
+
 /// Format a symbol for hover display (returns allocated markdown string)
 fn formatSymbolHover(allocator: std.mem.Allocator, symbol: symbol_mod.Symbol) ![]const u8 {
     var buf = std.ArrayList(u8).init(allocator);
@@ -582,22 +617,8 @@ fn formatSymbolHover(allocator: std.mem.Allocator, symbol: symbol_mod.Symbol) ![
         .function => {
             if (symbol.type) |t| {
                 if (t.kind == .function) {
-                    const func = t.data.function;
                     try buf.appendSlice("```typescript\nfunction ");
-                    try buf.appendSlice(symbol.name);
-                    try buf.append('(');
-                    for (func.params, 0..) |param, i| {
-                        if (i > 0) try buf.appendSlice(", ");
-                        try buf.appendSlice(param.name);
-                        try buf.appendSlice(": ");
-                        const param_type = try formatType(allocator, param.type);
-                        defer allocator.free(param_type);
-                        try buf.appendSlice(param_type);
-                    }
-                    try buf.appendSlice("): ");
-                    const ret_type = try formatType(allocator, func.return_type);
-                    defer allocator.free(ret_type);
-                    try buf.appendSlice(ret_type);
+                    try formatFunctionSignature(allocator, &buf, symbol.name, t.data.function.*);
                     try buf.appendSlice("\n```");
                 } else {
                     try buf.writer().print("```typescript\nfunction {s}\n```", .{symbol.name});
@@ -631,22 +652,8 @@ fn formatSymbolHover(allocator: std.mem.Allocator, symbol: symbol_mod.Symbol) ![
         .method => {
             if (symbol.type) |t| {
                 if (t.kind == .function) {
-                    const func = t.data.function;
                     try buf.appendSlice("```typescript\n(method) ");
-                    try buf.appendSlice(symbol.name);
-                    try buf.append('(');
-                    for (func.params, 0..) |param, i| {
-                        if (i > 0) try buf.appendSlice(", ");
-                        try buf.appendSlice(param.name);
-                        try buf.appendSlice(": ");
-                        const param_type = try formatType(allocator, param.type);
-                        defer allocator.free(param_type);
-                        try buf.appendSlice(param_type);
-                    }
-                    try buf.appendSlice("): ");
-                    const ret_type = try formatType(allocator, func.return_type);
-                    defer allocator.free(ret_type);
-                    try buf.appendSlice(ret_type);
+                    try formatFunctionSignature(allocator, &buf, symbol.name, t.data.function.*);
                     try buf.appendSlice("\n```");
                 } else {
                     try buf.writer().print("```typescript\n(method) {s}\n```", .{symbol.name});
@@ -655,216 +662,286 @@ fn formatSymbolHover(allocator: std.mem.Allocator, symbol: symbol_mod.Symbol) ![
                 try buf.writer().print("```typescript\n(method) {s}\n```", .{symbol.name});
             }
         },
+        .macro => {
+            // Macros look like functions but are expanded at compile time
+            if (symbol.type) |t| {
+                if (t.kind == .function) {
+                    try buf.appendSlice("```typescript\n(macro) ");
+                    try formatFunctionSignature(allocator, &buf, symbol.name, t.data.function.*);
+                    try buf.appendSlice("\n```\n\n*Expanded at compile time*");
+                } else {
+                    try buf.writer().print("```typescript\n(macro) {s}\n```\n\n*Expanded at compile time*", .{symbol.name});
+                }
+            } else {
+                try buf.writer().print("```typescript\n(macro) {s}\n```\n\n*Expanded at compile time*", .{symbol.name});
+            }
+        },
+    }
+
+    // Append JSDoc comment if present (with proper tag formatting)
+    if (symbol.doc_comment) |doc| {
+        try buf.appendSlice("\n\n---\n\n");
+        // Format the JSDoc with proper tag parsing (@param, @returns, @deprecated)
+        const formatted_doc = try formatJsDocForHover(allocator, doc);
+        defer allocator.free(formatted_doc);
+        try buf.appendSlice(formatted_doc);
     }
 
     return buf.toOwnedSlice();
 }
 
-/// Format generated AST nodes for macro expansion preview
-fn formatMacroExpansion(allocator: std.mem.Allocator, nodes: []*ast.Node, macro_name: []const u8, arguments: []const []const u8) ![]const u8 {
+/// Clean up JSDoc comment for display
+/// Removes /** and */ wrappers, cleans up leading asterisks, and formats tags
+fn cleanJsDoc(doc: []const u8) []const u8 {
+    var start: usize = 0;
+    var end: usize = doc.len;
+
+    // Skip leading whitespace and /**
+    while (start < doc.len and (doc[start] == ' ' or doc[start] == '\t' or doc[start] == '\n' or doc[start] == '\r')) {
+        start += 1;
+    }
+    if (start + 3 <= doc.len and std.mem.eql(u8, doc[start .. start + 3], "/**")) {
+        start += 3;
+    }
+
+    // Skip trailing whitespace and */
+    while (end > start and (doc[end - 1] == ' ' or doc[end - 1] == '\t' or doc[end - 1] == '\n' or doc[end - 1] == '\r')) {
+        end -= 1;
+    }
+    if (end >= 2 and end > start and std.mem.eql(u8, doc[end - 2 .. end], "*/")) {
+        end -= 2;
+    }
+
+    // Skip any remaining whitespace and leading asterisks
+    while (start < end and (doc[start] == ' ' or doc[start] == '\t' or doc[start] == '\n' or doc[start] == '\r' or doc[start] == '*')) {
+        start += 1;
+    }
+    while (end > start and (doc[end - 1] == ' ' or doc[end - 1] == '\t' or doc[end - 1] == '\n' or doc[end - 1] == '\r' or doc[end - 1] == '*')) {
+        end -= 1;
+    }
+
+    if (start >= end) return "";
+    return doc[start..end];
+}
+
+/// Format JSDoc comment for hover display with nice formatting
+/// Parses @param, @returns, @deprecated tags and formats them nicely
+/// Preserves line structure for lists and multi-line descriptions
+fn formatJsDocForHover(allocator: std.mem.Allocator, doc: []const u8) ![]const u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
 
-    const writer = buf.writer();
+    // First, clean the doc comment (remove /** and */)
+    const cleaned = cleanJsDoc(doc);
+    if (cleaned.len == 0) return buf.toOwnedSlice();
 
-    // Header with macro info
-    try writer.print("**@{s}(", .{macro_name});
-    for (arguments, 0..) |arg, i| {
-        if (i > 0) try writer.writeAll(", ");
-        try writer.writeAll(arg);
+    var description_lines = std.ArrayList(u8).init(allocator);
+    defer description_lines.deinit();
+
+    var params = std.ArrayList([]const u8).init(allocator);
+    defer params.deinit();
+
+    var examples = std.ArrayList([]const u8).init(allocator);
+    defer examples.deinit();
+
+    var returns: ?[]const u8 = null;
+    var deprecated: ?[]const u8 = null;
+    var in_example = false;
+
+    // Split by lines and process
+    var lines = std.mem.splitScalar(u8, cleaned, '\n');
+    while (lines.next()) |raw_line| {
+        // Clean leading asterisks and whitespace from each line
+        var line = raw_line;
+        while (line.len > 0 and (line[0] == ' ' or line[0] == '\t' or line[0] == '*')) {
+            line = line[1..];
+        }
+        // Trim trailing whitespace
+        while (line.len > 0 and (line[line.len - 1] == ' ' or line[line.len - 1] == '\t' or line[line.len - 1] == '\r')) {
+            line = line[0 .. line.len - 1];
+        }
+
+        // Handle @example blocks (can be multi-line)
+        if (std.mem.startsWith(u8, line, "@example")) {
+            in_example = true;
+            // Capture example content after @example tag
+            const example_content = line["@example".len..];
+            var trimmed = example_content;
+            while (trimmed.len > 0 and trimmed[0] == ' ') trimmed = trimmed[1..];
+            if (trimmed.len > 0) {
+                try examples.append(trimmed);
+            }
+            continue;
+        }
+
+        // If we hit another @ tag, we're out of example block
+        if (line.len > 0 and line[0] == '@') {
+            in_example = false;
+        }
+
+        // If in example block, collect non-empty example lines
+        if (in_example) {
+            if (line.len > 0) {
+                try examples.append(line);
+            }
+            continue;
+        }
+
+        // Empty line = paragraph break (preserve as double newline)
+        if (line.len == 0) {
+            if (description_lines.items.len > 0) {
+                // Add paragraph break (double newline for markdown)
+                try description_lines.appendSlice("\n\n");
+            }
+            continue;
+        }
+
+        // Check for JSDoc tags
+        if (std.mem.startsWith(u8, line, "@param")) {
+            try params.append(line);
+        } else if (std.mem.startsWith(u8, line, "@returns") or std.mem.startsWith(u8, line, "@return")) {
+            returns = line;
+        } else if (std.mem.startsWith(u8, line, "@deprecated")) {
+            deprecated = line;
+        } else if (line[0] == '@') {
+            // Other tags - include in description with line break
+            if (description_lines.items.len > 0) {
+                try description_lines.append('\n');
+            }
+            try description_lines.appendSlice(line);
+        } else {
+            // Regular description line - preserve structure for lists and line breaks
+            // Check if this looks like a list item (starts with - or * followed by space)
+            const is_list_item = (line.len > 1 and line[0] == '-' and line[1] == ' ') or
+                (line.len > 2 and line[0] == '*' and line[1] == ' ');
+
+            if (description_lines.items.len > 0) {
+                const items = description_lines.items;
+                const last_char = items[items.len - 1];
+
+                // Don't add anything if previous was paragraph break (ends with newline)
+                if (last_char == '\n') {
+                    // Already have newline from paragraph break, don't add more
+                } else if (is_list_item) {
+                    // List items get their own line
+                    try description_lines.append('\n');
+                } else {
+                    // Regular text continuation - join with space
+                    try description_lines.append(' ');
+                }
+            }
+            try description_lines.appendSlice(line);
+        }
     }
-    try writer.writeAll(")** - Macro expansion preview\n\n");
 
-    if (nodes.len == 0) {
-        try writer.writeAll("*No code generated*");
-        return buf.toOwnedSlice();
+    // Format output
+    // 1. Description
+    if (description_lines.items.len > 0) {
+        try buf.appendSlice(description_lines.items);
     }
 
-    try writer.writeAll("```typescript\n");
-    try writer.writeAll("// Generated methods:\n");
-
-    for (nodes) |node| {
-        try formatAstNode(writer, node);
-        try writer.writeAll("\n");
+    // 2. Deprecated warning (prominent)
+    if (deprecated) |dep| {
+        if (buf.items.len > 0) try buf.appendSlice("\n\n");
+        try buf.appendSlice("**");
+        if (dep.len > "@deprecated".len) {
+            try buf.appendSlice(dep);
+        } else {
+            try buf.appendSlice("@deprecated");
+        }
+        try buf.appendSlice("**");
     }
 
-    try writer.writeAll("```");
+    // 3. Parameters
+    if (params.items.len > 0) {
+        if (buf.items.len > 0) try buf.appendSlice("\n\n");
+        try buf.appendSlice("**Parameters:**\n");
+        for (params.items) |param| {
+            // Extract param name (skip @param and optional {type})
+            var param_rest = param["@param".len..];
+            while (param_rest.len > 0 and param_rest[0] == ' ') param_rest = param_rest[1..];
+
+            var param_type: ?[]const u8 = null;
+
+            // Check for {type} notation
+            if (param_rest.len > 0 and param_rest[0] == '{') {
+                if (std.mem.indexOfScalar(u8, param_rest, '}')) |close_idx| {
+                    param_type = param_rest[1..close_idx];
+                    param_rest = param_rest[close_idx + 1 ..];
+                    while (param_rest.len > 0 and param_rest[0] == ' ') param_rest = param_rest[1..];
+                }
+            }
+
+            // Get param name
+            var name_end: usize = 0;
+            while (name_end < param_rest.len and param_rest[name_end] != ' ' and param_rest[name_end] != '\t') {
+                name_end += 1;
+            }
+            if (name_end > 0) {
+                try buf.appendSlice("- `");
+                try buf.appendSlice(param_rest[0..name_end]);
+                try buf.append('`');
+                // Add type if present
+                if (param_type) |ptype| {
+                    try buf.appendSlice(" (`");
+                    try buf.appendSlice(ptype);
+                    try buf.appendSlice("`)");
+                }
+                if (name_end < param_rest.len) {
+                    // Description
+                    var desc = param_rest[name_end..];
+                    while (desc.len > 0 and (desc[0] == ' ' or desc[0] == '-')) desc = desc[1..];
+                    if (desc.len > 0) {
+                        try buf.appendSlice(" - ");
+                        try buf.appendSlice(desc);
+                    }
+                }
+            } else {
+                try buf.appendSlice("- ");
+                try buf.appendSlice(param_rest);
+            }
+            try buf.append('\n');
+        }
+    }
+
+    // 4. Returns
+    if (returns) |ret| {
+        if (buf.items.len > 0) try buf.appendSlice("\n");
+        try buf.appendSlice("**Returns:** ");
+        var ret_rest = ret;
+        if (std.mem.startsWith(u8, ret_rest, "@returns")) {
+            ret_rest = ret_rest["@returns".len..];
+        } else if (std.mem.startsWith(u8, ret_rest, "@return")) {
+            ret_rest = ret_rest["@return".len..];
+        }
+        while (ret_rest.len > 0 and ret_rest[0] == ' ') ret_rest = ret_rest[1..];
+
+        // Check for {type}
+        if (ret_rest.len > 0 and ret_rest[0] == '{') {
+            if (std.mem.indexOfScalar(u8, ret_rest, '}')) |close_idx| {
+                try buf.appendSlice("`");
+                try buf.appendSlice(ret_rest[1..close_idx]);
+                try buf.appendSlice("` ");
+                ret_rest = ret_rest[close_idx + 1 ..];
+                while (ret_rest.len > 0 and ret_rest[0] == ' ') ret_rest = ret_rest[1..];
+            }
+        }
+        try buf.appendSlice(ret_rest);
+    }
+
+    // 5. Examples - code block with syntax highlighting
+    if (examples.items.len > 0) {
+        if (buf.items.len > 0) try buf.appendSlice("\n\n");
+        try buf.appendSlice("```typescript\n");
+        for (examples.items) |example_line| {
+            try buf.appendSlice(example_line);
+            try buf.append('\n');
+        }
+        try buf.appendSlice("```");
+    }
+
     return buf.toOwnedSlice();
 }
-
-/// Format a single AST node as code
-fn formatAstNode(writer: anytype, node: *ast.Node) !void {
-    switch (node.kind) {
-        .function_decl => {
-            const func = node.data.function_decl;
-            try writer.print("{s}(", .{func.name});
-
-            // Format parameters
-            for (func.params, 0..) |param, i| {
-                if (i > 0) try writer.writeAll(", ");
-                try writer.writeAll(param.name);
-                if (param.type) |param_type| {
-                    try writer.writeAll(": ");
-                    try formatTypePtr(writer, param_type);
-                }
-            }
-
-            try writer.writeAll(")");
-
-            // Return type
-            if (func.return_type) |ret_type| {
-                try writer.writeAll(": ");
-                try formatTypePtr(writer, ret_type);
-            }
-
-            try writer.writeAll(" { ... }");
-        },
-        .method_decl => {
-            const method = node.data.method_decl;
-            try writer.print("{s}(", .{method.name});
-
-            for (method.params, 0..) |param, i| {
-                if (i > 0) try writer.writeAll(", ");
-                try writer.writeAll(param.name);
-                if (param.type) |param_type| {
-                    try writer.writeAll(": ");
-                    try formatTypePtr(writer, param_type);
-                }
-            }
-
-            try writer.writeAll(")");
-
-            if (method.return_type) |ret_type| {
-                try writer.writeAll(": ");
-                try formatTypePtr(writer, ret_type);
-            }
-
-            // Format actual body if present
-            if (method.body) |body| {
-                try writer.writeAll(" {\n");
-                try formatMethodBody(writer, body, 1);
-                try writer.writeAll("}");
-            } else {
-                try writer.writeAll(" { }");
-            }
-        },
-        .property_decl => {
-            const prop = node.data.property_decl;
-            if (prop.readonly) try writer.writeAll("readonly ");
-            try writer.print("{s}", .{prop.name});
-            if (prop.type) |prop_type| {
-                try writer.writeAll(": ");
-                try formatTypePtr(writer, prop_type);
-            }
-            try writer.writeAll(";");
-        },
-        else => {
-            try writer.writeAll("// (generated code)");
-        },
-    }
-}
-
-/// Format method body (block statement) recursively
-fn formatMethodBody(writer: anytype, body: *ast.Node, indent: usize) !void {
-    if (body.kind != .block_stmt) {
-        try formatExpr(writer, body);
-        return;
-    }
-
-    const block = body.data.block_stmt;
-    for (block.statements) |stmt| {
-        // Write indent
-        for (0..indent) |_| {
-            try writer.writeAll("  ");
-        }
-        try formatStatement(writer, stmt, indent);
-        try writer.writeAll("\n");
-    }
-}
-
-/// Format a statement
-fn formatStatement(writer: anytype, stmt: *ast.Node, indent: usize) !void {
-    _ = indent;
-    switch (stmt.kind) {
-        .return_stmt => {
-            try writer.writeAll("return ");
-            if (stmt.data.return_stmt.argument) |arg| {
-                try formatExpr(writer, arg);
-            }
-            try writer.writeAll(";");
-        },
-        else => {
-            try formatExpr(writer, stmt);
-            try writer.writeAll(";");
-        },
-    }
-}
-
-/// Format an expression
-fn formatExpr(writer: anytype, expr: *ast.Node) !void {
-    switch (expr.kind) {
-        .identifier => {
-            try writer.writeAll(expr.data.identifier);
-        },
-        .binary_expr => {
-            const bin = expr.data.binary_expr;
-            try formatExpr(writer, bin.left);
-            const op_str = switch (bin.op) {
-                .eq => " === ",
-                .@"and" => " && ",
-                .@"or" => " || ",
-                .add => " + ",
-                .sub => " - ",
-                .mul => " * ",
-                .div => " / ",
-                else => " ? ",
-            };
-            try writer.writeAll(op_str);
-            try formatExpr(writer, bin.right);
-        },
-        .member_expr => {
-            const mem = expr.data.member_expr;
-            try formatExpr(writer, mem.object);
-            try writer.writeAll(".");
-            try formatExpr(writer, mem.property);
-        },
-        else => {
-            try writer.writeAll("...");
-        },
-    }
-}
-
-/// Format a types.Type pointer as code
-fn formatTypePtr(writer: anytype, typ: *types_mod.Type) !void {
-    switch (typ.kind) {
-        .number => try writer.writeAll("number"),
-        .string => try writer.writeAll("string"),
-        .boolean => try writer.writeAll("boolean"),
-        .void => try writer.writeAll("void"),
-        .unknown => try writer.writeAll("unknown"),
-        .never => try writer.writeAll("never"),
-        .array => {
-            try formatTypePtr(writer, typ.data.array);
-            try writer.writeAll("[]");
-        },
-        .type_reference => {
-            const ref = typ.data.type_reference;
-            try writer.writeAll(ref.name);
-            if (ref.type_args.len > 0) {
-                try writer.writeAll("<");
-                for (ref.type_args, 0..) |arg, i| {
-                    if (i > 0) try writer.writeAll(", ");
-                    try formatTypePtr(writer, arg);
-                }
-                try writer.writeAll(">");
-            }
-        },
-        else => try writer.writeAll("any"),
-    }
-}
-
-// Import AST for formatting
-const ast = @import("../ast/ast.zig");
 
 // ============================================================================
 // Server
@@ -1315,65 +1392,8 @@ pub const Server = struct {
         }
 
         if (found_token) |tok| {
-            // Check for user-defined macro: @ sign followed by identifier
-            // Re-lex to find if we're on @macroName pattern
-            var is_user_macro = false;
-            var macro_name: ?[]const u8 = null;
-
-            if (tok.kind == .at_sign or tok.kind == .identifier) {
-                var lexer2 = lexer_mod.Lexer.init(self.allocator, text, 1) catch {
-                    try self.sendResponse(Response.nullResult(id), stdout, stderr);
-                    return;
-                };
-                defer lexer2.deinit();
-
-                var prev_tok2: ?token_mod.Token = null;
-                while (true) {
-                    const tok2 = lexer2.next() catch break;
-                    if (tok2.kind == .end_of_file) break;
-
-                    if (tok2.kind == .identifier and prev_tok2 != null and prev_tok2.?.kind == .at_sign) {
-                        // Check if either @ or identifier is at our position
-                        const at_line = if (prev_tok2.?.loc.start.line > 0) prev_tok2.?.loc.start.line - 1 else 0;
-                        const id_line = if (tok2.loc.start.line > 0) tok2.loc.start.line - 1 else 0;
-
-                        if ((at_line == line and character >= prev_tok2.?.loc.start.column and character < prev_tok2.?.loc.end.column) or
-                            (id_line == line and character >= tok2.loc.start.column and character < tok2.loc.end.column))
-                        {
-                            is_user_macro = true;
-                            macro_name = tok2.text;
-                            break;
-                        }
-                    }
-                    prev_tok2 = tok2;
-                }
-            }
-
-            // If it's a user-defined macro, try to expand and show preview
-            if (is_user_macro and macro_name != null) {
-                // Try Trans-Am macro expansion first
-                if (self.transam_db) |*db| {
-                    const expansion_hover = self.getMacroExpansionHover(db, uri.string, macro_name.?, line) catch null;
-                    if (expansion_hover) |content| {
-                        defer self.allocator.free(content);
-                        const elapsed_ms = std.time.milliTimestamp() - start_time;
-                        try stderr.print("[mls] Hover: macro expansion '{s}' ({d}ms)\n", .{ macro_name.?, elapsed_ms });
-                        try self.sendHoverResponse(id, content, tok, stdout, stderr);
-                        return;
-                    }
-                }
-                // Fallback to docs from source file
-                if (try self.getMacroHoverDocs(macro_name.?)) |docs| {
-                    const elapsed_ms = std.time.milliTimestamp() - start_time;
-                    try stderr.print("[mls] Hover: macro '{s}' ({d}ms)\n", .{ macro_name.?, elapsed_ms });
-                    try self.sendHoverResponse(id, docs, tok, stdout, stderr);
-                    self.allocator.free(docs);
-                    return;
-                }
-            }
-
-            // All macros are now @ + identifier, handled above via is_user_macro path
-
+            // Macros use the same code path as regular functions/identifiers
+            // They are looked up via Trans-Am symbol table like any other symbol
             const hover_content = getHoverContent(tok.kind, tok.text);
             if (hover_content) |content| {
                 const elapsed_ms = std.time.milliTimestamp() - start_time;
@@ -1384,7 +1404,27 @@ pub const Server = struct {
 
             // For identifiers, try to look up type information via Trans-Am
             if (tok.kind == .identifier) {
-                // First, check if this is a member expression property (e.g., "floor" in "Math.floor")
+                // First, check if this is a macro invocation (@target, @emit, etc.)
+                const macro_hover = self.getMacroHover(text, tok) catch null;
+                if (macro_hover) |content| {
+                    defer self.allocator.free(content);
+                    const elapsed_ms = std.time.milliTimestamp() - start_time;
+                    try stderr.print("[mls] Hover: macro @{s} ({d}ms)\n", .{ tok.text, elapsed_ms });
+                    try self.sendHoverResponse(id, content, tok, stdout, stderr);
+                    return;
+                }
+
+                // Second, check if this is an extern macro declaration (extern macro target)
+                const extern_macro_hover = self.getExternMacroDeclarationHover(text, tok) catch null;
+                if (extern_macro_hover) |content| {
+                    defer self.allocator.free(content);
+                    const elapsed_ms = std.time.milliTimestamp() - start_time;
+                    try stderr.print("[mls] Hover: extern macro {s} ({d}ms)\n", .{ tok.text, elapsed_ms });
+                    try self.sendHoverResponse(id, content, tok, stdout, stderr);
+                    return;
+                }
+
+                // Third, check if this is a member expression property (e.g., "floor" in "Math.floor")
                 // Re-scan to find if there's a dot before this identifier
                 const member_hover = self.getMemberExpressionHover(text, tok, line) catch null;
                 if (member_hover) |content| {
@@ -1419,153 +1459,6 @@ pub const Server = struct {
         const elapsed_ms = std.time.milliTimestamp() - start_time;
         try stderr.print("[mls] Hover: no info at {d}:{d} ({d}ms)\n", .{ line, character, elapsed_ms });
         try self.sendResponse(Response.nullResult(id), stdout, stderr);
-    }
-
-    /// Get hover documentation for a macro from its source file
-    fn getMacroHoverDocs(self: *Server, macro_name: []const u8) !?[]const u8 {
-        // Map macro names to potential source files
-        var target_file: ?[]const u8 = null;
-
-        if (std.mem.startsWith(u8, macro_name, "derive")) {
-            target_file = "std/macros/derive.ms";
-        }
-
-        if (target_file) |file_path| {
-            if (std.fs.cwd().access(file_path, .{})) |_| {
-                const file = std.fs.cwd().openFile(file_path, .{}) catch return null;
-                defer file.close();
-
-                const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch return null;
-                defer self.allocator.free(content);
-
-                // Search for the macro definition and preceding comments
-                const search_pattern = try std.fmt.allocPrint(
-                    self.allocator,
-                    "@macro function {s}",
-                    .{macro_name},
-                );
-                defer self.allocator.free(search_pattern);
-
-                if (std.mem.indexOf(u8, content, search_pattern)) |def_pos| {
-                    // Look backwards for comments
-                    var comment_start: usize = def_pos;
-                    var i = def_pos;
-                    while (i > 0) {
-                        i -= 1;
-                        if (content[i] == '\n') {
-                            // Check if previous line is a comment
-                            var line_start = i + 1;
-                            while (line_start < def_pos and (content[line_start] == ' ' or content[line_start] == '\t')) {
-                                line_start += 1;
-                            }
-                            if (line_start + 2 < def_pos and content[line_start] == '/' and content[line_start + 1] == '/') {
-                                comment_start = line_start;
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-
-                    // Extract comments
-                    var docs = std.ArrayList(u8).init(self.allocator);
-                    errdefer docs.deinit();
-
-                    try docs.appendSlice("**@");
-                    try docs.appendSlice(macro_name);
-                    try docs.appendSlice("** - Source-defined macro\n\n");
-
-                    // Parse comment lines
-                    var line_start: usize = comment_start;
-                    for (content[comment_start..def_pos], 0..) |c, idx| {
-                        if (c == '\n') {
-                            const line = content[line_start .. comment_start + idx];
-                            // Strip leading whitespace and //
-                            var trimmed = line;
-                            while (trimmed.len > 0 and (trimmed[0] == ' ' or trimmed[0] == '\t')) {
-                                trimmed = trimmed[1..];
-                            }
-                            if (trimmed.len >= 2 and trimmed[0] == '/' and trimmed[1] == '/') {
-                                trimmed = trimmed[2..];
-                                if (trimmed.len > 0 and trimmed[0] == ' ') {
-                                    trimmed = trimmed[1..];
-                                }
-                                try docs.appendSlice(trimmed);
-                                try docs.append('\n');
-                            }
-                            line_start = comment_start + idx + 1;
-                        }
-                    }
-
-                    try docs.appendSlice("\n```typescript\n@");
-                    try docs.appendSlice(macro_name);
-                    try docs.appendSlice("\nclass YourClass { ... }\n```\n\n");
-                    try docs.appendSlice("*Defined in: ");
-                    try docs.appendSlice(file_path);
-                    try docs.appendSlice("*");
-
-                    return try docs.toOwnedSlice();
-                }
-            } else |_| {}
-        }
-
-        return null;
-    }
-
-    /// Get macro expansion hover content using Trans-Am
-    fn getMacroExpansionHover(
-        self: *Server,
-        db: *transam.TransAmDatabase,
-        file_uri: []const u8,
-        macro_name: []const u8,
-        hover_line: u32,
-    ) !?[]const u8 {
-        // Get all macro call sites in the file
-        const call_sites = db.getMacroCallSites(file_uri) catch return null;
-        defer {
-            for (call_sites) |site| {
-                self.allocator.free(site.arguments);
-            }
-            self.allocator.free(call_sites);
-        }
-
-        // Find the macro call site at the hover line
-        var target_site: ?transam.MacroCallSite = null;
-        for (call_sites) |site| {
-            // Check if macro name matches and line is close
-            if (std.mem.eql(u8, site.macro_name, macro_name)) {
-                // Line comparison: site.line is from AST (1-indexed, points to class)
-                // hover_line is from LSP (0-indexed, points to @derive decorator)
-                // Decorators are typically on lines before the class
-                // So check if hover_line+1 is at or before site.line (within a few lines)
-                const hover_line_1indexed = hover_line + 1;
-                if (hover_line_1indexed <= site.line and site.line - hover_line_1indexed <= 3) {
-                    target_site = site;
-                    break;
-                }
-            }
-        }
-
-        if (target_site == null) return null;
-        const site = target_site.?;
-
-        // Debug: Check if target_node is available for MacroVM
-        std.debug.print("[mls] Macro site: {s}, target_node: {?}\n", .{ site.macro_name, site.target_node });
-
-        // Expand the macro
-        const expansion_result = db.expandMacroCallSite(file_uri, site) catch |err| {
-            std.debug.print("[mls] expandMacroCallSite failed: {}\n", .{err});
-            return null;
-        };
-
-        // Format the expansion for display
-        const hover_content = formatMacroExpansion(
-            self.allocator,
-            expansion_result.generated_nodes,
-            site.macro_name,
-            site.arguments,
-        ) catch return null;
-
-        return hover_content;
     }
 
     /// Check if token is a property in a member expression (e.g., "floor" in "Math.floor")
@@ -1735,6 +1628,186 @@ pub const Server = struct {
         return null;
     }
 
+    /// Get hover content for built-in compiler macros (extern macros)
+    /// These are defined in std/macros/compiler.ms but implemented by the compiler
+    fn getBuiltinMacroHover(self: *Server, macro_name: []const u8) !?[]const u8 {
+        const macros = [_]struct { name: []const u8, signature: []const u8, desc: []const u8 }{
+            .{
+                .name = "target",
+                .signature = "@target(...platforms: (\"c\" | \"js\" | \"erlang\")[])",
+                .desc = "Conditional compilation for target backends.\n\nCode inside block only compiled for specified target(s).\nSupports `else` clause for fallback code.\n\n```typescript\n@target(\"c\") {\n    @emit(\"printf($msg)\")\n} else @target(\"js\") {\n    console.log(msg);\n} else {\n    // Fallback\n}\n```",
+            },
+            .{
+                .name = "emit",
+                .signature = "@emit(code: string): void\n@emit<T>(code: string): T",
+                .desc = "Emit raw backend code.\n\nBypasses AST and emits literal code string to the backend.\nUse `$var` syntax for variable interpolation.\n\n```typescript\n@emit(\"printf(\\\"%s\\\\n\\\", $msg);\")  // C\n@emit(\"console.log($x)\")           // JS\n@emit<boolean>(\"confirm($msg)\")    // Typed return\n```",
+            },
+            .{
+                .name = "comptime",
+                .signature = "@comptime<T>(block: () => T): T",
+                .desc = "Compile-time execution block.\n\nCode runs during compilation; result embedded as constant.\n\n```typescript\nconst version = @comptime {\n    return readFile(\"VERSION\").trim();\n};\n```",
+            },
+            .{
+                .name = "inline",
+                .signature = "@inline",
+                .desc = "Force inline expansion at call sites.\n\nMarks a function for inline expansion.\n\n```typescript\n@inline\nfunction add(a: number, b: number): number {\n    return a + b;\n}\n```",
+            },
+            .{
+                .name = "sizeof",
+                .signature = "@sizeof<T>(): usize",
+                .desc = "Get size of type in bytes.\n\nReturns the size of the type in the target backend.\n\n```typescript\nconst intSize = @sizeof<i32>();   // 4\nconst ptrSize = @sizeof<*void>(); // 8 on 64-bit\n```",
+            },
+            .{
+                .name = "alignof",
+                .signature = "@alignof<T>(): usize",
+                .desc = "Get alignment of type in bytes.\n\nReturns the alignment requirement of the type.\n\n```typescript\nconst intAlign = @alignof<i32>();    // 4\nconst doubleAlign = @alignof<f64>(); // 8\n```",
+            },
+            .{
+                .name = "typeinfo",
+                .signature = "@typeinfo<T>(): TypeInfo",
+                .desc = "Get type information at compile time.\n\nReturns structural information about a type.\n\n```typescript\nconst info = @typeinfo<User>();\nfor (const field of info.fields) {\n    console.log(field.name, field.type);\n}\n```",
+            },
+            .{
+                .name = "currentTarget",
+                .signature = "@currentTarget(): \"c\" | \"js\" | \"erlang\"",
+                .desc = "Get current compilation target.\n\nReturns the backend being compiled for.\n\n```typescript\nif (@currentTarget() === \"js\") {\n    // Browser-specific code\n}\n```",
+            },
+            // FFI decorator macros (used with extern declarations)
+            .{
+                .name = "native",
+                .signature = "@native(name: string)",
+                .desc = "Map to different name in target backend.\n\n```typescript\n@native(\"__builtin_popcount\")\nextern function popcount(x: u32): u32;\n```",
+            },
+            .{
+                .name = "library",
+                .signature = "@library(name: string)",
+                .desc = "Specify library to link against.\n\n```typescript\n@library(\"libcurl\")\nextern function curl_easy_init(): *CurlHandle;\n```",
+            },
+            .{
+                .name = "include",
+                .signature = "@include(header: string)",
+                .desc = "Include C header file.\n\n```typescript\n@include(\"sys/stat.h\")\nextern class stat_t { ... }\n```",
+            },
+        };
+
+        for (macros) |macro| {
+            if (std.mem.eql(u8, macro_name, macro.name)) {
+                return try std.fmt.allocPrint(
+                    self.allocator,
+                    "```typescript\n{s}\n```\n{s}",
+                    .{ macro.signature, macro.desc },
+                );
+            }
+        }
+
+        return null;
+    }
+
+    /// Check if identifier is preceded by @ (macro invocation)
+    fn getMacroHover(
+        self: *Server,
+        text: []const u8,
+        tok: token_mod.Token,
+    ) !?[]const u8 {
+        // Re-lex to find if there's an @ before this identifier
+        var lexer = try lexer_mod.Lexer.init(self.allocator, text, 1);
+        defer lexer.deinit();
+
+        var prev_tok: ?token_mod.Token = null;
+
+        while (true) {
+            const current = lexer.next() catch break;
+            if (current.kind == .end_of_file) break;
+
+            // Check if current token matches the one we're hovering over
+            if (current.kind == .identifier and
+                current.loc.start.line == tok.loc.start.line and
+                current.loc.start.column == tok.loc.start.column)
+            {
+                // Check if preceded by @
+                if (prev_tok != null and prev_tok.?.kind == .at_sign) {
+                    // This is a macro invocation - look up documentation
+                    return try self.getBuiltinMacroHover(current.text);
+                }
+                break;
+            }
+
+            prev_tok = current;
+        }
+
+        return null;
+    }
+
+    /// Check if identifier is part of an extern macro declaration and return JSDoc
+    fn getExternMacroDeclarationHover(
+        self: *Server,
+        text: []const u8,
+        tok: token_mod.Token,
+    ) !?[]const u8 {
+        // Re-lex to find if this is: extern macro <name>
+        var lexer = try lexer_mod.Lexer.init(self.allocator, text, 1);
+        defer lexer.deinit();
+
+        var prev_prev_tok: ?token_mod.Token = null;
+        var prev_tok: ?token_mod.Token = null;
+        var last_doc_comment: ?[]const u8 = null;
+
+        while (true) {
+            const current = lexer.next() catch break;
+            if (current.kind == .end_of_file) break;
+
+            // Track doc comments
+            if (current.kind == .doc_comment) {
+                last_doc_comment = current.text;
+            }
+
+            // Check if current token matches the one we're hovering over
+            if (current.kind == .identifier and
+                current.loc.start.line == tok.loc.start.line and
+                current.loc.start.column == tok.loc.start.column)
+            {
+                // Check if preceded by: extern macro
+                if (prev_tok != null and prev_tok.?.kind == .keyword_macro and
+                    prev_prev_tok != null and prev_prev_tok.?.kind == .keyword_extern)
+                {
+                    // This is an extern macro declaration
+                    // First try built-in macro docs
+                    if (try self.getBuiltinMacroHover(current.text)) |builtin_docs| {
+                        return builtin_docs;
+                    }
+
+                    // Otherwise, try to find and format the JSDoc above
+                    if (last_doc_comment) |doc| {
+                        return try formatJsDocForHover(self.allocator, doc);
+                    }
+
+                    // Fallback: just show the declaration signature
+                    return try std.fmt.allocPrint(
+                        self.allocator,
+                        "```typescript\nextern macro {s}\n```",
+                        .{current.text},
+                    );
+                }
+                break;
+            }
+
+            // Reset doc comment if we hit non-doc token
+            if (current.kind != .doc_comment) {
+                // Only reset if we're on a different line (allow whitespace)
+                if (prev_tok) |prev| {
+                    if (current.loc.start.line > prev.loc.start.line + 1) {
+                        last_doc_comment = null;
+                    }
+                }
+            }
+
+            prev_prev_tok = prev_tok;
+            prev_tok = current;
+        }
+
+        return null;
+    }
+
     fn sendHoverResponse(
         self: *Server,
         id: std.json.Value,
@@ -1750,10 +1823,11 @@ pub const Server = struct {
         try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
         try std.json.stringify(id, .{}, writer);
 
-        // Hover result with markdown content and range
-        try writer.writeAll(",\"result\":{\"contents\":{\"kind\":\"markdown\",\"value\":");
+        // Hover result with plain string content (more compatible) and range
+        // Note: Using plain string instead of MarkupContent for better editor compatibility
+        try writer.writeAll(",\"result\":{\"contents\":");
         try std.json.stringify(content, .{}, writer);
-        try writer.writeAll("},\"range\":{\"start\":{\"line\":");
+        try writer.writeAll(",\"range\":{\"start\":{\"line\":");
 
         const start_line = if (tok.loc.start.line > 0) tok.loc.start.line - 1 else 0;
         const end_line = if (tok.loc.end.line > 0) tok.loc.end.line - 1 else 0;
@@ -2119,8 +2193,17 @@ pub const Server = struct {
         try stderr.print("[mls] Looking for macro definition: @{s}\n", .{macro_name});
 
         // Map macro names to file locations
-        // Built-in derive macros are in std/macros/derive.ms
+        // Built-in compiler intrinsics are in std/macros/compiler.ms
+        // Derive macros are in std/macros/derive.ms
         const macro_files = [_]struct { prefix: []const u8, file: []const u8 }{
+            // Compiler intrinsics
+            .{ .prefix = "target", .file = "std/macros/compiler.ms" },
+            .{ .prefix = "emit", .file = "std/macros/compiler.ms" },
+            .{ .prefix = "comptime", .file = "std/macros/compiler.ms" },
+            .{ .prefix = "inline", .file = "std/macros/compiler.ms" },
+            .{ .prefix = "sizeof", .file = "std/macros/compiler.ms" },
+            .{ .prefix = "alignof", .file = "std/macros/compiler.ms" },
+            // Derive macros
             .{ .prefix = "derive", .file = "std/macros/derive.ms" },
             .{ .prefix = "Eq", .file = "std/macros/derive.ms" },
             .{ .prefix = "Hash", .file = "std/macros/derive.ms" },
@@ -2157,66 +2240,78 @@ pub const Server = struct {
                 };
                 defer self.allocator.free(content);
 
-                // Search for @macro function macroName or function macroName
+                // Search for various macro definition patterns
                 var line_num: u32 = 0;
                 var line_start: usize = 0;
+
+                // Patterns to search for (in order of preference)
+                // Note: macro_name is just "target", but declaration is "extern macro @target"
+                const patterns = [_]struct { prefix: []const u8, offset: usize }{
+                    .{ .prefix = "extern macro @", .offset = "extern macro @".len },
+                    .{ .prefix = "@macro function ", .offset = "@macro function ".len },
+                    .{ .prefix = "macro @", .offset = "macro @".len },
+                    .{ .prefix = "macro ", .offset = "macro ".len },
+                };
 
                 for (content, 0..) |c, i| {
                     if (c == '\n') {
                         const line = content[line_start..i];
 
-                        // Look for @macro function macroName
-                        const search_pattern = try std.fmt.allocPrint(
-                            self.allocator,
-                            "@macro function {s}",
-                            .{macro_name},
-                        );
-                        defer self.allocator.free(search_pattern);
-
-                        if (std.mem.indexOf(u8, line, search_pattern)) |col| {
-                            // Found it! Calculate the column where the name starts
-                            const name_col = col + "@macro function ".len;
-
-                            // Get absolute path
-                            var abs_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-                            const abs_path = std.fs.cwd().realpath(file_path, &abs_path_buf) catch {
-                                return false;
-                            };
-
-                            // Build file URI
-                            const file_uri = try std.fmt.allocPrint(
+                        // Try each pattern
+                        for (patterns) |pattern| {
+                            // Build search string: pattern + macro_name
+                            const search_pattern = try std.fmt.allocPrint(
                                 self.allocator,
-                                "file://{s}",
-                                .{abs_path},
+                                "{s}{s}",
+                                .{ pattern.prefix, macro_name },
                             );
-                            defer self.allocator.free(file_uri);
+                            defer self.allocator.free(search_pattern);
 
-                            // Send location response
-                            var buf = std.ArrayList(u8).init(self.allocator);
-                            defer buf.deinit();
+                            if (std.mem.indexOf(u8, line, search_pattern)) |col| {
+                                // Found it! Calculate the column where the name starts
+                                const name_col = col + pattern.offset;
 
-                            const writer = buf.writer();
-                            try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
-                            try std.json.stringify(id, .{}, writer);
-                            try writer.writeAll(",\"result\":{\"uri\":");
-                            try std.json.stringify(file_uri, .{}, writer);
-                            try writer.writeAll(",\"range\":{\"start\":{\"line\":");
-                            try writer.print("{d}", .{line_num});
-                            try writer.writeAll(",\"character\":");
-                            try writer.print("{d}", .{name_col});
-                            try writer.writeAll("},\"end\":{\"line\":");
-                            try writer.print("{d}", .{line_num});
-                            try writer.writeAll(",\"character\":");
-                            try writer.print("{d}", .{name_col + macro_name.len});
-                            try writer.writeAll("}}}}");
+                                // Get absolute path
+                                var abs_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                                const abs_path = std.fs.cwd().realpath(file_path, &abs_path_buf) catch {
+                                    return false;
+                                };
 
-                            try jsonrpc.writeMessage(stdout, buf.items);
-                            try stderr.print("[mls] Found macro @{s} in {s}:{d}\n", .{
-                                macro_name,
-                                file_path,
-                                line_num + 1,
-                            });
-                            return true;
+                                // Build file URI
+                                const file_uri = try std.fmt.allocPrint(
+                                    self.allocator,
+                                    "file://{s}",
+                                    .{abs_path},
+                                );
+                                defer self.allocator.free(file_uri);
+
+                                // Send location response
+                                var buf = std.ArrayList(u8).init(self.allocator);
+                                defer buf.deinit();
+
+                                const writer = buf.writer();
+                                try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+                                try std.json.stringify(id, .{}, writer);
+                                try writer.writeAll(",\"result\":{\"uri\":");
+                                try std.json.stringify(file_uri, .{}, writer);
+                                try writer.writeAll(",\"range\":{\"start\":{\"line\":");
+                                try writer.print("{d}", .{line_num});
+                                try writer.writeAll(",\"character\":");
+                                try writer.print("{d}", .{name_col});
+                                try writer.writeAll("},\"end\":{\"line\":");
+                                try writer.print("{d}", .{line_num});
+                                try writer.writeAll(",\"character\":");
+                                try writer.print("{d}", .{name_col + macro_name.len});
+                                try writer.writeAll("}}}}");
+
+                                try jsonrpc.writeMessage(stdout, buf.items);
+                                try stderr.print("[mls] Found macro @{s} in {s}:{d}\n", .{
+                                    macro_name,
+                                    file_path,
+                                    line_num + 1,
+                                });
+                                return true;
+                            }
                         }
 
                         line_num += 1;
@@ -2580,6 +2675,8 @@ pub const Server = struct {
             defer db.freeDiagnostics(transam_diags);
 
             for (transam_diags) |td| {
+                // Copy message before freeDiagnostics is called (defer above)
+                const message_copy = try self.allocator.dupe(u8, td.message);
                 try diagnostics.append(.{
                     .range = .{
                         .start = .{ .line = td.start_line, .character = td.start_col },
@@ -2592,7 +2689,7 @@ pub const Server = struct {
                         .hint => .hint,
                     },
                     .source = "mls",
-                    .message = td.message,
+                    .message = message_copy,
                 });
             }
 
@@ -2784,4 +2881,199 @@ test "InitializeResult: JSON serialization" {
     try testing.expect(std.mem.indexOf(u8, buf.items, "\"name\":\"mls\"") != null);
     try testing.expect(std.mem.indexOf(u8, buf.items, "\"version\":\"0.1.0\"") != null);
     try testing.expect(std.mem.indexOf(u8, buf.items, "\"change\":2") != null);
+}
+
+// ===== JSDoc Formatting Tests =====
+
+test "lsp.jsdoc: cleanJsDoc removes wrapper" {
+    // Test basic JSDoc wrapper removal
+    const doc1 = "/** Simple comment */";
+    const cleaned1 = cleanJsDoc(doc1);
+    try testing.expectEqualStrings("Simple comment", cleaned1);
+
+    // Test multiline JSDoc
+    const doc2 = "/**\n * Description\n */";
+    const cleaned2 = cleanJsDoc(doc2);
+    try testing.expect(cleaned2.len > 0);
+}
+
+test "lsp.jsdoc: formatJsDocForHover parses simple description" {
+    const doc = "/** This is a simple description */";
+    const result = try formatJsDocForHover(testing.allocator, doc);
+    defer testing.allocator.free(result);
+
+    try testing.expect(std.mem.indexOf(u8, result, "This is a simple description") != null);
+}
+
+test "lsp.jsdoc: formatJsDocForHover parses @param tag" {
+    const doc =
+        \\/**
+        \\ * Function description
+        \\ * @param x The x parameter
+        \\ * @param y The y parameter
+        \\ */
+    ;
+    const result = try formatJsDocForHover(testing.allocator, doc);
+    defer testing.allocator.free(result);
+
+    // Should have Parameters section
+    try testing.expect(std.mem.indexOf(u8, result, "**Parameters:**") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "x`") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "y`") != null);
+}
+
+test "lsp.jsdoc: formatJsDocForHover parses @returns tag" {
+    const doc =
+        \\/**
+        \\ * Calculates something
+        \\ * @returns The calculated value
+        \\ */
+    ;
+    const result = try formatJsDocForHover(testing.allocator, doc);
+    defer testing.allocator.free(result);
+
+    // Should have Returns section
+    try testing.expect(std.mem.indexOf(u8, result, "**Returns:**") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "calculated value") != null);
+}
+
+test "lsp.jsdoc: formatJsDocForHover parses @deprecated tag" {
+    const doc =
+        \\/**
+        \\ * Old function
+        \\ * @deprecated Use newFunction instead
+        \\ */
+    ;
+    const result = try formatJsDocForHover(testing.allocator, doc);
+    defer testing.allocator.free(result);
+
+    // Should have deprecated warning
+    try testing.expect(std.mem.indexOf(u8, result, "**@deprecated") != null);
+}
+
+test "lsp.jsdoc: formatJsDocForHover handles typed @param" {
+    const doc =
+        \\/**
+        \\ * @param {number} x The x value
+        \\ */
+    ;
+    const result = try formatJsDocForHover(testing.allocator, doc);
+    defer testing.allocator.free(result);
+
+    // Should include type
+    try testing.expect(std.mem.indexOf(u8, result, "number") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "x") != null);
+}
+
+test "lsp.jsdoc: formatJsDocForHover preserves list items" {
+    const doc =
+        \\/**
+        \\ * Checks if a file exists across platforms:
+        \\ * - C backend: access() syscall
+        \\ * - JS backend: fs.existsSync
+        \\ * - Erlang: filelib:is_file
+        \\ */
+    ;
+    const result = try formatJsDocForHover(testing.allocator, doc);
+    defer testing.allocator.free(result);
+
+    // List items should be on separate lines, not joined
+    try testing.expect(std.mem.indexOf(u8, result, "- C backend") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "- JS backend") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "- Erlang") != null);
+    // Verify newlines exist between list items (rough check)
+    try testing.expect(std.mem.indexOf(u8, result, "\n- ") != null);
+}
+
+test "lsp.jsdoc: formatJsDocForHover parses @example tag" {
+    const doc =
+        \\/**
+        \\ * Adds two numbers
+        \\ * @example
+        \\ * const result = add(1, 2);
+        \\ * console.log(result); // 3
+        \\ * @param a First number
+        \\ */
+    ;
+    const result = try formatJsDocForHover(testing.allocator, doc);
+    defer testing.allocator.free(result);
+
+    // Should have Example code block
+    try testing.expect(std.mem.indexOf(u8, result, "```typescript") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "add(1, 2)") != null);
+}
+
+test "lsp.jsdoc: formatJsDocForHover handles inline @example" {
+    const doc =
+        \\/**
+        \\ * Computes value
+        \\ * @example const x = compute();
+        \\ */
+    ;
+    const result = try formatJsDocForHover(testing.allocator, doc);
+    defer testing.allocator.free(result);
+
+    try testing.expect(std.mem.indexOf(u8, result, "```typescript") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "compute()") != null);
+}
+
+test "lsp.jsdoc: formatJsDocForHover handles typed @returns" {
+    const doc =
+        \\/**
+        \\ * @returns {boolean} True if successful
+        \\ */
+    ;
+    const result = try formatJsDocForHover(testing.allocator, doc);
+    defer testing.allocator.free(result);
+
+    try testing.expect(std.mem.indexOf(u8, result, "**Returns:**") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "`boolean`") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "True if successful") != null);
+}
+
+test "lsp.jsdoc: formatJsDocForHover handles multi-paragraph description" {
+    const doc =
+        \\/**
+        \\ * First paragraph describes the purpose.
+        \\ *
+        \\ * Second paragraph provides more detail.
+        \\ */
+    ;
+    const result = try formatJsDocForHover(testing.allocator, doc);
+    defer testing.allocator.free(result);
+
+    try testing.expect(std.mem.indexOf(u8, result, "First paragraph") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "Second paragraph") != null);
+    // Verify paragraph break (double newline) exists between them
+    try testing.expect(std.mem.indexOf(u8, result, "\n\n") != null);
+}
+
+test "lsp.jsdoc: formatJsDocForHover complete example" {
+    const doc =
+        \\/**
+        \\ * Calculates the area of a rectangle.
+        \\ *
+        \\ * Supports:
+        \\ * - Integer dimensions
+        \\ * - Float dimensions
+        \\ *
+        \\ * @param {number} width The width
+        \\ * @param {number} height The height
+        \\ * @returns {number} The calculated area
+        \\ * @example
+        \\ * const area = calculateArea(10, 20);
+        \\ * @deprecated Use calculateRectArea instead
+        \\ */
+    ;
+    const result = try formatJsDocForHover(testing.allocator, doc);
+    defer testing.allocator.free(result);
+
+    // Check all sections present
+    try testing.expect(std.mem.indexOf(u8, result, "Calculates the area") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "**Parameters:**") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "`width`") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "`height`") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "**Returns:**") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "```typescript") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "**@deprecated") != null);
 }

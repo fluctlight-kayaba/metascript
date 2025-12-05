@@ -83,7 +83,10 @@ pub const TypeInference = struct {
             // Identifier - look up type from symbol table
             .identifier => {
                 const name = node.data.identifier;
-                if (self.symbols.lookup(name)) |sym| {
+                // Use lookupAll to search ALL scopes, not just current + parents.
+                // This is needed because Phase 3 creates new scope objects, but
+                // variables were defined in Phase 1's scopes.
+                if (self.symbols.lookupAll(name)) |sym| {
                     node.type = sym.type;
                     return node.type;
                 } else {
@@ -360,11 +363,14 @@ pub const TypeInference = struct {
             },
             .while_stmt => {
                 _ = try self.inferNode(node.data.while_stmt.condition);
+                // Enter loop scope for consistency with other phases
+                try self.symbols.enterScopeWithLocation(.loop, node.location);
+                defer self.symbols.exitScope();
                 _ = try self.inferNode(node.data.while_stmt.body);
                 return null;
             },
             .for_stmt => {
-                try self.symbols.enterScope(.loop);
+                try self.symbols.enterScopeWithLocation(.loop, node.location);
                 defer self.symbols.exitScope();
 
                 if (node.data.for_stmt.init) |for_init| _ = try self.inferNode(for_init);
@@ -382,8 +388,8 @@ pub const TypeInference = struct {
             .function_decl => {
                 const func = &node.data.function_decl;
                 if (func.body) |body| {
-                    // Enter function scope
-                    try self.symbols.enterScope(.function);
+                    // Enter function scope with body boundaries for correct shadowing lookup
+                    try self.symbols.enterScopeWithLocation(.function, body.location);
                     defer self.symbols.exitScope();
 
                     // Register parameters in scope
@@ -429,8 +435,8 @@ pub const TypeInference = struct {
             .method_decl => {
                 const method = &node.data.method_decl;
                 if (method.body) |body| {
-                    // Enter function scope
-                    try self.symbols.enterScope(.function);
+                    // Enter function scope with body boundaries for correct shadowing lookup
+                    try self.symbols.enterScopeWithLocation(.function, body.location);
                     defer self.symbols.exitScope();
 
                     // Register `this` with the current class type
@@ -465,6 +471,7 @@ pub const TypeInference = struct {
             .export_decl,
             .type_alias_decl,
             .macro_decl,
+            .extern_macro_decl,
             .macro_invocation,
             .comptime_block,
             .compile_error,
@@ -958,6 +965,90 @@ test "inference: macro-generated identifier skips error" {
 
     // Should NOT report error for macro-generated code
     try std.testing.expect(!inference.hasErrors());
+}
+
+test "inference: identifier in child scope found via lookupAll" {
+    // This tests that identifiers defined in a child scope (e.g., function body)
+    // can be found even when the current scope is global (after exitScope).
+    // This is critical for Phase 3 type inference which creates new scopes
+    // but needs to find symbols defined in Phase 1's scopes.
+    const allocator = std.testing.allocator;
+
+    var symbols = try symbol_mod.SymbolTable.init(allocator);
+    defer symbols.deinit();
+
+    // Simulate Phase 1: define variable in function scope
+    try symbols.enterScope(.function);
+
+    var int_type = types.Type{
+        .kind = .int32,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .int32 = {} },
+    };
+
+    var sym = symbol_mod.Symbol.init("counter", .variable, location.SourceLocation.dummy());
+    sym.type = &int_type;
+    try symbols.define(sym);
+
+    symbols.exitScope(); // Back to global scope
+
+    // Simulate Phase 3: inference runs with current scope = global
+    // But needs to find "counter" which is in the (exited) function scope
+    var inference = TypeInference.init(allocator, &symbols);
+    defer inference.deinit();
+
+    var node = ast.Node{
+        .kind = .identifier,
+        .location = location.SourceLocation.init(1, .{ .line = 5, .column = 4 }, .{ .line = 5, .column = 11 }),
+        .data = .{ .identifier = "counter" },
+    };
+
+    _ = try inference.inferNode(&node);
+
+    // Should find the variable and NOT report an error
+    try std.testing.expect(!inference.hasErrors());
+    try std.testing.expect(node.type != null);
+    try std.testing.expectEqual(types.TypeKind.int32, node.type.?.kind);
+}
+
+test "inference: nested function scope variables resolved" {
+    // Tests that variables in deeply nested scopes are found
+    const allocator = std.testing.allocator;
+
+    var symbols = try symbol_mod.SymbolTable.init(allocator);
+    defer symbols.deinit();
+
+    // Create nested scopes: global -> function -> block
+    try symbols.enterScope(.function);
+    try symbols.enterScope(.block);
+
+    var str_type = types.Type{
+        .kind = .string,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .string = {} },
+    };
+
+    var sym = symbol_mod.Symbol.init("deepVar", .variable, location.SourceLocation.dummy());
+    sym.type = &str_type;
+    try symbols.define(sym);
+
+    symbols.exitScope(); // exit block
+    symbols.exitScope(); // exit function, back to global
+
+    var inference = TypeInference.init(allocator, &symbols);
+    defer inference.deinit();
+
+    var node = ast.Node{
+        .kind = .identifier,
+        .location = location.SourceLocation.init(1, .{ .line = 10, .column = 8 }, .{ .line = 10, .column = 15 }),
+        .data = .{ .identifier = "deepVar" },
+    };
+
+    _ = try inference.inferNode(&node);
+
+    try std.testing.expect(!inference.hasErrors());
+    try std.testing.expect(node.type != null);
+    try std.testing.expectEqual(types.TypeKind.string, node.type.?.kind);
 }
 
 test "inference: member expression resolves property type" {

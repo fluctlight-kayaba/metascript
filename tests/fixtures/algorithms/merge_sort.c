@@ -9,6 +9,7 @@
 #define MS_ORC_IMPLEMENTATION
 #include "orc.h"
 #include "ms_string.h"
+#include "ms_string_intern.h"
 
 double merge(double left, double right) {
     double result[0] = {};

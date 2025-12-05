@@ -26,8 +26,17 @@ pub fn run(allocator: std.mem.Allocator, path: []const u8) !void {
     // Register file with Trans-Am
     _ = try db.setFileText(path, source);
 
-    // Get diagnostics via Trans-Am query (same as LSP!)
-    const diagnostics = db.getDiagnostics(path) catch |err| {
+    // Collect all diagnostics (parse errors + type errors)
+    var all_diagnostics = std.ArrayList(transam.Diagnostic).init(allocator);
+    defer {
+        for (all_diagnostics.items) |diag| {
+            allocator.free(diag.message);
+        }
+        all_diagnostics.deinit();
+    }
+
+    // Phase 1: Get parse diagnostics
+    const parse_diagnostics = db.getDiagnostics(path) catch |err| {
         std.debug.print("{s}error:{s} Analysis failed: {s}\n", .{
             colors.error_color.code(),
             colors.Color.reset.code(),
@@ -35,12 +44,39 @@ pub fn run(allocator: std.mem.Allocator, path: []const u8) !void {
         });
         return;
     };
-    defer {
-        for (diagnostics) |diag| {
-            allocator.free(diag.message);
-        }
-        allocator.free(diagnostics);
+    defer allocator.free(parse_diagnostics);
+
+    for (parse_diagnostics) |diag| {
+        try all_diagnostics.append(diag);
     }
+
+    // Phase 2: Run full type checking (only if no parse errors)
+    if (parse_diagnostics.len == 0) {
+        const check_result = db.checkFile(path) catch |err| {
+            std.debug.print("{s}error:{s} Type checking failed: {s}\n", .{
+                colors.error_color.code(),
+                colors.Color.reset.code(),
+                @errorName(err),
+            });
+            return;
+        };
+
+        // Convert type errors to diagnostics
+        for (check_result.errors) |type_err| {
+            const diag = transam.Diagnostic{
+                .start_line = if (type_err.location.start.line > 0) type_err.location.start.line - 1 else 0,
+                .start_col = type_err.location.start.column,
+                .end_line = if (type_err.location.end.line > 0) type_err.location.end.line - 1 else 0,
+                .end_col = type_err.location.end.column,
+                .severity = .@"error",
+                .message = try allocator.dupe(u8, type_err.message),
+                .source = "typecheck",
+            };
+            try all_diagnostics.append(diag);
+        }
+    }
+
+    const diagnostics = all_diagnostics.items;
 
     // Display results
     if (diagnostics.len == 0) {

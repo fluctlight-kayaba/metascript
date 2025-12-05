@@ -512,6 +512,14 @@ fn hashAstNodeImpl(hasher: *std.hash.Wyhash, n: *const Node) void {
             hashAstNodeImpl(hasher, macro.body);
         },
 
+        // Extern macro declaration (no body)
+        .extern_macro_decl => {
+            const macro = &n.data.extern_macro_decl;
+            hasher.update(macro.name);
+            hashFunctionParams(hasher, macro.params);
+            if (macro.return_type) |ret| hashTypeImpl(hasher, ret);
+        },
+
         // Macro invocation
         .macro_invocation => {
             const macro = &n.data.macro_invocation;
@@ -520,6 +528,7 @@ fn hashAstNodeImpl(hasher: *std.hash.Wyhash, n: *const Node) void {
             for (macro.arguments) |arg| {
                 switch (arg) {
                     .identifier => |id| hasher.update(id),
+                    .string_literal => |s| hasher.update(s),
                     .type => |t| hashTypeImpl(hasher, t),
                     .expression => |expr| hashAstNodeImpl(hasher, expr),
                 }

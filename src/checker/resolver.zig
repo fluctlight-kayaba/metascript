@@ -69,7 +69,12 @@ pub const TypeResolver = struct {
                 const func = &node.data.function_decl;
 
                 // Enter function scope to register type parameters
-                try self.symbols.enterScope(.function);
+                // Use body location if available for proper scope boundaries
+                if (func.body) |body| {
+                    try self.symbols.enterScopeWithLocation(.function, body.location);
+                } else {
+                    try self.symbols.enterScope(.function);
+                }
                 defer self.symbols.exitScope();
 
                 // Register type parameters as type aliases in scope
@@ -283,6 +288,7 @@ pub const TypeResolver = struct {
             .import_decl,
             .export_decl,
             .macro_decl,
+            .extern_macro_decl,
             .macro_invocation,
             .comptime_block,
             .compile_error,

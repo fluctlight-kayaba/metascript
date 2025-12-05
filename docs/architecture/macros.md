@@ -6,204 +6,225 @@
 
 ---
 
-## Syntax Convention
+## Macro Types
 
-| Action | Syntax | Example |
-|--------|--------|---------|
-| **Define** macro | Keyword only | `macro derive(...)` |
-| **Use** macro | Always `@` prefix | `@derive(Eq)`, `@comptime { }` |
+Metascript has two types of macros:
+
+### 1. Compiler Intrinsic Macros (`extern macro @name`)
+
+**Declaration:** `extern macro @name(params): ReturnType;`
+**Usage:** `@name(args)` - always with `@` prefix
+
+These are built into the compiler - no Metascript body exists.
+
+```typescript
+// Declaration (in std/macros/compiler.ms)
+extern macro @target(...platforms: string[]): void;
+extern macro @emit(code: string): void;
+extern macro @emit<T>(code: string): T;
+extern macro @comptime<T>(block: Function): T;
+extern macro @inline(): void;
+extern macro @sizeof<T>(): usize;
+extern macro @alignof<T>(): usize;
+```
+
+| Macro | Purpose | Example |
+|-------|---------|---------|
+| `@target` | Conditional compilation by backend | `@target("c") { ... }` |
+| `@emit` | Emit raw backend code | `@emit("printf(...)")` |
+| `@comptime` | Compile-time evaluation | `@comptime { ... }` |
+| `@inline` | Force inlining hint | `@inline` |
+| `@sizeof` | Get type size in bytes | `@sizeof<i32>()` |
+| `@alignof` | Get type alignment | `@alignof<i64>()` |
+
+### 2. User-Defined Macros (`macro function`)
+
+**Declaration:** `macro function name(params) { ... }`
+**Usage:** `name(args)` - called like normal functions (NO `@` prefix)
+
+```typescript
+// Declaration
+macro function deriveEq(target) {
+    const body = ast.createBlock([]);
+    const method = ast.createMethod("equals", body);
+    target.addMethod(method);
+    return target;
+}
+
+// Usage - like a normal function call
+deriveEq(User);
+```
+
+**Key Points:**
+- User macros are called like regular functions
+- Must be imported before use
+- Decorator syntax (`@macroName` before class) is a **future consideration** - to be discussed following Haxe's approach
 
 ---
 
-## Core Macros
+## Compiler Intrinsics
 
-### @derive - Trait Auto-Generation
+### @target - Conditional Compilation
 
 ```typescript
-@derive(Eq, Hash, Clone, Debug)
-class User {
-    name: string;
-    age: number;
+function printValue(msg: string): void {
+    @target("c") {
+        @emit("printf(\"%s\\n\", $msg);")
+    } else @target("js") {
+        console.log(msg);
+    } else @target("erlang") {
+        @emit("io:format(\"~s~n\", [$msg])")
+    }
 }
-
-// Generates:
-// equals(other: User): boolean
-// hashCode(): number
-// clone(): User
-// toString(): string
 ```
 
-**Supported Traits:**
+### @emit - Raw Backend Code
 
-| Trait | Generated Method |
-|-------|------------------|
-| Eq | `equals(other): boolean` |
-| Hash | `hashCode(): number` |
-| Clone | `clone(): T` |
-| Debug | `toString(): string` |
-| Serialize | `toJSON(): object` |
-| Deserialize | `static fromJSON(json): T` |
-| Builder | `static builder(): Builder<T>` |
-| Validate | `static validate(data): T` |
+```typescript
+@target("c") {
+    @emit("printf($format, $args)")
+}
+
+// With return value
+const now = @emit<number>("Date.now()");
+```
 
 ### @comptime - Compile-Time Execution
 
 ```typescript
 const version = @comptime {
     const gitHash = exec("git rev-parse --short HEAD");
-    const buildDate = new Date().toISOString();
-    return `${gitHash}-${buildDate}`;
+    return gitHash;
 };
-// → "a3f5d2c-2025-11-30T10:23:45.000Z" (embedded constant)
-
-const config = @comptime {
-    return {
-        apiUrl: readEnv("NODE_ENV") === "production"
-            ? "https://api.prod.com"
-            : "http://localhost:3000"
-    };
-};
-// Config embedded in binary - no runtime loading
+// Result embedded as constant in binary
 ```
 
-### @ffi - Foreign Function Interface
+---
+
+## User Macro Definition
+
+### Basic Syntax
 
 ```typescript
-const libc = @comptime bindC("./libc.h");
+// Define a macro - uses 'macro function' keyword
+macro function myMacro(a: string, b: number) {
+    // Compile-time code here
+    // Can use @target, @emit inside
+    @target("c") {
+        @emit("some_c_code($a, $b)")
+    }
+    return result;
+}
 
-const fd = libc.open("/tmp/test.txt", libc.O_RDWR);
-const buf = new Uint8Array(1024);
-libc.read(fd, buf, 1024);
-libc.close(fd);
+// Usage - called like a normal function
+myMacro("hello", 42);
 ```
 
----
-
-## Macro Architecture
-
-**Key Decision:** ALL macros are `.ms` source files - no built-in macros in compiler.
-
-```
-std/
-├── macros/
-│   ├── index.ms      # Re-exports
-│   ├── derive.ms     # @derive implementation
-│   ├── serialize.ms  # @serialize (TODO)
-│   └── ffi.ms        # @ffi (TODO)
-```
-
-**Why:**
-- **Dogfooding:** Macros written IN Metascript
-- **Versioning:** Updates ship with releases
-- **Transparency:** Users can read macro source
-- **Extensibility:** Same mechanism for all macros
-
----
-
-## Execution Flow
-
-```
-@derive(Eq) class User {}
-       │
-       ↓
-┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
-│ Find derive.ms   │ ─▶ │ Execute via      │ ─▶ │ Insert generated │
-│ in std/macros/   │    │ Hermes VM        │    │ AST into class   │
-└──────────────────┘    └──────────────────┘    └──────────────────┘
-```
-
----
-
-## Custom Macro Development
-
-### Defining a Macro
+### Standard Library Macros
 
 ```typescript
-// macros/my-macro.ms
-macro myMacro(ctx: MacroContext) {
-    for field in ctx.target.fields {
-        quote {
-            get${capitalize(field.name)}(): ${field.type} {
-                return this.${field.name};
-            }
-            set${capitalize(field.name)}(value: ${field.type}) {
-                this.${field.name} = value;
-            }
+// std/macros/derive.ms
+macro function deriveEq(target) {
+    console.log("deriveEq called for:", target.name);
+    const body = ast.createBlock([]);
+    const method = ast.createMethod("equals", body);
+    target.addMethod(method);
+    return target;
+}
+
+macro function deriveHash(target) {
+    const body = ast.createBlock([]);
+    const method = ast.createMethod("hash", body);
+    target.addMethod(method);
+    return target;
+}
+```
+
+### Using Standard Macros
+
+```typescript
+import { deriveEq, deriveHash } from "std/macros";
+
+// Call like normal functions
+deriveEq(User);
+deriveHash(User);
+
+class User {
+    name: string;
+    age: number;
+}
+```
+
+---
+
+## The `quote` Block (Future)
+
+For AST generation without manual `ast.createMethod()` calls:
+
+```typescript
+macro function addGetter(target, fieldName: string) {
+    quote {
+        get${capitalize(fieldName)}() {
+            return this.${fieldName};
         }
     }
 }
 ```
 
-### Using the Macro
-
-```typescript
-@myMacro
-class User {
-    name: string;
-    age: number;
-}
-// Auto-generates getName(), setName(), getAge(), setAge()
-```
-
-### The `quote` Block
-
 - Code inside `quote { }` becomes AST at compile-time
 - `${expr}` interpolates values into the quoted AST
-- No manual `ast.createMethod()` calls needed
 
 ---
 
-## Macro API
+## Macro Architecture
 
-```typescript
-interface MacroContext {
-    target: TargetInfo;      // The decorated class/function
-    args: any[];             // Arguments passed to @macro(...)
-}
+```
+std/macros/
+├── compiler.ms   # Compiler intrinsic declarations (extern macro @name)
+├── derive.ms     # User macros: deriveEq, deriveHash, etc.
+├── serialize.ms  # User macros: serialize/deserialize (TODO)
+└── ffi.ms        # User macros: FFI helpers (TODO)
+```
 
-interface TargetInfo {
-    name: string;
-    kind: "class" | "function" | "property";
-    fields: Field[];
-    methods: Method[];
-}
-
-// Compile-time I/O
-function readFile(path: string): string;
-function exec(command: string): string;
-function fetch(url: string): Response;
-function readEnv(key: string): string;
+**Execution Flow:**
+```
+deriveEq(User)
+      │
+      ↓
+┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
+│ Find deriveEq    │ ─▶ │ Execute via      │ ─▶ │ Return modified  │
+│ in std/macros/   │    │ Hermes VM        │    │ AST              │
+└──────────────────┘    └──────────────────┘    └──────────────────┘
 ```
 
 ---
 
-## Hygiene
+## Syntax Summary
 
-Macros are **hygienic** - no variable capture:
+| Type | Declaration | Usage |
+|------|-------------|-------|
+| Compiler intrinsic | `extern macro @name(params): Type;` | `@name(args)` |
+| User macro | `macro function name(params) { }` | `name(args)` |
 
-```typescript
-macro addHelper() {
-    let helper = 42;  // Local to macro expansion
-    quote {
-        // `helper` here is fresh, doesn't capture outer scope
-    }
-}
-```
+**Visual distinction:**
+- `@` prefix = compiler magic (always available, no import needed)
+- No `@` prefix = user abstraction (requires import, like normal functions)
 
 ---
 
-## Cross-Backend Compatibility
+## Future: Decorator Syntax
 
-Macros are **backend-agnostic** - they generate AST before backend selection:
+Decorator-style usage is under consideration for future versions:
 
 ```typescript
+// FUTURE - not yet implemented
 @derive(Eq, Hash)
-class User { name: string; }
-
-// C backend: struct + vtable + equals/hash functions
-// JS backend: ES2020 class with equals/hash methods
-// Erlang backend: record + module functions
+class User {
+    name: string;
+}
 ```
+
+This will follow Haxe's approach with 2-3 different macro invocation styles. Design discussion pending.
 
 ---
 
@@ -212,13 +233,11 @@ class User { name: string; }
 | Metric | Target |
 |--------|--------|
 | Expansion time | <10% of total build |
-| Generated code ratio | 5x acceptable |
 | Cache hit rate | >99% |
 
 ```bash
 # Profile macro overhead
 msc compile --profile user.ms
-# → Parsing: 5ms, Macro expansion: 15ms, Type checking: 20ms
 
 # View expanded code
 msc expand --macro=derive user.ms
@@ -226,88 +245,17 @@ msc expand --macro=derive user.ms
 
 ---
 
-## Best Practices
-
-**1. Keep Focused:**
-```typescript
-// Good
-@derive(Eq)
-
-// Avoid
-@derive(Eq, Hash, Clone, Serialize, Validate, Builder, Debug)
-```
-
-**2. Readable Generated Code:**
-```typescript
-// Good
-equals(other: User): boolean {
-    return this.id === other.id && this.name === other.name;
-}
-
-// Avoid
-equals(o: any): boolean {
-    return Object.keys(this).every(k => this[k] === o[k]);
-}
-```
-
-**3. Clear Error Messages:**
-```
-// Good
-Error: @derive(Eq) cannot handle field 'metadata' of type Map<string, any>.
-Suggestion: Implement equals() manually or use @derive(Eq, ignore: ["metadata"])
-
-// Avoid
-Error: Type 'Map' is not equatable
-```
-
----
-
-## Testing Strategy
-
-```zig
-test "macro expands @derive(Eq)" {
-    const source = "@derive(Eq) class Point { x: number; y: number; }";
-    const expanded = expandMacros(parse(source));
-
-    // Check equals method exists
-    const point = expanded.classes[0];
-    try testing.expect(point.hasMethod("equals"));
-
-    // Check method signature
-    const equals = point.getMethod("equals");
-    try testing.expectEqual(.boolean, equals.returnType.kind);
-}
-
-test "macro firewall: independent expansions" {
-    // Editing one macro shouldn't re-expand others
-    const db = TransAmDatabase.init();
-    db.setFileText("test.ms", "@derive(Eq) class A {}\n@derive(Hash) class B {}");
-
-    const v1 = db.macroExpand("A");
-    const v2 = db.macroExpand("B");
-
-    // Edit class A
-    db.setFileText("test.ms", "@derive(Eq) class A { x: number; }\n@derive(Hash) class B {}");
-
-    // B should still be cached
-    try testing.expect(db.isCacheHit("B"));
-}
-```
-
----
-
-## File Location
+## File Locations
 
 ```
 src/macro/
-  expander.zig        # Main expansion engine
-  builtin_macros.zig  # Temporary Zig fallback
+  vm_expander.zig     # Main expansion engine (Hermes VM)
+  source_registry.zig # Source macro registry
   cache.zig           # Expansion caching
 
 std/macros/
-  derive.ms           # @derive implementation
-  serialize.ms        # @serialize (TODO)
-  ffi.ms              # @ffi (TODO)
+  compiler.ms         # extern macro declarations
+  derive.ms           # deriveEq, deriveHash, etc.
 ```
 
 ---

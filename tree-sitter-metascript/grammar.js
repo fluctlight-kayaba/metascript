@@ -13,6 +13,8 @@ module.exports = grammar({
   conflicts: $ => [
     [$.block, $.object],
     [$.parameter, $._expression],
+    [$.function_body_statement, $._macro_body_statement],
+    [$.macro_emit_statement, $.macro_emit_expr],
   ],
 
   word: $ => $.identifier,
@@ -25,8 +27,13 @@ module.exports = grammar({
     // =========================================================================
 
     _statement: $ => choice(
+      $.import_statement,
+      $.export_statement,
       $.class_declaration,
+      $.interface_declaration,
       $.function_declaration,
+      $.macro_declaration,
+      $.extern_declaration,
       $.variable_declaration,
       $.type_alias_declaration,
       $.defer_statement,
@@ -36,6 +43,49 @@ module.exports = grammar({
       $.while_statement,
       $.expression_statement,
       $.block,
+    ),
+
+    // =========================================================================
+    // Imports / Exports
+    // =========================================================================
+
+    import_statement: $ => seq(
+      'import',
+      choice(
+        // import { foo, bar } from "module"
+        seq($.import_clause, 'from', $.string),
+        // import * as Utils from "module"
+        seq('*', 'as', $.identifier, 'from', $.string),
+        // import MyModule from "module"
+        seq($.identifier, 'from', $.string),
+      ),
+      optional(';'),
+    ),
+
+    import_clause: $ => seq(
+      '{',
+      commaSep1(choice(
+        $.identifier,
+        seq($.identifier, 'as', $.identifier),  // aliased import
+      )),
+      '}',
+    ),
+
+    export_statement: $ => choice(
+      // export { foo, bar } from "module" - re-export
+      seq('export', '{', commaSep1($.identifier), '}', 'from', $.string, optional(';')),
+      // export { foo, bar }
+      seq('export', '{', commaSep1($.identifier), '}', optional(';')),
+      // export default ...
+      seq('export', 'default', choice($.function_declaration, $.class_declaration, $._expression), optional(';')),
+      // export const/let/function/class/interface/macro
+      seq('export', choice(
+        $.variable_declaration,
+        $.function_declaration,
+        $.class_declaration,
+        $.interface_declaration,
+        $.macro_declaration,
+      )),
     ),
 
     // Metascript: defer statement
@@ -59,6 +109,35 @@ module.exports = grammar({
       '{',
       repeat(choice($.property_declaration, $.method_declaration)),
       '}',
+    ),
+
+    interface_declaration: $ => seq(
+      'interface',
+      field('name', $.identifier),
+      optional($.type_parameters),
+      optional(seq('extends', commaSep1($.type))),
+      field('body', $.interface_body),
+    ),
+
+    interface_body: $ => seq(
+      '{',
+      repeat(choice($.interface_property, $.interface_method)),
+      '}',
+    ),
+
+    interface_property: $ => seq(
+      field('name', $.identifier),
+      optional('?'),  // optional property
+      $.type_annotation,
+      ';',
+    ),
+
+    interface_method: $ => seq(
+      field('name', $.identifier),
+      optional('?'),  // optional method
+      $.parameters,
+      optional($.type_annotation),
+      ';',
     ),
 
     property_declaration: $ => seq(
@@ -85,7 +164,144 @@ module.exports = grammar({
       optional($.type_parameters),
       $.parameters,
       optional($.type_annotation),
-      field('body', $.block),
+      field('body', $.function_body),
+    ),
+
+    // Function body can contain @extern statements
+    function_body: $ => seq('{', repeat($.function_body_statement), '}'),
+
+    function_body_statement: $ => choice(
+      $.macro_extern_statement,
+      $.macro_target_block,
+      $.macro_emit_statement,
+      $._statement,
+    ),
+
+    // Metascript: macro declaration
+    // Syntax: macro function name(params) { ... }
+    // Usage: name(args) - called like normal function
+    macro_declaration: $ => seq(
+      'macro',
+      'function',
+      field('name', $.identifier),
+      optional($.type_parameters),
+      $.parameters,
+      optional($.type_annotation),
+      field('body', $.macro_body),
+    ),
+
+    // Metascript: extern declaration (FFI / compiler intrinsics)
+    // extern function printf(fmt: string): i32;
+    // extern class FILE;
+    // extern macro target(...): void;
+    // extern const BUILD_VERSION: string;
+    extern_declaration: $ => seq(
+      repeat($.macro_decorator),  // @native, @library, @include, @target
+      'extern',
+      choice(
+        $.extern_function,
+        $.extern_class,
+        $.extern_macro,
+        $.extern_const,
+      ),
+    ),
+
+    extern_function: $ => seq(
+      'function',
+      field('name', $.identifier),
+      optional($.type_parameters),
+      $.parameters,
+      optional($.type_annotation),
+      ';',
+    ),
+
+    extern_class: $ => seq(
+      'class',
+      field('name', $.identifier),
+      optional($.type_parameters),
+      optional(seq('extends', $.type)),
+      choice(
+        ';',  // Opaque: extern class FILE;
+        $.extern_class_body,  // With fields: extern class stat_t { ... }
+      ),
+    ),
+
+    extern_class_body: $ => seq(
+      '{',
+      repeat(choice(
+        $.interface_property,  // Reuse interface property syntax
+        $.interface_method,    // Reuse interface method syntax
+      )),
+      '}',
+    ),
+
+    extern_macro: $ => seq(
+      'macro',
+      field('name', $.macro_name),  // @target, @emit, etc.
+      optional($.type_parameters),
+      $.parameters,
+      optional($.type_annotation),
+      ';',
+    ),
+
+    // Macro name: @ followed by identifier (e.g., @target, @emit)
+    macro_name: $ => seq('@', $.identifier),
+
+    extern_const: $ => seq(
+      'const',
+      field('name', $.identifier),
+      $.type_annotation,
+      ';',
+    ),
+
+    // Macro body can contain @target blocks and @emit statements
+    macro_body: $ => seq('{', repeat($._macro_body_statement), '}'),
+
+    _macro_body_statement: $ => choice(
+      $.macro_target_block,
+      $.macro_emit_statement,
+      $._statement,
+    ),
+
+    // @target("c") { ... } else { ... } - conditional compilation with else
+    // @target("c", "js") { ... } - multiple targets
+    macro_target_block: $ => seq(
+      '@target',
+      '(',
+      commaSep1($.string),  // Support multiple targets: @target("c", "js")
+      ')',
+      $.macro_target_body,
+      optional($.macro_target_else),  // Optional else clause
+    ),
+
+    // else { ... } or else @target(...) { ... }
+    macro_target_else: $ => seq(
+      'else',
+      choice(
+        $.macro_target_block,  // Chained: else @target("js") { }
+        $.macro_target_body,   // Fallback: else { }
+      ),
+    ),
+
+    macro_target_body: $ => seq('{', repeat(choice($.macro_emit_statement, $._statement)), '}'),
+
+    // @emit("code") - raw backend code emission
+    macro_emit_statement: $ => seq(
+      '@emit',
+      optional($.type_parameters),  // @emit<boolean>("confirm($msg)")
+      '(',
+      $.string,
+      ')',
+      optional(';'),
+    ),
+
+    // @extern("name") - native function binding (in function body) - legacy
+    macro_extern_statement: $ => seq(
+      '@extern',
+      '(',
+      $.string,
+      ')',
+      ';',
     ),
 
     variable_declaration: $ => seq(
@@ -159,6 +375,7 @@ module.exports = grammar({
     parameters: $ => seq('(', optional(commaSep1($.parameter)), ')'),
 
     parameter: $ => seq(
+      optional('...'),  // Rest/variadic parameter
       field('name', $.identifier),
       optional($.type_annotation),
       optional(seq('=', $._expression)),
@@ -213,9 +430,19 @@ module.exports = grammar({
       $.arrow_function,
       $.parenthesized_expression,
       $.macro_comptime,
+      $.macro_emit_expr,
     ),
 
     macro_comptime: $ => seq('@comptime', $.block),
+
+    // @emit<T>("code") as expression (for use in return statements)
+    macro_emit_expr: $ => seq(
+      '@emit',
+      optional($.type_parameters),
+      '(',
+      $.string,
+      ')',
+    ),
 
     assignment_expression: $ => prec.right(1, seq(
       field('left', choice($.identifier, $.member_expression)),

@@ -12,6 +12,9 @@ pub const TokenKind = enum {
     template_string,  // `template ${x}`
     regex,            // /pattern/flags
 
+    // ===== Comments =====
+    doc_comment,      // /** JSDoc comment */
+
     // ===== Identifiers =====
     identifier,       // foo, myVar
 
@@ -104,6 +107,7 @@ pub const TokenKind = enum {
     // Metascript macro keywords (Nim-style)
     keyword_macro,    // macro definition: macro derive(ctx) { }
     keyword_quote,    // AST quotation: quote { ... }
+    keyword_extern,   // extern declaration: extern function, extern class
 
     // ===== Macro Tokens (Metascript extensions) =====
     // All macros are now user-defined in std/macros/*.ms
@@ -292,6 +296,7 @@ pub const Token = struct {
             .keyword_distinct,
             .keyword_macro,
             .keyword_quote,
+            .keyword_extern,
             => true,
             else => false,
         };
@@ -399,6 +404,7 @@ pub fn initKeywordMap(allocator: std.mem.Allocator) !KeywordMap {
     // Metascript macro keywords (Nim-style)
     try map.put("macro", .keyword_macro);
     try map.put("quote", .keyword_quote);
+    try map.put("extern", .keyword_extern);
 
     return map;
 }

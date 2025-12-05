@@ -173,6 +173,7 @@ pub const TypeChecker = struct {
                     var sym = symbol.Symbol.init(decl.name, .variable, node.location);
                     sym.mutable = is_mutable;
                     sym.type = decl.type; // May be null, will be inferred later in Phase 3
+                    sym.doc_comment = node.doc_comment; // Propagate JSDoc from AST
 
                     self.symbols.define(sym) catch {
                         try self.errors.append(.{
@@ -189,6 +190,7 @@ pub const TypeChecker = struct {
 
                 // Create function type from declaration (with type parameters)
                 sym.type = try self.createFunctionType(func.type_params, func.params, func.return_type, node.location);
+                sym.doc_comment = node.doc_comment; // Propagate JSDoc from AST
 
                 self.symbols.define(sym) catch {
                     try self.errors.append(.{
@@ -200,7 +202,8 @@ pub const TypeChecker = struct {
 
                 // Enter function scope for body
                 if (func.body) |body| {
-                    try self.symbols.enterScope(.function);
+                    // Use node location (full declaration) so parameters in signature are in scope
+                    try self.symbols.enterScopeWithLocation(.function, node.location);
                     defer self.symbols.exitScope();
 
                     // Register type parameters as type aliases in scope
@@ -236,6 +239,7 @@ pub const TypeChecker = struct {
 
                 // Create object type for the class (with name for debugging and is_cyclic for ORC)
                 sym.type = try self.createClassTypeNamed(class.name, class.members, node.location);
+                sym.doc_comment = node.doc_comment; // Propagate JSDoc from AST
 
                 self.symbols.define(sym) catch {
                     try self.errors.append(.{
@@ -245,8 +249,8 @@ pub const TypeChecker = struct {
                     });
                 };
 
-                // Enter class scope for members
-                try self.symbols.enterScope(.class);
+                // Enter class scope for members (use node location for class body boundaries)
+                try self.symbols.enterScopeWithLocation(.class, node.location);
                 defer self.symbols.exitScope();
 
                 // Set current class type for `this` binding in methods
@@ -260,7 +264,8 @@ pub const TypeChecker = struct {
             },
             .interface_decl => {
                 const iface = &node.data.interface_decl;
-                const sym = symbol.Symbol.init(iface.name, .interface, node.location);
+                var sym = symbol.Symbol.init(iface.name, .interface, node.location);
+                sym.doc_comment = node.doc_comment; // Propagate JSDoc from AST
 
                 self.symbols.define(sym) catch {
                     try self.errors.append(.{
@@ -272,7 +277,8 @@ pub const TypeChecker = struct {
             },
             .type_alias_decl => {
                 const alias = &node.data.type_alias_decl;
-                const sym = symbol.Symbol.init(alias.name, .type_alias, node.location);
+                var sym = symbol.Symbol.init(alias.name, .type_alias, node.location);
+                sym.doc_comment = node.doc_comment; // Propagate JSDoc from AST
 
                 self.symbols.define(sym) catch {
                     try self.errors.append(.{
@@ -282,23 +288,62 @@ pub const TypeChecker = struct {
                     });
                 };
             },
+            .macro_decl => {
+                // Register macro as a symbol so it can be invoked like a function
+                // Macros look like functions but expand at compile time
+                const macro = &node.data.macro_decl;
+                var sym = symbol.Symbol.init(macro.name, .macro, node.location);
+
+                // Create function-like type for the macro
+                sym.type = try self.createFunctionType(macro.type_params, macro.params, macro.return_type, node.location);
+                sym.decl_node = node; // Store the macro body for expansion
+                sym.doc_comment = node.doc_comment; // Propagate JSDoc from AST
+
+                self.symbols.define(sym) catch {
+                    try self.errors.append(.{
+                        .message = "duplicate macro definition",
+                        .location = node.location,
+                        .kind = .duplicate_definition,
+                    });
+                };
+
+                // Collect declarations in macro body (same as function/method)
+                // macro.body is always present (not optional like method.body)
+                {
+                    // Use node location (full declaration) so parameters in signature are in scope
+                    try self.symbols.enterScopeWithLocation(.function, node.location);
+                    defer self.symbols.exitScope();
+
+                    // Register macro parameters as symbols for hover/completion
+                    for (macro.params) |param| {
+                        var param_sym = symbol.Symbol.init(param.name, .parameter, node.location);
+                        param_sym.type = param.type;
+                        self.symbols.define(param_sym) catch {};
+                    }
+
+                    try self.collectDeclarations(macro.body);
+                }
+            },
             .property_decl => {
                 const prop = &node.data.property_decl;
                 var sym = symbol.Symbol.init(prop.name, .property, node.location);
                 sym.type = prop.type;
                 sym.mutable = !prop.readonly;
+                sym.doc_comment = node.doc_comment; // Propagate JSDoc from AST
 
                 self.symbols.define(sym) catch {};
             },
             .method_decl => {
                 const method = &node.data.method_decl;
-                const sym = symbol.Symbol.init(method.name, .method, node.location);
+                var sym = symbol.Symbol.init(method.name, .method, node.location);
+                sym.doc_comment = node.doc_comment; // Propagate JSDoc from AST
 
                 self.symbols.define(sym) catch {};
 
                 // Collect declarations in method body
                 if (method.body) |body| {
-                    try self.symbols.enterScope(.function);
+                    // Use node location (full declaration) so parameters in signature are in scope
+                    try self.symbols.enterScopeWithLocation(.function, node.location);
                     defer self.symbols.exitScope();
 
                     // Register `this` with the current class type
@@ -319,7 +364,7 @@ pub const TypeChecker = struct {
                 }
             },
             .block_stmt => {
-                try self.symbols.enterScope(.block);
+                try self.symbols.enterScopeWithLocation(.block, node.location);
                 defer self.symbols.exitScope();
 
                 for (node.data.block_stmt.statements) |stmt| {
@@ -333,12 +378,12 @@ pub const TypeChecker = struct {
                 }
             },
             .while_stmt => {
-                try self.symbols.enterScope(.loop);
+                try self.symbols.enterScopeWithLocation(.loop, node.location);
                 defer self.symbols.exitScope();
                 try self.collectDeclarations(node.data.while_stmt.body);
             },
             .for_stmt => {
-                try self.symbols.enterScope(.loop);
+                try self.symbols.enterScopeWithLocation(.loop, node.location);
                 defer self.symbols.exitScope();
 
                 if (node.data.for_stmt.init) |for_init| {
@@ -362,6 +407,43 @@ pub const TypeChecker = struct {
                 // 2. Load the module
                 // 3. Register imported symbols in current scope
                 // For now, we just skip processing (no error - imports may be resolved elsewhere)
+            },
+            // Expression statements may contain function expressions (named nested functions)
+            .expression_stmt => {
+                try self.collectDeclarations(node.data.expression_stmt);
+            },
+            // Function expressions (nested named functions like `function inner() {}`)
+            .function_expr => {
+                const func_expr = &node.data.function_expr;
+                const body = func_expr.body;
+
+                // For NAMED function expressions (like `function inner() {}`),
+                // register the function name in the CURRENT scope before entering the function scope.
+                // This allows the function to be called by name within the enclosing scope.
+                if (func_expr.name) |name| {
+                    var sym = symbol.Symbol.init(name, .function, node.location);
+                    // Create function type from expression
+                    sym.type = try self.createFunctionType(
+                        func_expr.type_params,
+                        func_expr.params,
+                        func_expr.return_type,
+                        node.location,
+                    );
+                    self.symbols.define(sym) catch {}; // Ignore duplicate errors
+                }
+
+                // Enter function scope with body boundaries for correct shadowing lookup
+                try self.symbols.enterScopeWithLocation(.function, body.location);
+                defer self.symbols.exitScope();
+
+                // Register parameters
+                for (func_expr.params) |param| {
+                    var param_sym = symbol.Symbol.init(param.name, .parameter, node.location);
+                    param_sym.type = param.type;
+                    self.symbols.define(param_sym) catch {};
+                }
+
+                try self.collectDeclarations(body);
             },
             // Other nodes don't introduce declarations
             else => {},
@@ -475,6 +557,9 @@ pub const TypeChecker = struct {
             },
             .while_stmt => {
                 try self.checkTypes(node.data.while_stmt.condition);
+                // Enter loop scope so break/continue can be validated
+                try self.symbols.enterScopeWithLocation(.loop, node.location);
+                defer self.symbols.exitScope();
                 try self.checkTypes(node.data.while_stmt.body);
                 // Check condition is boolean
                 if (node.data.while_stmt.condition.type) |cond_type| {
@@ -488,6 +573,9 @@ pub const TypeChecker = struct {
                 }
             },
             .for_stmt => {
+                // Enter loop scope so break/continue can be validated
+                try self.symbols.enterScopeWithLocation(.loop, node.location);
+                defer self.symbols.exitScope();
                 if (node.data.for_stmt.init) |for_init| try self.checkTypes(for_init);
                 if (node.data.for_stmt.condition) |cond| try self.checkTypes(cond);
                 if (node.data.for_stmt.update) |update| try self.checkTypes(update);
@@ -514,7 +602,7 @@ pub const TypeChecker = struct {
 
                 if (func.body) |body| {
                     // Enter function scope and set return type
-                    try self.symbols.enterScope(.function);
+                    try self.symbols.enterScopeWithLocation(.function, body.location);
                     defer self.symbols.exitScope();
 
                     // Register function parameters in scope
@@ -568,7 +656,7 @@ pub const TypeChecker = struct {
                 const method = &node.data.method_decl;
                 if (method.body) |body| {
                     // Enter function scope and set return type
-                    try self.symbols.enterScope(.function);
+                    try self.symbols.enterScopeWithLocation(.function, body.location);
                     defer self.symbols.exitScope();
 
                     // Register method parameters in scope
@@ -608,7 +696,7 @@ pub const TypeChecker = struct {
                 const body = func_expr.body;
 
                 // Enter function scope and set return type
-                try self.symbols.enterScope(.function);
+                try self.symbols.enterScopeWithLocation(.function, body.location);
                 defer self.symbols.exitScope();
 
                 // Register function expression parameters in scope
@@ -1206,6 +1294,102 @@ test "type checker: continue outside loop" {
     try std.testing.expect(!ok);
     try std.testing.expect(checker.hasErrors());
     try std.testing.expectEqual(TypeError.Kind.continue_outside_loop, checker.errors.items[0].kind);
+}
+
+test "type checker: break inside while loop is valid" {
+    var checker = try TypeChecker.init(std.testing.allocator);
+    defer checker.deinit();
+
+    // Create: while (true) { break; }
+    var bool_type = types.Type{
+        .kind = .boolean,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .boolean = {} },
+    };
+
+    var cond = ast.Node{
+        .kind = .boolean_literal,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .boolean_literal = true },
+        .type = &bool_type,
+    };
+
+    var break_node = ast.Node{
+        .kind = .break_stmt,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .break_stmt = {} },
+    };
+
+    var body_stmts = [_]*ast.Node{&break_node};
+    var body = ast.Node{
+        .kind = .block_stmt,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .block_stmt = .{ .statements = &body_stmts } },
+    };
+
+    var while_node = ast.Node{
+        .kind = .while_stmt,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .while_stmt = .{ .condition = &cond, .body = &body } },
+    };
+
+    var stmts = [_]*ast.Node{&while_node};
+    var program = ast.Node{
+        .kind = .program,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .program = .{
+            .statements = &stmts,
+            .file_id = 0,
+        } },
+    };
+
+    const ok = try checker.check(&program);
+    try std.testing.expect(ok);
+    try std.testing.expect(!checker.hasErrors());
+}
+
+test "type checker: continue inside for loop is valid" {
+    var checker = try TypeChecker.init(std.testing.allocator);
+    defer checker.deinit();
+
+    // Create: for (;;) { continue; }
+    var continue_node = ast.Node{
+        .kind = .continue_stmt,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .continue_stmt = {} },
+    };
+
+    var body_stmts = [_]*ast.Node{&continue_node};
+    var body = ast.Node{
+        .kind = .block_stmt,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .block_stmt = .{ .statements = &body_stmts } },
+    };
+
+    var for_node = ast.Node{
+        .kind = .for_stmt,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .for_stmt = .{
+            .init = null,
+            .condition = null,
+            .update = null,
+            .body = &body,
+        } },
+    };
+
+    var stmts = [_]*ast.Node{&for_node};
+    var program = ast.Node{
+        .kind = .program,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .program = .{
+            .statements = &stmts,
+            .file_id = 0,
+        } },
+    };
+
+    const ok = try checker.check(&program);
+    try std.testing.expect(ok);
+    try std.testing.expect(!checker.hasErrors());
 }
 
 test "type checker: empty program" {
@@ -5098,9 +5282,803 @@ test "type checker: named exports are tracked" {
     try std.testing.expect(helper_sym != null);
 }
 
+// ============================================================================
+// Scope Boundary Tests - Integration tests for lookupAtPosition with real AST
+// ============================================================================
+
+test "type checker: scope boundaries are set for nested functions" {
+    // This test verifies that enterScopeWithLocation is called correctly
+    // and scope boundaries are set for nested functions.
+    //
+    // Test code:
+    // function outer() {       // Line 1, scope ends at line 7
+    //     let x = 1;           // Line 2
+    //     function inner() {   // Line 3, scope ends at line 5
+    //         let x = 2;       // Line 4
+    //     }                    // Line 5
+    //     return x;            // Line 6 - should find outer's x, not inner's
+    // }                        // Line 7
+
+    var checker = try TypeChecker.init(std.testing.allocator);
+    defer checker.deinit();
+
+    // Create outer function body (lines 1-7)
+    // First: inner function
+    var inner_x = ast.Node{
+        .kind = .identifier,
+        .location = location.SourceLocation.init(1, .{ .line = 4, .column = 8 }, .{ .line = 4, .column = 9 }),
+        .data = .{ .identifier = "x" },
+    };
+    var inner_ret = ast.Node{
+        .kind = .return_stmt,
+        .location = location.SourceLocation.init(1, .{ .line = 4, .column = 0 }, .{ .line = 4, .column = 10 }),
+        .data = .{ .return_stmt = .{ .argument = &inner_x } },
+    };
+    var inner_decls = [_]ast.node.VariableStmt.VariableDeclarator{.{
+        .name = "x",
+        .type = null,
+        .init = null,
+    }};
+    var inner_let = ast.Node{
+        .kind = .variable_stmt,
+        .location = location.SourceLocation.init(1, .{ .line = 4, .column = 8 }, .{ .line = 4, .column = 17 }),
+        .data = .{ .variable_stmt = .{
+            .kind = .@"const",
+            .declarations = &inner_decls,
+        } },
+    };
+    var inner_body_stmts = [_]*ast.Node{ &inner_let, &inner_ret };
+    var inner_body = ast.Node{
+        .kind = .block_stmt,
+        // Inner function body spans lines 3-5
+        .location = location.SourceLocation.init(1, .{ .line = 3, .column = 20 }, .{ .line = 5, .column = 5 }),
+        .data = .{ .block_stmt = .{ .statements = &inner_body_stmts } },
+    };
+    var inner_func = ast.Node{
+        .kind = .function_decl,
+        .location = location.SourceLocation.init(1, .{ .line = 3, .column = 4 }, .{ .line = 5, .column = 5 }),
+        .data = .{ .function_decl = .{
+            .name = "inner",
+            .params = &[_]ast.node.FunctionExpr.FunctionParam{},
+            .return_type = null,
+            .body = &inner_body,
+            .type_params = &[_]types.GenericParam{},
+        } },
+    };
+
+    // Outer function elements
+    var outer_decls = [_]ast.node.VariableStmt.VariableDeclarator{.{
+        .name = "x",
+        .type = null,
+        .init = null,
+    }};
+    var outer_let = ast.Node{
+        .kind = .variable_stmt,
+        .location = location.SourceLocation.init(1, .{ .line = 2, .column = 4 }, .{ .line = 2, .column = 13 }),
+        .data = .{ .variable_stmt = .{
+            .kind = .@"const",
+            .declarations = &outer_decls,
+        } },
+    };
+    var outer_x = ast.Node{
+        .kind = .identifier,
+        .location = location.SourceLocation.init(1, .{ .line = 6, .column = 11 }, .{ .line = 6, .column = 12 }),
+        .data = .{ .identifier = "x" },
+    };
+    var outer_ret = ast.Node{
+        .kind = .return_stmt,
+        .location = location.SourceLocation.init(1, .{ .line = 6, .column = 4 }, .{ .line = 6, .column = 13 }),
+        .data = .{ .return_stmt = .{ .argument = &outer_x } },
+    };
+    var outer_body_stmts = [_]*ast.Node{ &outer_let, &inner_func, &outer_ret };
+    var outer_body = ast.Node{
+        .kind = .block_stmt,
+        // Outer function body spans lines 1-7
+        .location = location.SourceLocation.init(1, .{ .line = 1, .column = 17 }, .{ .line = 7, .column = 1 }),
+        .data = .{ .block_stmt = .{ .statements = &outer_body_stmts } },
+    };
+    var outer_func = ast.Node{
+        .kind = .function_decl,
+        .location = location.SourceLocation.init(1, .{ .line = 1, .column = 0 }, .{ .line = 7, .column = 1 }),
+        .data = .{ .function_decl = .{
+            .name = "outer",
+            .params = &[_]ast.node.FunctionExpr.FunctionParam{},
+            .return_type = null,
+            .body = &outer_body,
+            .type_params = &[_]types.GenericParam{},
+        } },
+    };
+
+    // Program with just outer function
+    var stmts = [_]*ast.Node{&outer_func};
+    var program = ast.Node{
+        .kind = .program,
+        .location = location.SourceLocation.init(1, .{ .line = 1, .column = 0 }, .{ .line = 7, .column = 1 }),
+        .data = .{ .program = .{ .statements = &stmts, .file_id = 1 } },
+    };
+
+    // Run type checker
+    _ = checker.check(&program) catch {};
+
+    // Verify scope boundaries were set
+    // We should have at least: global, outer function, inner function
+    try std.testing.expect(checker.symbols.scopes.items.len >= 3);
+
+    // Find the function scopes and verify they have boundaries
+    var outer_scope_found = false;
+    var inner_scope_found = false;
+
+    for (checker.symbols.scopes.items) |scope| {
+        if (scope.start_location) |loc| {
+            if (scope.kind == .function) {
+                if (loc.start.line == 1 and loc.end.line == 7) {
+                    outer_scope_found = true;
+                }
+                if (loc.start.line == 3 and loc.end.line == 5) {
+                    inner_scope_found = true;
+                }
+            }
+        }
+    }
+
+    try std.testing.expect(outer_scope_found);
+    try std.testing.expect(inner_scope_found);
+
+    // KEY TEST: lookupAtPosition at line 6 (inside outer, outside inner)
+    // should find outer's x (line 2), NOT inner's x (line 4)
+    const at_line_6 = checker.symbols.lookupAtPosition("x", 6, 15);
+    try std.testing.expect(at_line_6 != null);
+    try std.testing.expectEqual(@as(u32, 2), at_line_6.?.location.start.line);
+
+    // Verify: lookupAtPosition at line 4 (inside inner) should find inner's x
+    const at_line_4 = checker.symbols.lookupAtPosition("x", 4, 15);
+    try std.testing.expect(at_line_4 != null);
+    try std.testing.expectEqual(@as(u32, 4), at_line_4.?.location.start.line);
+}
+
 // Reference submodule tests to include them in test run
 test {
     std.testing.refAllDecls(symbol);
     std.testing.refAllDecls(resolver);
     std.testing.refAllDecls(inference);
+}
+
+test "type checker: calling nested function should work" {
+    // This tests the actual issue: calling inner() from within outer()
+    // function outer(): number {
+    //     function inner(): number { return 1; }
+    //     return inner();
+    // }
+    var checker = try TypeChecker.init(std.testing.allocator);
+    defer checker.deinit();
+
+    var num_type = types.Type{
+        .kind = .number,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .number = {} },
+    };
+
+    // Inner function: function inner(): number { return 1; }
+    var inner_ret_val = ast.Node{
+        .kind = .number_literal,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .number_literal = 1.0 },
+        .type = &num_type,
+    };
+
+    var inner_ret = ast.Node{
+        .kind = .return_stmt,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .return_stmt = .{ .argument = &inner_ret_val } },
+    };
+
+    var inner_stmts = [_]*ast.Node{&inner_ret};
+    var inner_body = ast.Node{
+        .kind = .block_stmt,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .block_stmt = .{ .statements = &inner_stmts } },
+    };
+
+    var inner_func = ast.Node{
+        .kind = .function_decl,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .function_decl = .{
+            .name = "inner",
+            .type_params = &[_]types.GenericParam{},
+            .params = &[_]ast.node.FunctionExpr.FunctionParam{},
+            .return_type = &num_type,
+            .body = &inner_body,
+        } },
+    };
+
+    // Call expression: inner()
+    var inner_id = ast.Node{
+        .kind = .identifier,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .identifier = "inner" },
+    };
+
+    var call_args = [_]*ast.Node{};
+    var type_args = [_]*types.Type{};
+    var inner_call = ast.Node{
+        .kind = .call_expr,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .call_expr = .{
+            .callee = &inner_id,
+            .arguments = &call_args,
+            .type_args = &type_args,
+        } },
+    };
+
+    // return inner()
+    var outer_ret = ast.Node{
+        .kind = .return_stmt,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .return_stmt = .{ .argument = &inner_call } },
+    };
+
+    // Outer function body: { function inner()...; return inner(); }
+    var outer_stmts = [_]*ast.Node{ &inner_func, &outer_ret };
+    var outer_body = ast.Node{
+        .kind = .block_stmt,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .block_stmt = .{ .statements = &outer_stmts } },
+    };
+
+    var outer_func = ast.Node{
+        .kind = .function_decl,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .function_decl = .{
+            .name = "outer",
+            .type_params = &[_]types.GenericParam{},
+            .params = &[_]ast.node.FunctionExpr.FunctionParam{},
+            .return_type = &num_type,
+            .body = &outer_body,
+        } },
+    };
+
+    var stmts = [_]*ast.Node{&outer_func};
+    var program = ast.Node{
+        .kind = .program,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .program = .{ .statements = &stmts, .file_id = 0 } },
+    };
+
+    const ok = try checker.check(&program);
+
+    // Debug: print scopes
+    std.debug.print("\n=== Scopes after check ===\n", .{});
+    for (checker.symbols.scopes.items, 0..) |scope, i| {
+        std.debug.print("Scope {d}: kind={s}\n", .{ i, @tagName(scope.kind) });
+        var it = scope.symbols.iterator();
+        while (it.next()) |entry| {
+            std.debug.print("  - {s}\n", .{entry.key_ptr.*});
+        }
+    }
+
+    // Debug: print errors
+    std.debug.print("\n=== Errors ===\n", .{});
+    for (checker.getErrors()) |err| {
+        std.debug.print("  {s}\n", .{err.message});
+    }
+
+    // Should have no errors - inner() should be found
+    try std.testing.expect(ok);
+}
+
+// ============================================================================
+// Macro LSP Tests - Mirror function/method tests for macro support
+// ============================================================================
+// These tests ensure macros behave identically to functions for LSP features:
+// - Macro symbol registration
+// - Macro parameter lookup (hover)
+// - Macro scope boundaries
+// - Macro JSDoc propagation
+
+test "type checker: macro symbol is registered with function type" {
+    // Mirrors "generic function type parameter in scope" test
+    // macro derive(ctx: AstContext): Node { return ctx.target; }
+    var checker = try TypeChecker.init(std.testing.allocator);
+    defer checker.deinit();
+
+    // Return: ctx.target (simplified to just ctx identifier)
+    var ctx_id = ast.Node{
+        .kind = .identifier,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .identifier = "ctx" },
+    };
+
+    var return_stmt = ast.Node{
+        .kind = .return_stmt,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .return_stmt = .{ .argument = &ctx_id } },
+    };
+
+    var body_stmts = [_]*ast.Node{&return_stmt};
+    var body = ast.Node{
+        .kind = .block_stmt,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .block_stmt = .{ .statements = &body_stmts } },
+    };
+
+    // Parameter: ctx: AstContext (using unknown type for simplicity)
+    var param_type = types.Type{
+        .kind = .unknown,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .unknown = {} },
+    };
+
+    var params = [_]ast.node.FunctionExpr.FunctionParam{
+        .{ .name = "ctx", .type = &param_type, .optional = false, .default_value = null },
+    };
+
+    var macro = ast.Node{
+        .kind = .macro_decl,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .macro_decl = .{
+            .name = "derive",
+            .type_params = &[_]types.GenericParam{},
+            .params = &params,
+            .return_type = &param_type,
+            .body = &body,
+        } },
+    };
+
+    var stmts = [_]*ast.Node{&macro};
+    var program = ast.Node{
+        .kind = .program,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .program = .{ .statements = &stmts, .file_id = 0 } },
+    };
+
+    const ok = try checker.check(&program);
+    try std.testing.expect(ok);
+
+    // KEY TEST: Macro should be registered as a symbol
+    const macro_sym = checker.symbols.lookup("derive");
+    try std.testing.expect(macro_sym != null);
+    try std.testing.expectEqual(symbol.SymbolKind.macro, macro_sym.?.kind);
+
+    // Macro should have a function type (macros are callable)
+    try std.testing.expect(macro_sym.?.type != null);
+    try std.testing.expectEqual(types.TypeKind.function, macro_sym.?.type.?.kind);
+
+    // Function type should have the parameter
+    const func_type = macro_sym.?.type.?.data.function;
+    try std.testing.expectEqual(@as(usize, 1), func_type.params.len);
+    try std.testing.expectEqualStrings("ctx", func_type.params[0].name);
+}
+
+test "type checker: macro parameter is in scope for hover lookup" {
+    // This is the KEY test that was failing before the fix
+    // macro transform(input: Node, output: Node): Node {
+    //     return input;  // <-- Shift+K on 'input' should show parameter info
+    // }
+    var checker = try TypeChecker.init(std.testing.allocator);
+    defer checker.deinit();
+
+    var param_type = types.Type{
+        .kind = .unknown,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .unknown = {} },
+    };
+
+    // Return statement references 'input' parameter
+    var input_id = ast.Node{
+        .kind = .identifier,
+        .location = location.SourceLocation.init(1, .{ .line = 3, .column = 11 }, .{ .line = 3, .column = 16 }),
+        .data = .{ .identifier = "input" },
+    };
+
+    var return_stmt = ast.Node{
+        .kind = .return_stmt,
+        .location = location.SourceLocation.init(1, .{ .line = 3, .column = 4 }, .{ .line = 3, .column = 17 }),
+        .data = .{ .return_stmt = .{ .argument = &input_id } },
+    };
+
+    var body_stmts = [_]*ast.Node{&return_stmt};
+    var body = ast.Node{
+        .kind = .block_stmt,
+        // Body spans lines 2-4
+        .location = location.SourceLocation.init(1, .{ .line = 2, .column = 40 }, .{ .line = 4, .column = 1 }),
+        .data = .{ .block_stmt = .{ .statements = &body_stmts } },
+    };
+
+    // Parameters with proper locations (in signature, before body)
+    var params = [_]ast.node.FunctionExpr.FunctionParam{
+        .{
+            .name = "input",
+            .type = &param_type,
+            .optional = false,
+            .default_value = null,
+        },
+        .{
+            .name = "output",
+            .type = &param_type,
+            .optional = false,
+            .default_value = null,
+        },
+    };
+
+    var macro = ast.Node{
+        .kind = .macro_decl,
+        // Full macro declaration spans lines 1-4 (includes signature with params)
+        .location = location.SourceLocation.init(1, .{ .line = 1, .column = 0 }, .{ .line = 4, .column = 1 }),
+        .data = .{ .macro_decl = .{
+            .name = "transform",
+            .type_params = &[_]types.GenericParam{},
+            .params = &params,
+            .return_type = &param_type,
+            .body = &body,
+        } },
+    };
+
+    var stmts = [_]*ast.Node{&macro};
+    var program = ast.Node{
+        .kind = .program,
+        .location = location.SourceLocation.init(1, .{ .line = 1, .column = 0 }, .{ .line = 4, .column = 1 }),
+        .data = .{ .program = .{ .statements = &stmts, .file_id = 1 } },
+    };
+
+    const ok = try checker.check(&program);
+    try std.testing.expect(ok);
+
+    // KEY TEST: lookupAtPosition should find 'input' parameter at line 3
+    // This is what the LSP hover uses
+    const input_at_line_3 = checker.symbols.lookupAtPosition("input", 3, 15);
+    try std.testing.expect(input_at_line_3 != null);
+    try std.testing.expectEqual(symbol.SymbolKind.parameter, input_at_line_3.?.kind);
+
+    // Also verify 'output' parameter is findable
+    const output_at_line_3 = checker.symbols.lookupAtPosition("output", 3, 15);
+    try std.testing.expect(output_at_line_3 != null);
+    try std.testing.expectEqual(symbol.SymbolKind.parameter, output_at_line_3.?.kind);
+
+    // Verify macro itself is also findable
+    const macro_sym = checker.symbols.lookupAtPosition("transform", 3, 15);
+    try std.testing.expect(macro_sym != null);
+    try std.testing.expectEqual(symbol.SymbolKind.macro, macro_sym.?.kind);
+}
+
+test "type checker: macro scope boundary respects parameter visibility" {
+    // Mirrors "scope boundaries are set for nested functions" test
+    // macro outer() {           // Line 1
+    //     let x = 1;            // Line 2
+    //     macro inner() {       // Line 3 - nested macro
+    //         let x = 2;        // Line 4
+    //     }                     // Line 5
+    //     return x;             // Line 6 - should find outer's x
+    // }                         // Line 7
+    var checker = try TypeChecker.init(std.testing.allocator);
+    defer checker.deinit();
+
+    var ret_type = types.Type{
+        .kind = .unknown,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .unknown = {} },
+    };
+
+    // Inner macro
+    var inner_x = ast.Node{
+        .kind = .identifier,
+        .location = location.SourceLocation.init(1, .{ .line = 4, .column = 8 }, .{ .line = 4, .column = 9 }),
+        .data = .{ .identifier = "x" },
+    };
+    var inner_ret = ast.Node{
+        .kind = .return_stmt,
+        .location = location.SourceLocation.init(1, .{ .line = 4, .column = 0 }, .{ .line = 4, .column = 10 }),
+        .data = .{ .return_stmt = .{ .argument = &inner_x } },
+    };
+    var inner_decls = [_]ast.node.VariableStmt.VariableDeclarator{.{
+        .name = "x",
+        .type = null,
+        .init = null,
+    }};
+    var inner_let = ast.Node{
+        .kind = .variable_stmt,
+        .location = location.SourceLocation.init(1, .{ .line = 4, .column = 8 }, .{ .line = 4, .column = 17 }),
+        .data = .{ .variable_stmt = .{
+            .kind = .@"const",
+            .declarations = &inner_decls,
+        } },
+    };
+    var inner_body_stmts = [_]*ast.Node{ &inner_let, &inner_ret };
+    var inner_body = ast.Node{
+        .kind = .block_stmt,
+        .location = location.SourceLocation.init(1, .{ .line = 3, .column = 20 }, .{ .line = 5, .column = 5 }),
+        .data = .{ .block_stmt = .{ .statements = &inner_body_stmts } },
+    };
+    var inner_macro = ast.Node{
+        .kind = .macro_decl,
+        .location = location.SourceLocation.init(1, .{ .line = 3, .column = 4 }, .{ .line = 5, .column = 5 }),
+        .data = .{ .macro_decl = .{
+            .name = "inner",
+            .params = &[_]ast.node.FunctionExpr.FunctionParam{},
+            .return_type = null,
+            .body = &inner_body,
+            .type_params = &[_]types.GenericParam{},
+        } },
+    };
+
+    // Outer macro
+    var outer_decls = [_]ast.node.VariableStmt.VariableDeclarator{.{
+        .name = "x",
+        .type = null,
+        .init = null,
+    }};
+    var outer_let = ast.Node{
+        .kind = .variable_stmt,
+        .location = location.SourceLocation.init(1, .{ .line = 2, .column = 4 }, .{ .line = 2, .column = 13 }),
+        .data = .{ .variable_stmt = .{
+            .kind = .@"const",
+            .declarations = &outer_decls,
+        } },
+    };
+    var outer_x = ast.Node{
+        .kind = .identifier,
+        .location = location.SourceLocation.init(1, .{ .line = 6, .column = 11 }, .{ .line = 6, .column = 12 }),
+        .data = .{ .identifier = "x" },
+    };
+    var outer_ret = ast.Node{
+        .kind = .return_stmt,
+        .location = location.SourceLocation.init(1, .{ .line = 6, .column = 4 }, .{ .line = 6, .column = 13 }),
+        .data = .{ .return_stmt = .{ .argument = &outer_x } },
+    };
+    var outer_body_stmts = [_]*ast.Node{ &outer_let, &inner_macro, &outer_ret };
+    var outer_body = ast.Node{
+        .kind = .block_stmt,
+        .location = location.SourceLocation.init(1, .{ .line = 1, .column = 17 }, .{ .line = 7, .column = 1 }),
+        .data = .{ .block_stmt = .{ .statements = &outer_body_stmts } },
+    };
+    var outer_macro = ast.Node{
+        .kind = .macro_decl,
+        .location = location.SourceLocation.init(1, .{ .line = 1, .column = 0 }, .{ .line = 7, .column = 1 }),
+        .data = .{ .macro_decl = .{
+            .name = "outer",
+            .params = &[_]ast.node.FunctionExpr.FunctionParam{},
+            .return_type = &ret_type,
+            .body = &outer_body,
+            .type_params = &[_]types.GenericParam{},
+        } },
+    };
+
+    var stmts = [_]*ast.Node{&outer_macro};
+    var program = ast.Node{
+        .kind = .program,
+        .location = location.SourceLocation.init(1, .{ .line = 1, .column = 0 }, .{ .line = 7, .column = 1 }),
+        .data = .{ .program = .{ .statements = &stmts, .file_id = 1 } },
+    };
+
+    _ = checker.check(&program) catch {};
+
+    // KEY TEST: lookupAtPosition at line 6 (inside outer, outside inner)
+    // should find outer's x (line 2), NOT inner's x (line 4)
+    const at_line_6 = checker.symbols.lookupAtPosition("x", 6, 15);
+    try std.testing.expect(at_line_6 != null);
+    try std.testing.expectEqual(@as(u32, 2), at_line_6.?.location.start.line);
+
+    // Verify: lookupAtPosition at line 4 (inside inner) should find inner's x
+    const at_line_4 = checker.symbols.lookupAtPosition("x", 4, 15);
+    try std.testing.expect(at_line_4 != null);
+    try std.testing.expectEqual(@as(u32, 4), at_line_4.?.location.start.line);
+}
+
+test "type checker: macro JSDoc is propagated to symbol" {
+    // Ensures macro JSDoc comments are available for LSP hover
+    // /** This is a derive macro */
+    // macro derive(ctx: AstContext): Node { ... }
+    var checker = try TypeChecker.init(std.testing.allocator);
+    defer checker.deinit();
+
+    var param_type = types.Type{
+        .kind = .unknown,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .unknown = {} },
+    };
+
+    var ctx_id = ast.Node{
+        .kind = .identifier,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .identifier = "ctx" },
+    };
+
+    var return_stmt = ast.Node{
+        .kind = .return_stmt,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .return_stmt = .{ .argument = &ctx_id } },
+    };
+
+    var body_stmts = [_]*ast.Node{&return_stmt};
+    var body = ast.Node{
+        .kind = .block_stmt,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .block_stmt = .{ .statements = &body_stmts } },
+    };
+
+    var params = [_]ast.node.FunctionExpr.FunctionParam{
+        .{ .name = "ctx", .type = &param_type, .optional = false, .default_value = null },
+    };
+
+    // Macro with JSDoc comment
+    var macro = ast.Node{
+        .kind = .macro_decl,
+        .location = location.SourceLocation.dummy(),
+        .doc_comment = "/** This is a derive macro for auto-generating implementations */",
+        .data = .{ .macro_decl = .{
+            .name = "derive",
+            .type_params = &[_]types.GenericParam{},
+            .params = &params,
+            .return_type = &param_type,
+            .body = &body,
+        } },
+    };
+
+    var stmts = [_]*ast.Node{&macro};
+    var program = ast.Node{
+        .kind = .program,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .program = .{ .statements = &stmts, .file_id = 0 } },
+    };
+
+    const ok = try checker.check(&program);
+    try std.testing.expect(ok);
+
+    // KEY TEST: Macro symbol should have JSDoc propagated
+    const macro_sym = checker.symbols.lookup("derive");
+    try std.testing.expect(macro_sym != null);
+    try std.testing.expect(macro_sym.?.doc_comment != null);
+    try std.testing.expect(std.mem.indexOf(u8, macro_sym.?.doc_comment.?, "derive macro") != null);
+}
+
+test "type checker: generic macro type parameter in scope" {
+    // Mirrors "generic function type parameter in scope" test
+    // macro transform<T>(input: T): T { return input; }
+    var checker = try TypeChecker.init(std.testing.allocator);
+    defer checker.deinit();
+
+    // Type parameter T
+    const type_param = types.GenericParam{
+        .name = "T",
+        .constraint = null,
+        .default = null,
+    };
+    var type_params = [_]types.GenericParam{type_param};
+
+    // Parameter input: T (type reference to T)
+    var t_ref_data = types.TypeReference{
+        .name = "T",
+        .type_args = &[_]*types.Type{},
+    };
+    var t_ref = types.Type{
+        .kind = .type_reference,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .type_reference = &t_ref_data },
+    };
+
+    // Return: input
+    var input_id = ast.Node{
+        .kind = .identifier,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .identifier = "input" },
+    };
+
+    var return_stmt = ast.Node{
+        .kind = .return_stmt,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .return_stmt = .{ .argument = &input_id } },
+    };
+
+    var body_stmts = [_]*ast.Node{&return_stmt};
+    var body = ast.Node{
+        .kind = .block_stmt,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .block_stmt = .{ .statements = &body_stmts } },
+    };
+
+    var params = [_]ast.node.FunctionExpr.FunctionParam{
+        .{ .name = "input", .type = &t_ref, .optional = false, .default_value = null },
+    };
+
+    var macro = ast.Node{
+        .kind = .macro_decl,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .macro_decl = .{
+            .name = "transform",
+            .type_params = &type_params,
+            .params = &params,
+            .return_type = &t_ref,
+            .body = &body,
+        } },
+    };
+
+    var stmts = [_]*ast.Node{&macro};
+    var program = ast.Node{
+        .kind = .program,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .program = .{ .statements = &stmts, .file_id = 0 } },
+    };
+
+    const ok = try checker.check(&program);
+    try std.testing.expect(ok);
+
+    // KEY TEST: Macro should have type params registered
+    const macro_sym = checker.symbols.lookup("transform");
+    try std.testing.expect(macro_sym != null);
+    try std.testing.expect(macro_sym.?.type != null);
+    try std.testing.expectEqual(types.TypeKind.function, macro_sym.?.type.?.kind);
+
+    // The macro's function type should have type_params
+    const func_type = macro_sym.?.type.?.data.function;
+    try std.testing.expectEqual(@as(usize, 1), func_type.type_params.len);
+    try std.testing.expectEqualStrings("T", func_type.type_params[0].name);
+
+    // Parameter should reference T
+    try std.testing.expectEqual(@as(usize, 1), func_type.params.len);
+    try std.testing.expectEqualStrings("input", func_type.params[0].name);
+}
+
+test "type checker: duplicate macro definition reports error" {
+    // Ensures duplicate macro names are caught
+    // macro foo() { }
+    // macro foo() { }  // ERROR: duplicate macro definition
+    var checker = try TypeChecker.init(std.testing.allocator);
+    defer checker.deinit();
+
+    var empty_body_stmts = [_]*ast.Node{};
+    var body1 = ast.Node{
+        .kind = .block_stmt,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .block_stmt = .{ .statements = &empty_body_stmts } },
+    };
+    var body2 = ast.Node{
+        .kind = .block_stmt,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .block_stmt = .{ .statements = &empty_body_stmts } },
+    };
+
+    var macro1 = ast.Node{
+        .kind = .macro_decl,
+        .location = location.SourceLocation.init(1, .{ .line = 1, .column = 0 }, .{ .line = 1, .column = 20 }),
+        .data = .{ .macro_decl = .{
+            .name = "foo",
+            .type_params = &[_]types.GenericParam{},
+            .params = &[_]ast.node.FunctionExpr.FunctionParam{},
+            .return_type = null,
+            .body = &body1,
+        } },
+    };
+
+    var macro2 = ast.Node{
+        .kind = .macro_decl,
+        .location = location.SourceLocation.init(1, .{ .line = 2, .column = 0 }, .{ .line = 2, .column = 20 }),
+        .data = .{ .macro_decl = .{
+            .name = "foo", // Same name - should error
+            .type_params = &[_]types.GenericParam{},
+            .params = &[_]ast.node.FunctionExpr.FunctionParam{},
+            .return_type = null,
+            .body = &body2,
+        } },
+    };
+
+    var stmts = [_]*ast.Node{ &macro1, &macro2 };
+    var program = ast.Node{
+        .kind = .program,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .program = .{ .statements = &stmts, .file_id = 0 } },
+    };
+
+    _ = checker.check(&program) catch {};
+
+    // KEY TEST: Should have duplicate definition error
+    const errors = checker.getErrors();
+    try std.testing.expect(errors.len > 0);
+
+    var found_duplicate_error = false;
+    for (errors) |err| {
+        if (std.mem.indexOf(u8, err.message, "duplicate") != null) {
+            found_duplicate_error = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_duplicate_error);
 }

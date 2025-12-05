@@ -43,6 +43,43 @@ pub const CGenerator = struct {
     /// Current line being generated (for DRC queries)
     current_line: u32,
 
+    // ========================================================================
+    // String Interning - Compile-time literal deduplication
+    // ========================================================================
+    /// Map of string literal -> intern ID for deduplication
+    string_literals: std.StringHashMap(u32),
+    /// Next available intern ID
+    next_intern_id: u32,
+    /// Enable string interning optimization (default: true)
+    enable_interning: bool,
+    /// Literals that are ONLY used in StringBuilder appends (can skip from pool)
+    stringbuilder_only_literals: std.StringHashMap(void),
+
+    // ========================================================================
+    // StringBuilder Optimization - Concat-in-loop detection
+    // ========================================================================
+    /// Variables that should use StringBuilder (detected via concat-in-loop pattern)
+    /// Scoped per-function - cleared at function entry
+    stringbuilder_vars: std.StringHashMap(void),
+    /// StringBuilder variables that have been "finalized" (built to msString*)
+    /// After finalization, identifier emission uses the plain name instead of ms_sb_build()
+    stringbuilder_finalized: std.StringHashMap(void),
+    /// Enable StringBuilder optimization (default: true)
+    enable_stringbuilder: bool,
+    /// Current function name (for scoping StringBuilder vars)
+    current_function: ?[]const u8,
+
+    // ========================================================================
+    // Nested Call Temporary Tracking - for f(g(x)) pattern
+    // ========================================================================
+    /// Counter for generating unique temporary names
+    nested_call_temp_counter: u32,
+    /// Pending temporaries that need decref after current statement
+    pending_temps: std.ArrayList([]const u8),
+    /// Map of hoisted call nodes to their temporary names
+    /// Used during expression emission to substitute temps for nested calls
+    hoisted_calls: std.AutoHashMap(*ast.Node, []const u8),
+
     const Self = @This();
 
     /// Initialize C generator with DRC analysis results (required)
@@ -53,10 +90,53 @@ pub const CGenerator = struct {
             .indent_level = 0,
             .drc = drc,
             .current_line = 0,
+            .string_literals = std.StringHashMap(u32).init(allocator),
+            .next_intern_id = 0,
+            .enable_interning = true,
+            .stringbuilder_only_literals = std.StringHashMap(void).init(allocator),
+            // StringBuilder optimization
+            .stringbuilder_vars = std.StringHashMap(void).init(allocator),
+            .stringbuilder_finalized = std.StringHashMap(void).init(allocator),
+            .enable_stringbuilder = true,
+            .current_function = null,
+            // Nested call temporaries
+            .nested_call_temp_counter = 0,
+            .pending_temps = std.ArrayList([]const u8).init(allocator),
+            .hoisted_calls = std.AutoHashMap(*ast.Node, []const u8).init(allocator),
         };
     }
 
     pub fn deinit(self: *Self) void {
+        // Free duplicated string keys from the intern pool
+        var key_iter = self.string_literals.keyIterator();
+        while (key_iter.next()) |key_ptr| {
+            self.allocator.free(key_ptr.*);
+        }
+        self.string_literals.deinit();
+        // Free StringBuilder-only literal keys
+        var sb_lit_iter = self.stringbuilder_only_literals.keyIterator();
+        while (sb_lit_iter.next()) |key_ptr| {
+            self.allocator.free(key_ptr.*);
+        }
+        self.stringbuilder_only_literals.deinit();
+        // Free StringBuilder candidate keys
+        var sb_key_iter = self.stringbuilder_vars.keyIterator();
+        while (sb_key_iter.next()) |key_ptr| {
+            self.allocator.free(key_ptr.*);
+        }
+        self.stringbuilder_vars.deinit();
+        // Free StringBuilder finalized keys
+        var sb_fin_iter = self.stringbuilder_finalized.keyIterator();
+        while (sb_fin_iter.next()) |key_ptr| {
+            self.allocator.free(key_ptr.*);
+        }
+        self.stringbuilder_finalized.deinit();
+        // Free nested call temporary names
+        for (self.pending_temps.items) |temp_name| {
+            self.allocator.free(temp_name);
+        }
+        self.pending_temps.deinit();
+        self.hoisted_calls.deinit();
         self.output.deinit();
     }
 
@@ -68,9 +148,19 @@ pub const CGenerator = struct {
     /// Call this before emitting the statement at `line` (for .before ops)
     /// or after emitting the statement (for .after ops)
     fn emitDrcOpsForLine(self: *Self, line: u32, position: RcOp.Position) !void {
+        try self.emitDrcOpsForLineFiltered(line, position, false);
+    }
+
+    /// Emit RC operations with optional scope_exit filter
+    /// When skip_scope_exit is true, scope cleanup ops are skipped (for per-statement emission)
+    fn emitDrcOpsForLineFiltered(self: *Self, line: u32, position: RcOp.Position, skip_scope_exit: bool) !void {
         const ops = self.drc.getOpsForLine(line);
         for (ops) |op| {
             if (op.position == position) {
+                // Skip scope_exit ops if requested (they'll be emitted at block end)
+                if (skip_scope_exit and op.reason == .scope_exit) {
+                    continue;
+                }
                 try self.emitRcOp(op);
             }
         }
@@ -86,6 +176,11 @@ pub const CGenerator = struct {
 
     /// Emit a single RC operation from DRC
     fn emitRcOp(self: *Self, op: RcOp) !void {
+        // Skip RC ops for StringBuilder variables - they manage their own memory
+        if (self.isStringBuilderVar(op.target)) {
+            return;
+        }
+
         switch (op.kind) {
             .init => {
                 // RC = 1 is handled by ms_alloc, no explicit op needed
@@ -169,9 +264,27 @@ pub const CGenerator = struct {
     pub fn generate(self: *Self, program: *ast.Node) ![]const u8 {
         std.debug.assert(program.kind == .program);
 
+        // Pass 1: Pre-scan for StringBuilder candidates (just to know if header is needed)
+        // Per-function detection happens in emitFunctionDecl, this is just for include decision
+        const uses_stringbuilder = if (self.enable_stringbuilder) self.hasStringBuilderCandidates(program) else false;
+
+        // Pass 2: Collect string literals for interning (if enabled)
+        // Also marks literals used only in StringBuilder contexts
+        if (self.enable_interning) {
+            try self.collectStringLiterals(program);
+            // Mark StringBuilder-only literals for exclusion from pool
+            if (uses_stringbuilder) {
+                try self.markStringBuilderOnlyLiterals(program);
+            }
+        }
+
         // Emit includes
-        try self.emitIncludes();
+        try self.emitIncludesWithStringBuilder(uses_stringbuilder);
         try self.emitNewline();
+
+        // Emit string literal pool (if interning enabled and has literals)
+        // Excludes literals that are only used in StringBuilder appends
+        try self.emitStringLiteralPool();
 
         // Check if user defined a main function
         var has_user_main = false;
@@ -182,6 +295,13 @@ pub const CGenerator = struct {
                     has_user_main = true;
                     break;
                 }
+            }
+        }
+
+        // Emit top-level variable declarations as globals
+        for (program.data.program.statements) |stmt| {
+            if (stmt.kind == .variable_stmt) {
+                try self.emitGlobalVariables(stmt);
             }
         }
 
@@ -218,8 +338,130 @@ pub const CGenerator = struct {
         return try self.output.toOwnedSlice();
     }
 
+    /// Pass 1: Collect all string literals for interning
+    fn collectStringLiterals(self: *Self, node: *ast.Node) !void {
+        switch (node.kind) {
+            .string_literal => {
+                _ = try self.registerStringLiteral(node.data.string_literal);
+            },
+            .program => {
+                for (node.data.program.statements) |stmt| {
+                    try self.collectStringLiterals(stmt);
+                }
+            },
+            .function_decl => {
+                const func = &node.data.function_decl;
+                if (func.body) |body| {
+                    try self.collectStringLiterals(body);
+                }
+            },
+            .class_decl => {
+                for (node.data.class_decl.members) |member| {
+                    try self.collectStringLiterals(member);
+                }
+            },
+            .block_stmt => {
+                for (node.data.block_stmt.statements) |stmt| {
+                    try self.collectStringLiterals(stmt);
+                }
+            },
+            .variable_stmt => {
+                const var_stmt = &node.data.variable_stmt;
+                for (var_stmt.declarations) |decl| {
+                    if (decl.init) |var_init| {
+                        try self.collectStringLiterals(var_init);
+                    }
+                }
+            },
+            .expression_stmt => {
+                try self.collectStringLiterals(node.data.expression_stmt);
+            },
+            .if_stmt => {
+                const if_stmt = &node.data.if_stmt;
+                try self.collectStringLiterals(if_stmt.condition);
+                try self.collectStringLiterals(if_stmt.consequent);
+                if (if_stmt.alternate) |else_br| {
+                    try self.collectStringLiterals(else_br);
+                }
+            },
+            .while_stmt => {
+                const while_stmt = &node.data.while_stmt;
+                try self.collectStringLiterals(while_stmt.condition);
+                try self.collectStringLiterals(while_stmt.body);
+            },
+            .for_stmt => {
+                const for_stmt = &node.data.for_stmt;
+                if (for_stmt.init) |for_init| try self.collectStringLiterals(for_init);
+                if (for_stmt.condition) |cond| try self.collectStringLiterals(cond);
+                if (for_stmt.update) |upd| try self.collectStringLiterals(upd);
+                try self.collectStringLiterals(for_stmt.body);
+            },
+            .return_stmt => {
+                if (node.data.return_stmt.argument) |arg| {
+                    try self.collectStringLiterals(arg);
+                }
+            },
+            .binary_expr => {
+                const binary = &node.data.binary_expr;
+                try self.collectStringLiterals(binary.left);
+                try self.collectStringLiterals(binary.right);
+            },
+            .unary_expr => {
+                try self.collectStringLiterals(node.data.unary_expr.argument);
+            },
+            .call_expr => {
+                const call = &node.data.call_expr;
+                try self.collectStringLiterals(call.callee);
+                for (call.arguments) |arg| {
+                    try self.collectStringLiterals(arg);
+                }
+            },
+            .member_expr => {
+                const member = &node.data.member_expr;
+                try self.collectStringLiterals(member.object);
+                // For computed access (obj[key]), the key could contain string literals
+                if (member.computed) {
+                    try self.collectStringLiterals(member.property);
+                }
+            },
+            .array_expr => {
+                for (node.data.array_expr.elements) |elem| {
+                    try self.collectStringLiterals(elem);
+                }
+            },
+            .object_expr => {
+                for (node.data.object_expr.properties) |prop| {
+                    switch (prop) {
+                        .property => |p| {
+                            try self.collectStringLiterals(p.key);
+                            try self.collectStringLiterals(p.value);
+                        },
+                        .spread => |s| try self.collectStringLiterals(s),
+                    }
+                }
+            },
+            .property_decl => {
+                const prop = &node.data.property_decl;
+                if (prop.init) |prop_init| {
+                    try self.collectStringLiterals(prop_init);
+                }
+            },
+            .method_decl => {
+                const method = &node.data.method_decl;
+                if (method.body) |body| {
+                    try self.collectStringLiterals(body);
+                }
+            },
+            // Terminals that don't contain string literals
+            .number_literal, .boolean_literal, .null_literal, .identifier,
+            .break_stmt, .continue_stmt, .interface_decl, .type_alias_decl => {},
+            // Other nodes - skip
+            else => {},
+        }
+    }
+
     /// Emit standard C includes
-    fn emitIncludes(self: *Self) !void {
+    fn emitIncludesWithStringBuilder(self: *Self, uses_stringbuilder: bool) !void {
         try self.emit("#include <stdio.h>\n");
         try self.emit("#include <stdint.h>\n");
         try self.emit("#include <stdbool.h>\n");
@@ -230,6 +472,462 @@ pub const CGenerator = struct {
         try self.emit("#define MS_ORC_IMPLEMENTATION\n");
         try self.emit("#include \"orc.h\"\n");
         try self.emit("#include \"ms_string.h\"\n");
+        if (self.enable_interning) {
+            try self.emit("#include \"ms_string_intern.h\"\n");
+        }
+        // Include StringBuilder header if any candidates detected
+        if (uses_stringbuilder) {
+            try self.emit("#include \"ms_string_builder.h\"\n");
+        }
+    }
+
+    /// Check if the program contains any StringBuilder candidates (concat-in-loop patterns)
+    /// This is a lightweight pre-scan used only to decide if StringBuilder header is needed
+    fn hasStringBuilderCandidates(self: *Self, node: *ast.Node) bool {
+        _ = self;
+        return hasStringBuilderCandidatesRecursive(node, false);
+    }
+
+    fn hasStringBuilderCandidatesRecursive(node: *ast.Node, in_loop: bool) bool {
+        switch (node.kind) {
+            .program => {
+                for (node.data.program.statements) |stmt| {
+                    if (hasStringBuilderCandidatesRecursive(stmt, false)) return true;
+                }
+            },
+            .function_decl => {
+                const func = &node.data.function_decl;
+                if (func.body) |body| {
+                    if (hasStringBuilderCandidatesRecursive(body, false)) return true;
+                }
+            },
+            .block_stmt => {
+                for (node.data.block_stmt.statements) |stmt| {
+                    if (hasStringBuilderCandidatesRecursive(stmt, in_loop)) return true;
+                }
+            },
+            .while_stmt => {
+                if (hasStringBuilderCandidatesRecursive(node.data.while_stmt.body, true)) return true;
+            },
+            .for_stmt => {
+                if (hasStringBuilderCandidatesRecursive(node.data.for_stmt.body, true)) return true;
+            },
+            .expression_stmt => {
+                if (hasStringBuilderCandidatesRecursive(node.data.expression_stmt, in_loop)) return true;
+            },
+            .binary_expr => {
+                const binary = &node.data.binary_expr;
+                // Check for concat-in-loop pattern: str = str + x
+                if (in_loop and binary.op == .assign) {
+                    if (binary.right.kind == .binary_expr) {
+                        const rhs = &binary.right.data.binary_expr;
+                        if (rhs.op == .add) {
+                            if (binary.left.kind == .identifier and rhs.left.kind == .identifier) {
+                                const lhs_name = binary.left.data.identifier;
+                                const rhs_left_name = rhs.left.data.identifier;
+                                if (std.mem.eql(u8, lhs_name, rhs_left_name)) {
+                                    const is_string = if (binary.left.type) |t| t.kind == .string else false;
+                                    if (is_string) return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+        return false;
+    }
+
+    /// Mark string literals that are ONLY used in StringBuilder concat patterns
+    /// These can be excluded from the interned string pool
+    fn markStringBuilderOnlyLiterals(self: *Self, node: *ast.Node) !void {
+        try self.markStringBuilderOnlyLiteralsRecursive(node, false);
+    }
+
+    fn markStringBuilderOnlyLiteralsRecursive(self: *Self, node: *ast.Node, in_loop: bool) !void {
+        switch (node.kind) {
+            .program => {
+                for (node.data.program.statements) |stmt| {
+                    try self.markStringBuilderOnlyLiteralsRecursive(stmt, false);
+                }
+            },
+            .function_decl => {
+                const func = &node.data.function_decl;
+                if (func.body) |body| {
+                    try self.markStringBuilderOnlyLiteralsRecursive(body, false);
+                }
+            },
+            .block_stmt => {
+                for (node.data.block_stmt.statements) |stmt| {
+                    try self.markStringBuilderOnlyLiteralsRecursive(stmt, in_loop);
+                }
+            },
+            .while_stmt => {
+                try self.markStringBuilderOnlyLiteralsRecursive(node.data.while_stmt.body, true);
+            },
+            .for_stmt => {
+                try self.markStringBuilderOnlyLiteralsRecursive(node.data.for_stmt.body, true);
+            },
+            .expression_stmt => {
+                try self.markStringBuilderOnlyLiteralsRecursive(node.data.expression_stmt, in_loop);
+            },
+            .variable_stmt => {
+                // Check for StringBuilder init pattern: let result: string = ""
+                const var_stmt = &node.data.variable_stmt;
+                for (var_stmt.declarations) |decl| {
+                    if (decl.init) |init_expr| {
+                        // Check if this is a string variable with empty string init
+                        // that will later be used in a concat-in-loop pattern
+                        if (init_expr.kind == .string_literal) {
+                            const is_string_type = if (decl.type) |t| t.kind == .string else false;
+                            if (is_string_type) {
+                                // Mark the init literal as StringBuilder-only
+                                // It will be used in ms_sb_init or ms_sb_append_cstr
+                                const literal = init_expr.data.string_literal;
+                                if (!self.stringbuilder_only_literals.contains(literal)) {
+                                    const key = try self.allocator.dupe(u8, literal);
+                                    try self.stringbuilder_only_literals.put(key, {});
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            .binary_expr => {
+                const binary = &node.data.binary_expr;
+                // Check for concat-in-loop pattern: str = str + "literal"
+                if (in_loop and binary.op == .assign) {
+                    if (binary.right.kind == .binary_expr) {
+                        const rhs = &binary.right.data.binary_expr;
+                        if (rhs.op == .add) {
+                            if (binary.left.kind == .identifier and rhs.left.kind == .identifier) {
+                                const lhs_name = binary.left.data.identifier;
+                                const rhs_left_name = rhs.left.data.identifier;
+                                if (std.mem.eql(u8, lhs_name, rhs_left_name)) {
+                                    const is_string = if (binary.left.type) |t| t.kind == .string else false;
+                                    if (is_string) {
+                                        // Mark the appended literal as StringBuilder-only
+                                        if (rhs.right.kind == .string_literal) {
+                                            const literal = rhs.right.data.string_literal;
+                                            if (!self.stringbuilder_only_literals.contains(literal)) {
+                                                const key = try self.allocator.dupe(u8, literal);
+                                                try self.stringbuilder_only_literals.put(key, {});
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    // ========================================================================
+    // String Interning Helpers
+    // ========================================================================
+
+    /// Register a string literal and return its intern ID
+    /// If already registered, returns existing ID (deduplication)
+    fn registerStringLiteral(self: *Self, literal: []const u8) !u32 {
+        if (self.string_literals.get(literal)) |id| {
+            return id;
+        }
+        const id = self.next_intern_id;
+        // Make a copy of the literal for the hash map
+        const key = try self.allocator.dupe(u8, literal);
+        try self.string_literals.put(key, id);
+        self.next_intern_id += 1;
+        return id;
+    }
+
+    /// Emit the string literal pool (static interned strings)
+    /// Call this after collecting all literals but before main code
+    fn emitStringLiteralPool(self: *Self) !void {
+        if (!self.enable_interning or self.string_literals.count() == 0) return;
+
+        // Collect entries and sort by ID for deterministic output
+        // Skip literals that are only used in StringBuilder contexts
+        var entries = std.ArrayList(struct { key: []const u8, id: u32 }).init(self.allocator);
+        defer entries.deinit();
+
+        var iter = self.string_literals.iterator();
+        while (iter.next()) |entry| {
+            // Skip StringBuilder-only literals - they're passed as raw C strings
+            if (self.stringbuilder_only_literals.contains(entry.key_ptr.*)) {
+                continue;
+            }
+            try entries.append(.{ .key = entry.key_ptr.*, .id = entry.value_ptr.* });
+        }
+
+        // If all literals are StringBuilder-only, skip the pool entirely
+        if (entries.items.len == 0) return;
+
+        try self.emit("\n// ========================================================================\n");
+        try self.emit("// String Literal Pool (compile-time interning)\n");
+        try self.emit("// ========================================================================\n\n");
+
+        // Sort by ID
+        std.mem.sort(@TypeOf(entries.items[0]), entries.items, {}, struct {
+            fn lessThan(_: void, a: @TypeOf(entries.items[0]), b: @TypeOf(entries.items[0])) bool {
+                return a.id < b.id;
+            }
+        }.lessThan);
+
+        // Emit static interned string declarations
+        for (entries.items) |entry| {
+            try self.emit("static msInternedString _str_");
+            var id_buf: [16]u8 = undefined;
+            const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{entry.id}) catch "0";
+            try self.emit(id_str);
+            try self.emit(" = MS_INTERN_INIT(\"");
+            try self.emitEscapedString(entry.key);
+            try self.emit("\", ");
+            var len_buf: [16]u8 = undefined;
+            const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{entry.key.len}) catch "0";
+            try self.emit(len_str);
+            try self.emit(");\n");
+        }
+        try self.emit("\n");
+    }
+
+    /// Emit a string with C escape sequences
+    fn emitEscapedString(self: *Self, s: []const u8) !void {
+        for (s) |c| {
+            switch (c) {
+                0 => try self.emit("\\0"),
+                '\n' => try self.emit("\\n"),
+                '\r' => try self.emit("\\r"),
+                '\t' => try self.emit("\\t"),
+                '\\' => try self.emit("\\\\"),
+                '"' => try self.emit("\\\""),
+                '\x07' => try self.emit("\\a"), // bell
+                '\x08' => try self.emit("\\b"), // backspace
+                '\x0C' => try self.emit("\\f"), // form feed
+                '\x0B' => try self.emit("\\v"), // vertical tab
+                else => {
+                    if (c >= 32 and c < 127) {
+                        try self.output.append(c);
+                    } else {
+                        // Emit as hex escape for non-printable chars
+                        var buf: [8]u8 = undefined;
+                        const escaped = std.fmt.bufPrint(&buf, "\\x{x:0>2}", .{c}) catch "\\x00";
+                        try self.emit(escaped);
+                    }
+                },
+            }
+        }
+    }
+
+    // ========================================================================
+    // StringBuilder Optimization - Concat-in-loop detection
+    // ========================================================================
+
+    /// Detect variables that are string-concatenated inside loops
+    /// Pattern: `str = str + x` or `str += x` where str is string type inside loop
+    /// Returns true if the node modifies a string variable via concatenation
+    fn detectStringBuilderCandidates(self: *Self, node: *ast.Node, in_loop: bool) !void {
+        switch (node.kind) {
+            .program => {
+                for (node.data.program.statements) |stmt| {
+                    try self.detectStringBuilderCandidates(stmt, false);
+                }
+            },
+            .function_decl => {
+                const func = &node.data.function_decl;
+                if (func.body) |body| {
+                    try self.detectStringBuilderCandidates(body, false);
+                }
+            },
+            .class_decl => {
+                for (node.data.class_decl.members) |member| {
+                    try self.detectStringBuilderCandidates(member, false);
+                }
+            },
+            .method_decl => {
+                const method = &node.data.method_decl;
+                if (method.body) |body| {
+                    try self.detectStringBuilderCandidates(body, false);
+                }
+            },
+            .block_stmt => {
+                for (node.data.block_stmt.statements) |stmt| {
+                    try self.detectStringBuilderCandidates(stmt, in_loop);
+                }
+            },
+            .if_stmt => {
+                const if_stmt = &node.data.if_stmt;
+                try self.detectStringBuilderCandidates(if_stmt.consequent, in_loop);
+                if (if_stmt.alternate) |else_br| {
+                    try self.detectStringBuilderCandidates(else_br, in_loop);
+                }
+            },
+            .while_stmt => {
+                const while_stmt = &node.data.while_stmt;
+                // Recursively scan body with in_loop=true
+                try self.detectStringBuilderCandidates(while_stmt.body, true);
+            },
+            .for_stmt => {
+                const for_stmt = &node.data.for_stmt;
+                // Recursively scan body with in_loop=true
+                try self.detectStringBuilderCandidates(for_stmt.body, true);
+            },
+            .expression_stmt => {
+                try self.detectStringBuilderCandidates(node.data.expression_stmt, in_loop);
+            },
+            .binary_expr => {
+                const binary = &node.data.binary_expr;
+                // Check for concat-in-loop pattern: str = str + x
+                if (in_loop and binary.op == .assign) {
+                    // Check if RHS is a string concatenation
+                    if (binary.right.kind == .binary_expr) {
+                        const rhs = &binary.right.data.binary_expr;
+                        if (rhs.op == .add) {
+                            // Check if LHS and RHS.left refer to the same variable
+                            if (binary.left.kind == .identifier and rhs.left.kind == .identifier) {
+                                const lhs_name = binary.left.data.identifier;
+                                const rhs_left_name = rhs.left.data.identifier;
+                                if (std.mem.eql(u8, lhs_name, rhs_left_name)) {
+                                    // Check if it's a string type
+                                    const is_string = if (binary.left.type) |t| t.kind == .string else false;
+                                    if (is_string) {
+                                        // Register as StringBuilder candidate
+                                        if (!self.stringbuilder_vars.contains(lhs_name)) {
+                                            const key = try self.allocator.dupe(u8, lhs_name);
+                                            try self.stringbuilder_vars.put(key, {});
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    /// Check if a variable is a StringBuilder candidate
+    fn isStringBuilderVar(self: *Self, name: []const u8) bool {
+        return self.enable_stringbuilder and self.stringbuilder_vars.contains(name);
+    }
+
+    /// Emit StringBuilder variable declaration
+    /// Transforms: let result: string = "";
+    /// Into: msStringBuilder _sb_result; ms_sb_init_default(&_sb_result);
+    fn emitStringBuilderDecl(self: *Self, decl: node_mod.VariableStmt.VariableDeclarator) !void {
+        // Emit StringBuilder declaration
+        try self.emit("msStringBuilder _sb_");
+        try self.emit(decl.name);
+        try self.emit(";\n");
+
+        // Initialize StringBuilder
+        try self.emitIndent();
+        try self.emit("ms_sb_init_default(&_sb_");
+        try self.emit(decl.name);
+        try self.emit(");\n");
+
+        // If there's an initial value, append it
+        if (decl.init) |init_expr| {
+            // Only append if not empty string
+            if (init_expr.kind != .string_literal or init_expr.data.string_literal.len > 0) {
+                try self.emitIndent();
+                try self.emitStringBuilderAppend(decl.name, init_expr);
+            }
+        }
+    }
+
+    /// Emit ms_sb_append_* call for a value
+    fn emitStringBuilderAppend(self: *Self, var_name: []const u8, value: *ast.Node) !void {
+        // Determine the type and use appropriate append function
+        const value_type = value.type;
+
+        if (value.kind == .string_literal) {
+            // String literal - use ms_sb_append_cstr
+            try self.emit("ms_sb_append_cstr(&_sb_");
+            try self.emit(var_name);
+            try self.emit(", \"");
+            try self.emitEscapedString(value.data.string_literal);
+            try self.emit("\");\n");
+        } else if (value_type) |typ| {
+            if (typ.kind == .string) {
+                // msString* - use ms_sb_append_string
+                try self.emit("ms_sb_append_string(&_sb_");
+                try self.emit(var_name);
+                try self.emit(", ");
+                try self.emitExpression(value);
+                try self.emit(");\n");
+            } else if (typ.kind == .number or typ.kind == .float64 or typ.kind == .float32) {
+                // double - use ms_sb_append_double
+                try self.emit("ms_sb_append_double(&_sb_");
+                try self.emit(var_name);
+                try self.emit(", ");
+                try self.emitExpression(value);
+                try self.emit(");\n");
+            } else if (typ.kind == .int32 or typ.kind == .int64) {
+                // int - use ms_sb_append_int
+                try self.emit("ms_sb_append_int(&_sb_");
+                try self.emit(var_name);
+                try self.emit(", ");
+                try self.emitExpression(value);
+                try self.emit(");\n");
+            } else if (typ.kind == .boolean) {
+                // bool - use ms_sb_append_bool
+                try self.emit("ms_sb_append_bool(&_sb_");
+                try self.emit(var_name);
+                try self.emit(", ");
+                try self.emitExpression(value);
+                try self.emit(");\n");
+            } else {
+                // Fallback: convert to string with ms_sb_append_string
+                try self.emit("ms_sb_append_string(&_sb_");
+                try self.emit(var_name);
+                try self.emit(", ");
+                try self.emitExpression(value);
+                try self.emit(");\n");
+            }
+        } else {
+            // Unknown type - use generic string append
+            try self.emit("ms_sb_append_string(&_sb_");
+            try self.emit(var_name);
+            try self.emit(", ");
+            try self.emitExpression(value);
+            try self.emit(");\n");
+        }
+    }
+
+    /// Emit StringBuilder concat assignment: result = result + x -> ms_sb_append_*(...)
+    fn emitStringBuilderConcat(self: *Self, var_name: []const u8, rhs_value: *ast.Node) !void {
+        // Emit the append operation
+        try self.emitStringBuilderAppend(var_name, rhs_value);
+    }
+
+    /// Check if a binary expression is a StringBuilder concat pattern
+    /// Pattern: str = str + value (where str is a StringBuilder var)
+    fn isStringBuilderConcatExpr(self: *Self, node: *ast.Node) ?struct { var_name: []const u8, append_value: *ast.Node } {
+        if (node.kind != .binary_expr) return null;
+
+        const binary = &node.data.binary_expr;
+        if (binary.op != .assign) return null;
+
+        // LHS must be identifier that's a StringBuilder var
+        if (binary.left.kind != .identifier) return null;
+        const lhs_name = binary.left.data.identifier;
+        if (!self.isStringBuilderVar(lhs_name)) return null;
+
+        // RHS must be binary add with LHS as first operand
+        if (binary.right.kind != .binary_expr) return null;
+        const rhs_binary = &binary.right.data.binary_expr;
+        if (rhs_binary.op != .add) return null;
+
+        // RHS.left must be same identifier
+        if (rhs_binary.left.kind != .identifier) return null;
+        if (!std.mem.eql(u8, rhs_binary.left.data.identifier, lhs_name)) return null;
+
+        return .{ .var_name = lhs_name, .append_value = rhs_binary.right };
     }
 
     /// Main dispatch for node emission
@@ -325,6 +1023,91 @@ pub const CGenerator = struct {
             // Primitives - no tracing needed
             else => false,
         };
+    }
+
+    // ========================================================================
+    // Nested Call Temporary Handling - for f(g(x)) pattern
+    // ========================================================================
+
+    /// Check if a call expression returns an RC type that needs cleanup
+    fn callReturnsRcType(node: *ast.Node) bool {
+        if (node.kind != .call_expr) return false;
+        return isOrcReferenceType(node.type);
+    }
+
+    /// Collect nested call expressions from an expression that need to be hoisted
+    /// These are call expressions used as arguments to other calls that return RC types
+    fn collectNestedRcCalls(self: *Self, node: *ast.Node, calls: *std.ArrayList(*ast.Node)) !void {
+        switch (node.kind) {
+            .call_expr => {
+                const call = &node.data.call_expr;
+                // Check arguments for nested calls that return RC types
+                for (call.arguments) |arg| {
+                    if (arg.kind == .call_expr and callReturnsRcType(arg)) {
+                        // This is a nested call returning RC type - needs hoisting
+                        try calls.append(arg);
+                    }
+                    // Recursively check for deeper nesting
+                    try self.collectNestedRcCalls(arg, calls);
+                }
+            },
+            .binary_expr => {
+                const bin = &node.data.binary_expr;
+                try self.collectNestedRcCalls(bin.left, calls);
+                try self.collectNestedRcCalls(bin.right, calls);
+            },
+            .unary_expr => {
+                try self.collectNestedRcCalls(node.data.unary_expr.argument, calls);
+            },
+            .member_expr => {
+                try self.collectNestedRcCalls(node.data.member_expr.object, calls);
+            },
+            else => {},
+        }
+    }
+
+    /// Hoist nested RC-returning calls into temporaries before the statement
+    /// Populates self.hoisted_calls map for use during expression emission
+    /// Note: Caller (block) already emitted indent for first item, so we skip first indent
+    fn hoistNestedCalls(self: *Self, calls: []const *ast.Node) !void {
+        for (calls, 0..) |call_node, i| {
+            // Generate unique temporary name
+            const temp_name = try std.fmt.allocPrint(self.allocator, "_nested_tmp_{d}", .{self.nested_call_temp_counter});
+            self.nested_call_temp_counter += 1;
+
+            // Emit temporary declaration and initialization
+            // Skip indent for first item (block already emitted it)
+            if (i > 0) {
+                try self.emitIndent();
+            }
+            try self.emitType(call_node.type);
+            try self.emit(" ");
+            try self.emit(temp_name);
+            try self.emit(" = ");
+            // Recursively emit the call - nested calls within this one
+            // will already be in hoisted_calls from earlier iterations
+            try self.emitExpression(call_node);
+            try self.emit(";\n");
+
+            // Track for cleanup after statement (use original, will be freed in cleanup)
+            try self.pending_temps.append(temp_name);
+
+            // Add to map so emitExpression will use temp name
+            try self.hoisted_calls.put(call_node, temp_name);
+        }
+    }
+
+    /// Emit cleanup for pending temporaries after a statement
+    fn emitTempCleanup(self: *Self) !void {
+        for (self.pending_temps.items) |temp_name| {
+            try self.emitIndent();
+            try self.emit("ms_decref(");
+            try self.emit(temp_name);
+            try self.emit(");\n");
+            self.allocator.free(temp_name);
+        }
+        self.pending_temps.clearRetainingCapacity();
+        self.hoisted_calls.clearRetainingCapacity();
     }
 
     /// Emit ORC support (trace function + TypeInfo) for a class
@@ -538,6 +1321,17 @@ pub const CGenerator = struct {
     fn emitFunctionDecl(self: *Self, node: *ast.Node) !void {
         const func = &node.data.function_decl;
 
+        // Clear StringBuilder candidates from previous function (per-function scoping)
+        try self.clearStringBuilderVars();
+        self.current_function = func.name;
+
+        // Detect StringBuilder candidates for THIS function only
+        if (self.enable_stringbuilder) {
+            if (func.body) |body| {
+                try self.detectStringBuilderCandidates(body, false);
+            }
+        }
+
         // Special case: main always returns int in C
         const is_main = std.mem.eql(u8, func.name, "main");
 
@@ -576,7 +1370,7 @@ pub const CGenerator = struct {
         if (func.body) |body| {
             try self.emit(" ");
             if (body.kind == .block_stmt) {
-                try self.emitBlockStmt(body);
+                try self.emitFunctionBlockStmt(body);
             } else {
                 // Single expression body - wrap in block with return
                 try self.emit("{\n");
@@ -585,6 +1379,8 @@ pub const CGenerator = struct {
                 try self.emit("return ");
                 try self.emitExpression(body);
                 try self.emit(";\n");
+                // StringBuilder cleanup before function exit
+                try self.emitStringBuilderCleanup();
                 self.indent_level -= 1;
                 try self.emit("}\n");
             }
@@ -594,11 +1390,333 @@ pub const CGenerator = struct {
         }
     }
 
+    /// Emit finalization and cleanup for all StringBuilder variables
+    /// 1. Build each StringBuilder into a final msString* variable
+    /// 2. Free the StringBuilder buffer
+    /// 3. Decref the built string (ORC managed)
+    fn emitStringBuilderCleanup(self: *Self) !void {
+        if (self.stringbuilder_vars.count() == 0) return;
+
+        // Step 1: Finalize StringBuilders that haven't been finalized yet
+        // This happens when a StringBuilder is never accessed before function exit
+        var iter = self.stringbuilder_vars.keyIterator();
+        while (iter.next()) |key_ptr| {
+            const name = key_ptr.*;
+            if (!self.stringbuilder_finalized.contains(name)) {
+                // Emit: msString* varname = ms_sb_build(&_sb_varname);
+                try self.emitIndent();
+                try self.emit("msString* ");
+                try self.emit(name);
+                try self.emit(" = ms_sb_build(&_sb_");
+                try self.emit(name);
+                try self.emit(");\n");
+                // Mark as finalized
+                const key = try self.allocator.dupe(u8, name);
+                try self.stringbuilder_finalized.put(key, {});
+            }
+        }
+
+        // Step 2: Free StringBuilder buffers
+        iter = self.stringbuilder_vars.keyIterator();
+        while (iter.next()) |key_ptr| {
+            try self.emitIndent();
+            try self.emit("ms_sb_free(&_sb_");
+            try self.emit(key_ptr.*);
+            try self.emit(");\n");
+        }
+
+        // Step 3: Decref the built strings (ORC cleanup)
+        iter = self.stringbuilder_vars.keyIterator();
+        while (iter.next()) |key_ptr| {
+            try self.emitIndent();
+            try self.emit("ms_decref(");
+            try self.emit(key_ptr.*);
+            try self.emit(");\n");
+        }
+    }
+
+    /// Clear StringBuilder variables (called at function entry for per-function scoping)
+    fn clearStringBuilderVars(self: *Self) !void {
+        // Free all keys from stringbuilder_vars
+        var key_iter = self.stringbuilder_vars.keyIterator();
+        while (key_iter.next()) |key_ptr| {
+            self.allocator.free(key_ptr.*);
+        }
+        self.stringbuilder_vars.clearRetainingCapacity();
+        // Free all keys from stringbuilder_finalized
+        var fin_iter = self.stringbuilder_finalized.keyIterator();
+        while (fin_iter.next()) |key_ptr| {
+            self.allocator.free(key_ptr.*);
+        }
+        self.stringbuilder_finalized.clearRetainingCapacity();
+    }
+
+    /// Finalize any StringBuilder variables used in an expression BEFORE emitting the expression
+    /// This ensures the msString* is created once and properly tracked for cleanup
+    /// Returns true if any finalization was emitted (caller may need to re-emit indent)
+    fn finalizeStringBuildersInExprCheck(self: *Self, node: *ast.Node) !bool {
+        var finalized_any = false;
+        switch (node.kind) {
+            .identifier => {
+                const name = node.data.identifier;
+                // If this is a StringBuilder var and not yet finalized, finalize it now
+                if (self.isStringBuilderVar(name) and !self.stringbuilder_finalized.contains(name)) {
+                    // Emit: msString* varname = ms_sb_build(&_sb_varname);
+                    try self.emitIndent();
+                    try self.emit("msString* ");
+                    try self.emit(name);
+                    try self.emit(" = ms_sb_build(&_sb_");
+                    try self.emit(name);
+                    try self.emit(");\n");
+                    // Mark as finalized
+                    const key = try self.allocator.dupe(u8, name);
+                    try self.stringbuilder_finalized.put(key, {});
+                    finalized_any = true;
+                }
+            },
+            .binary_expr => {
+                const binary = &node.data.binary_expr;
+                // Skip LHS of assignment - it's the target, not a usage
+                if (binary.op != .assign) {
+                    if (try self.finalizeStringBuildersInExprCheck(binary.left)) {
+                        finalized_any = true;
+                    }
+                }
+                if (try self.finalizeStringBuildersInExprCheck(binary.right)) {
+                    finalized_any = true;
+                }
+            },
+            .call_expr => {
+                const call = &node.data.call_expr;
+                if (try self.finalizeStringBuildersInExprCheck(call.callee)) {
+                    finalized_any = true;
+                }
+                for (call.arguments) |arg| {
+                    if (try self.finalizeStringBuildersInExprCheck(arg)) {
+                        finalized_any = true;
+                    }
+                }
+            },
+            .member_expr => {
+                const member = &node.data.member_expr;
+                if (try self.finalizeStringBuildersInExprCheck(member.object)) {
+                    finalized_any = true;
+                }
+            },
+            .unary_expr => {
+                if (try self.finalizeStringBuildersInExprCheck(node.data.unary_expr.argument)) {
+                    finalized_any = true;
+                }
+            },
+            .conditional_expr => {
+                const cond = &node.data.conditional_expr;
+                if (try self.finalizeStringBuildersInExprCheck(cond.condition)) {
+                    finalized_any = true;
+                }
+                if (try self.finalizeStringBuildersInExprCheck(cond.consequent)) {
+                    finalized_any = true;
+                }
+                if (try self.finalizeStringBuildersInExprCheck(cond.alternate)) {
+                    finalized_any = true;
+                }
+            },
+            else => {},
+        }
+        return finalized_any;
+    }
+
+    /// Check if a statement uses any StringBuilder vars and finalize them if needed
+    /// Called from block emission BEFORE emitting the statement's indent
+    /// Returns true if any finalization occurred (caller should skip indent since we already emitted it)
+    fn checkAndFinalizeStringBuildersForStmt(self: *Self, stmt: *ast.Node) !bool {
+        // Only check expression statements and return statements
+        switch (stmt.kind) {
+            .expression_stmt => {
+                const expr = stmt.data.expression_stmt;
+                // Skip StringBuilder concat assignments (result = result + x)
+                if (self.isStringBuilderConcatExpr(expr) != null) {
+                    return false;
+                }
+                // Check if expression uses any StringBuilder vars
+                const finalized = try self.finalizeStringBuildersInExprCheck(expr);
+                if (finalized) {
+                    // Re-emit indent for the actual statement
+                    try self.emitIndent();
+                }
+                return finalized;
+            },
+            .return_stmt => {
+                const ret = &stmt.data.return_stmt;
+                if (ret.argument) |arg| {
+                    const finalized = try self.finalizeStringBuildersInExprCheck(arg);
+                    if (finalized) {
+                        // Re-emit indent for the return statement
+                        try self.emitIndent();
+                    }
+                    return finalized;
+                }
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    /// Emit function body block statement (with StringBuilder cleanup before exit)
+    fn emitFunctionBlockStmt(self: *Self, node: *ast.Node) !void {
+        const block = &node.data.block_stmt;
+        const block_start_line = node.location.start.line;
+
+        try self.emit("{\n");
+        self.indent_level += 1;
+
+        // Emit statements in the block
+        for (block.statements) |stmt| {
+            const stmt_line = stmt.location.start.line;
+            self.current_line = stmt_line;
+
+            // Emit DRC ops that should come BEFORE this statement
+            // This includes decref for reassignment old values
+            // Skip scope_exit ops - they're emitted at block end
+            try self.emitDrcOpsForLineFiltered(stmt_line, .before, true);
+
+            // Check if this statement uses any StringBuilder vars - finalize them first
+            // This must happen BEFORE emitIndent to avoid double-indentation
+            const finalized_any = try self.checkAndFinalizeStringBuildersForStmt(stmt);
+
+            // Emit indent (unless finalization already happened - it handles its own indent+reindent)
+            if (!finalized_any) {
+                try self.emitIndent();
+            }
+            try self.emitNode(stmt);
+
+            // Emit DRC ops that should come AFTER this statement
+            try self.emitDrcOpsForLine(stmt_line, .after);
+        }
+
+        // Update current_line to block's end for scope exit ops
+        const block_end_line = if (block.statements.len > 0)
+            block.statements[block.statements.len - 1].location.start.line
+        else
+            block_start_line;
+        self.current_line = block_end_line;
+
+        // Check if block ends with return/break/continue (control flow exit)
+        const ends_with_control_flow = if (block.statements.len > 0)
+            switch (block.statements[block.statements.len - 1].kind) {
+                .return_stmt, .break_stmt, .continue_stmt => true,
+                else => false,
+            }
+        else
+            false;
+
+        // Emit scope cleanup from DRC (if not already handled by control flow)
+        if (!ends_with_control_flow) {
+            try self.emitDrcOpsForLine(block_end_line, .before);
+            // StringBuilder finalization and cleanup at function exit
+            // 1. Build final strings (already done inline via ms_sb_build)
+            // 2. Free StringBuilder buffers
+            try self.emitStringBuilderCleanup();
+        }
+
+        self.indent_level -= 1;
+        try self.emitIndent();
+        try self.emit("}\n");
+    }
+
+    /// Emit global variable declarations (top-level const/let)
+    fn emitGlobalVariables(self: *Self, node: *ast.Node) !void {
+        const var_stmt = &node.data.variable_stmt;
+
+        for (var_stmt.declarations) |decl| {
+            // Determine type
+            const is_string = if (decl.init) |init_expr|
+                init_expr.kind == .string_literal
+            else
+                false;
+
+            if (is_string and self.enable_interning) {
+                // Emit as macro that lazily gets interned string
+                // #define greeting ms_intern_get(&_str_0)
+                const literal = decl.init.?.data.string_literal;
+                if (self.string_literals.get(literal)) |intern_id| {
+                    try self.emit("#define ");
+                    try self.emit(decl.name);
+                    try self.emit(" ms_intern_get(&_str_");
+                    const id_str = try std.fmt.allocPrint(self.allocator, "{d}", .{intern_id});
+                    defer self.allocator.free(id_str);
+                    try self.emit(id_str);
+                    try self.emit(")\n");
+                }
+            } else if (decl.type) |typ| {
+                try self.emitType(typ);
+                try self.emit(" ");
+                try self.emit(decl.name);
+                if (decl.init) |init_expr| {
+                    try self.emit(" = ");
+                    try self.emitExpression(init_expr);
+                }
+                try self.emit(";\n");
+            } else if (decl.init) |init_expr| {
+                // Infer type from initializer
+                if (init_expr.kind == .number_literal) {
+                    const num = init_expr.data.number_literal;
+                    if (@floor(num) == num and num >= -2147483648 and num <= 2147483647) {
+                        try self.emit("int ");
+                    } else {
+                        try self.emit("double ");
+                    }
+                } else if (init_expr.kind == .boolean_literal) {
+                    try self.emit("bool ");
+                } else if (is_string) {
+                    // String without interning
+                    try self.emit("msString* ");
+                    try self.emit(decl.name);
+                    try self.emit(" = ms_string_from_cstr(\"");
+                    try self.emitEscapedString(init_expr.data.string_literal);
+                    try self.emit("\");\n");
+                    continue;
+                } else {
+                    try self.emit("void* ");
+                }
+                try self.emit(decl.name);
+                try self.emit(" = ");
+                try self.emitExpression(init_expr);
+                try self.emit(";\n");
+            }
+        }
+    }
+
     /// Emit variable statement: const x = ...; or let x = ...;
     fn emitVariableStmt(self: *Self, node: *ast.Node) !void {
         const var_stmt = &node.data.variable_stmt;
 
         for (var_stmt.declarations) |decl| {
+            // Check if this is a StringBuilder candidate
+            if (self.isStringBuilderVar(decl.name)) {
+                try self.emitStringBuilderDecl(decl);
+                continue;
+            }
+
+            // Hoist nested RC-returning calls from initializer
+            // For: let x = f(g(h(y))), hoist h, then g, before emitting declaration
+            var had_hoisted_temps = false;
+            if (decl.init) |init_expr| {
+                var nested_calls = std.ArrayList(*ast.Node).init(self.allocator);
+                defer nested_calls.deinit();
+                try self.collectNestedRcCalls(init_expr, &nested_calls);
+
+                if (nested_calls.items.len > 0) {
+                    // Reverse to process innermost calls first
+                    std.mem.reverse(*ast.Node, nested_calls.items);
+                    try self.hoistNestedCalls(nested_calls.items);
+                    had_hoisted_temps = true;
+                }
+            }
+            // If we hoisted temps, need indent for the actual declaration
+            if (had_hoisted_temps) {
+                try self.emitIndent();
+            }
+
             // Check if initializer is a non-constant object literal
             const needs_split = if (decl.init) |init_expr|
                 init_expr.kind == .object_expr and self.objectHasVariableReferences(init_expr)
@@ -762,6 +1880,9 @@ pub const CGenerator = struct {
                 }
 
                 try self.emit(";\n");
+
+                // Cleanup any hoisted temporaries after this declaration
+                try self.emitTempCleanup();
             }
         }
     }
@@ -788,6 +1909,21 @@ pub const CGenerator = struct {
     fn emitExpressionStmt(self: *Self, node: *ast.Node) !void {
         const expr = node.data.expression_stmt;
 
+        // Collect and hoist nested RC-returning calls before the main expression
+        // This handles patterns like: printMessage(makeGreeting("World"))
+        // where makeGreeting returns an owned string that needs cleanup
+        var nested_calls = std.ArrayList(*ast.Node).init(self.allocator);
+        defer nested_calls.deinit();
+        try self.collectNestedRcCalls(expr, &nested_calls);
+
+        if (nested_calls.items.len > 0) {
+            // CRITICAL: Reverse to process innermost calls first
+            // For f(g(h(x))), collector produces [g, h] (outer-first)
+            // We need [h, g] so h is hoisted before g references it
+            std.mem.reverse(*ast.Node, nested_calls.items);
+            try self.hoistNestedCalls(nested_calls.items);
+        }
+
         // Map console.log to printf
         if (expr.kind == .call_expr) {
             const call = &expr.data.call_expr;
@@ -796,14 +1932,36 @@ pub const CGenerator = struct {
                 if (member.object.kind == .identifier and
                     std.mem.eql(u8, member.object.data.identifier, "console"))
                 {
+                    // Note: StringBuilder finalization is handled by checkAndFinalizeStringBuildersForStmt
+                    // before this function is called, so we can emit directly
                     try self.emitConsoleCall(call);
+                    // Emit cleanup for any hoisted temporaries
+                    try self.emitTempCleanup();
                     return;
                 }
             }
         }
 
+        // Check for StringBuilder concat pattern: result = result + x
+        if (self.isStringBuilderConcatExpr(expr)) |concat_info| {
+            try self.emitStringBuilderConcat(concat_info.var_name, concat_info.append_value);
+            // Emit cleanup for any hoisted temporaries
+            try self.emitTempCleanup();
+            return;
+        }
+
+        // Note: StringBuilder finalization is handled by checkAndFinalizeStringBuildersForStmt
+        // before this function is called
+        // If we hoisted temps, we need indent for main expression (previous line was temp decl)
+        // If no temps, block already emitted indent
+        if (nested_calls.items.len > 0) {
+            try self.emitIndent();
+        }
         try self.emitExpression(expr);
         try self.emit(";\n");
+
+        // Emit cleanup for any hoisted temporaries
+        try self.emitTempCleanup();
     }
 
     /// Emit a block statement
@@ -818,6 +1976,11 @@ pub const CGenerator = struct {
         for (block.statements) |stmt| {
             const stmt_line = stmt.location.start.line;
             self.current_line = stmt_line;
+
+            // Emit DRC ops that should come BEFORE this statement
+            // This includes decref for reassignment old values
+            // Skip scope_exit ops - they're emitted at block end
+            try self.emitDrcOpsForLineFiltered(stmt_line, .before, true);
 
             try self.emitIndent();
             try self.emitNode(stmt);
@@ -1023,23 +2186,110 @@ pub const CGenerator = struct {
     fn emitReturnStmt(self: *Self, node: *ast.Node) !void {
         const ret = &node.data.return_stmt;
 
-        // Check if we have any cleanup to emit
-        const has_cleanup = self.hasAnyCleanup();
+        // Note: StringBuilder finalization is handled by checkAndFinalizeStringBuildersForStmt
+        // before this function is called
 
-        if (has_cleanup) {
-            // Emit cleanup for all scopes before return (early exit)
-            // Note: caller already emitted indent for this line, so cleanup goes on next line
+        // Determine if return argument is safe to evaluate after cleanup
+        // Safe: identifiers (cleanup skips returned var), literals (no dependencies)
+        // Unsafe: expressions using variables that may be freed during cleanup
+        const is_safe_after_cleanup = if (ret.argument) |arg|
+            arg.kind == .identifier or
+                arg.kind == .number_literal or
+                arg.kind == .string_literal or
+                arg.kind == .boolean_literal or
+                arg.kind == .null_literal
+        else
+            true; // No argument is safe
+
+        // Get the returned variable name (if returning a simple identifier)
+        const returned_var: ?[]const u8 = if (ret.argument) |arg|
+            if (arg.kind == .identifier) arg.data.identifier else null
+        else
+            null;
+
+        // Check if we have any cleanup to emit (DRC or StringBuilder)
+        const has_drc_cleanup = self.hasAnyCleanup();
+        const has_sb_cleanup = self.stringbuilder_vars.count() > 0;
+        const needs_cleanup = has_drc_cleanup or has_sb_cleanup;
+
+        // CRITICAL: For complex expressions that use variables (not identifiers/literals),
+        // we must evaluate the expression BEFORE cleanup to avoid use-after-free.
+        // Example: `return part1 + part2` - we need part1/part2 valid during concat
+        if (needs_cleanup and !is_safe_after_cleanup) {
+            // Complex expression: evaluate to temp, cleanup, return temp
+            try self.emit("\n"); // End current line
+
+            // Evaluate expression into a temporary variable
+            try self.emitIndent();
+            // Infer return type from the expression or use generic pointer
+            try self.emit("void* _return_value = (void*)(");
+            if (ret.argument) |arg| {
+                try self.emitExpression(arg);
+            }
+            try self.emit(");\n");
+
+            // Now emit cleanup (variables are still valid, but we have our copy)
+            try self.emitAllScopeCleanup();
+            try self.emitStringBuilderCleanupForReturn(returned_var);
+
+            // Return the saved value
+            try self.emitIndent();
+            try self.emit("return _return_value;\n");
+        } else if (needs_cleanup) {
+            // Simple identifier or no argument: existing logic is safe
+            // The scope cleanup already skips the returned variable
             try self.emit("\n"); // End the current (empty) line
             try self.emitAllScopeCleanup();
+            try self.emitStringBuilderCleanupForReturn(returned_var);
             try self.emitIndent(); // Indent for the return statement
+
+            try self.emit("return");
+            if (ret.argument) |arg| {
+                try self.emit(" ");
+                try self.emitExpression(arg);
+            }
+            try self.emit(";\n");
+        } else {
+            // No cleanup needed - simple return
+            try self.emit("return");
+            if (ret.argument) |arg| {
+                try self.emit(" ");
+                try self.emitExpression(arg);
+            }
+            try self.emit(";\n");
+        }
+    }
+
+    /// Emit StringBuilder cleanup for return statements
+    /// Frees buffers but doesn't decref the returned variable
+    fn emitStringBuilderCleanupForReturn(self: *Self, returned_var: ?[]const u8) !void {
+        if (self.stringbuilder_vars.count() == 0) return;
+
+        // Step 1: Free StringBuilder buffers
+        var iter = self.stringbuilder_vars.keyIterator();
+        while (iter.next()) |key_ptr| {
+            try self.emitIndent();
+            try self.emit("ms_sb_free(&_sb_");
+            try self.emit(key_ptr.*);
+            try self.emit(");\n");
         }
 
-        try self.emit("return");
-        if (ret.argument) |arg| {
-            try self.emit(" ");
-            try self.emitExpression(arg);
+        // Step 2: Decref all built strings EXCEPT the one being returned
+        iter = self.stringbuilder_vars.keyIterator();
+        while (iter.next()) |key_ptr| {
+            const name = key_ptr.*;
+            // Skip the returned variable - caller takes ownership
+            if (returned_var) |rv| {
+                if (std.mem.eql(u8, name, rv)) continue;
+            }
+            // Only decref if it was finalized
+            if (self.stringbuilder_finalized.contains(name)) {
+                try self.emitIndent();
+                try self.emit("ms_decref(");
+                try self.emit(name);
+                try self.emit(");\n");
+            }
         }
-        try self.emit(";\n");
     }
 
     /// Check if any scope has variables that need cleanup
@@ -1246,10 +2496,21 @@ pub const CGenerator = struct {
                 try self.emit(num_str);
             },
             .string_literal => {
-                // Wrap string literals in ms_string_from_cstr for ORC management
-                try self.emit("ms_string_from_cstr(\"");
-                try self.emit(node.data.string_literal);
-                try self.emit("\")");
+                const literal = node.data.string_literal;
+                if (self.enable_interning) {
+                    // Use interned string pool for deduplication and performance
+                    const intern_id = try self.registerStringLiteral(literal);
+                    try self.emit("ms_intern_get(&_str_");
+                    var id_buf: [16]u8 = undefined;
+                    const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{intern_id}) catch "0";
+                    try self.emit(id_str);
+                    try self.emit(")");
+                } else {
+                    // Fallback: wrap string literals in ms_string_from_cstr for ORC management
+                    try self.emit("ms_string_from_cstr(\"");
+                    try self.emit(literal);
+                    try self.emit("\")");
+                }
             },
             .boolean_literal => {
                 if (node.data.boolean_literal) {
@@ -1262,7 +2523,12 @@ pub const CGenerator = struct {
                 try self.emit("NULL");
             },
             .identifier => {
-                try self.emit(node.data.identifier);
+                const name = node.data.identifier;
+                // For StringBuilder variables that have been finalized, use the plain name
+                // (finalization creates: msString* varname = ms_sb_build(&_sb_varname))
+                // For non-finalized StringBuilder vars, this is an error - should have been
+                // finalized by finalizeStringBuildersInExpr before this expression was emitted
+                try self.emit(name);
             },
             .binary_expr => {
                 const binary = &node.data.binary_expr;
@@ -1456,6 +2722,13 @@ pub const CGenerator = struct {
                 }
             },
             .call_expr => {
+                // Check if this call was hoisted to a temporary
+                // (for nested calls like f(g(x)) where g(x) returns RC type)
+                if (self.hoisted_calls.get(node)) |temp_name| {
+                    try self.emit(temp_name);
+                    return;
+                }
+
                 const call = &node.data.call_expr;
 
                 // Check for Math.* builtin calls: Math.floor(x) → floor(x)

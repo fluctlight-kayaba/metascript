@@ -7,6 +7,16 @@
 ///!   3. Cycle Detection (Bacon-Rajan)
 ///!   4. Backend Integration (via rc_trait)
 ///!
+///! Lifetime System (stolen from Lobster):
+///!   - LT_BORROW: Value is borrowed, don't hold onto it
+///!   - LT_KEEP: You own this value, must delete or store
+///!   - LT_ANY: Non-reference type, lifetime doesn't matter
+///!
+///! Key optimizations:
+///!   - consumes_vars_on_return: Skip decref when returning owned var
+///!   - AdjustLifetime: Convert between borrow/keep with incref/decref
+///!   - Last-use move: Transfer ownership on last use
+///!
 ///! Usage:
 ///!   var drc = Drc.init(allocator);
 ///!   defer drc.deinit();
@@ -26,6 +36,60 @@ const std = @import("std");
 const ownership = @import("ownership.zig");
 const rc_annotation = @import("rc_annotation.zig");
 const cycle_detection = @import("cycle_detection.zig");
+
+// ============================================================================
+// Lifetime System (Lobster-style)
+// ============================================================================
+
+/// Lifetime annotation for values (stolen from Lobster)
+/// Positive values (>= 0) are borrow indices into the borrow stack
+pub const Lifetime = enum(i32) {
+    /// Value: you are receiving a value stored elsewhere, do not hold on.
+    /// Recipient: I do not want to be responsible for managing this value.
+    borrow = -1,
+
+    /// Value: you are responsible for this value, you must delete or store.
+    /// Recipient: I want to hold on to this value (inc ref, or be sole owner).
+    keep = -2,
+
+    /// Value: lifetime shouldn't matter, because type is non-reference.
+    /// Recipient: I'm cool with any lifetime.
+    any = -3,
+
+    /// Value: there are multiple lifetimes, stored elsewhere.
+    multiple = -4,
+
+    /// Lifetime is not valid/undefined.
+    undef = -5,
+
+    pub fn isBorrow(self: Lifetime) bool {
+        return @intFromEnum(self) >= @intFromEnum(Lifetime.borrow);
+    }
+
+    pub fn lifetimeType(self: Lifetime) Lifetime {
+        return if (self.isBorrow()) .borrow else self;
+    }
+
+    pub fn isRef(self: Lifetime) bool {
+        return self != .any and self != .undef;
+    }
+};
+
+/// Borrow tracking entry (like Lobster's Borrow struct)
+pub const BorrowEntry = struct {
+    /// The variable being borrowed from
+    var_name: []const u8,
+    /// Reference count of outstanding borrows
+    refc: u32 = 1,
+    /// Line where borrow started
+    line: u32,
+    /// Column where borrow started
+    column: u32,
+
+    pub fn init(var_name: []const u8, line: u32, column: u32) BorrowEntry {
+        return .{ .var_name = var_name, .refc = 1, .line = line, .column = column };
+    }
+};
 
 /// DRC Configuration
 pub const Config = struct {
@@ -195,8 +259,30 @@ pub const Drc = struct {
     /// Scope stack
     scope_stack: std.ArrayList(Scope),
 
+    /// Borrow stack (Lobster-style) - tracks outstanding borrows
+    borrow_stack: std.ArrayList(BorrowEntry),
+
+    /// Statement temporaries - call results that need cleanup after statement
+    /// Used for nested calls like f(g(x)) where g(x) returns owned value
+    statement_temporaries: std.ArrayList(Temporary),
+
+    /// Current line being processed (for error messages)
+    current_line: u32 = 0,
+
     /// Statistics
     stats: Stats,
+
+    /// A temporary value from a call expression that needs cleanup
+    pub const Temporary = struct {
+        /// Synthetic name for the temporary (e.g., "_tmp_0")
+        name: []const u8,
+        /// Line where the call occurs
+        line: u32,
+        /// Column where the call occurs
+        column: u32,
+        /// Whether this temp is consumed (stored, returned, etc.)
+        consumed: bool = false,
+    };
 
     pub const Scope = struct {
         depth: u32,
@@ -231,6 +317,8 @@ pub const Drc = struct {
             .ops_by_line = std.AutoHashMap(u32, std.ArrayList(RcOp)).init(allocator),
             .variables = std.StringHashMap(Variable).init(allocator),
             .scope_stack = std.ArrayList(Scope).init(allocator),
+            .borrow_stack = std.ArrayList(BorrowEntry).init(allocator),
+            .statement_temporaries = std.ArrayList(Temporary).init(allocator),
             .stats = .{},
         };
     }
@@ -253,6 +341,8 @@ pub const Drc = struct {
             scope.deinit();
         }
         self.scope_stack.deinit();
+        self.borrow_stack.deinit();
+        self.statement_temporaries.deinit();
     }
 
     // ========================================================================
@@ -308,6 +398,115 @@ pub const Drc = struct {
                 .reason = .scope_exit,
             });
         }
+    }
+
+    // ========================================================================
+    // Early Return Cleanup
+    // ========================================================================
+
+    /// Emit cleanup for early returns - decref all owned vars except the returned one
+    /// This is critical for functions that return early and would otherwise leak
+    ///
+    /// IMPORTANT: We DON'T check ownership_state here because:
+    /// - ownership_state may be .moved due to analysis of a DIFFERENT control-flow path
+    /// - At runtime, only ONE return executes, so each return must clean up its own scope
+    /// - Example: if (cond) { return x; } return y; -- both returns need independent cleanup
+    pub fn emitEarlyReturnCleanup(
+        self: *Drc,
+        line: u32,
+        column: u32,
+        returned_var: ?[]const u8,
+    ) !void {
+        // Iterate through all scopes and emit cleanup for owned variables
+        // We need to clean up ALL scopes we're exiting, not just the current one
+        for (self.scope_stack.items) |scope| {
+            for (scope.variables.items) |var_name| {
+                // Skip the returned variable - it's being moved to caller
+                if (returned_var) |ret_var| {
+                    if (std.mem.eql(u8, var_name, ret_var)) continue;
+                }
+
+                if (self.variables.get(var_name)) |v| {
+                    // Only decref non-parameter variables that need RC
+                    // NOTE: We ONLY check is_parameter here, NOT ownership_state or escaped.
+                    // - Parameters are borrowed (caller owns them) - never decref
+                    // - Local variables are owned and must be cleaned up
+                    // - ownership_state might be .moved from a DIFFERENT branch
+                    // - escaped might be true from a DIFFERENT branch where this var was returned
+                    // Each return statement must independently clean up all vars it doesn't return.
+                    if (v.needs_rc and !v.is_parameter) {
+                        try self.addOp(.{
+                            .kind = if (self.config.enable_cycle_detection) .decref_cycle_check else .decref,
+                            .target = var_name,
+                            .line = line,
+                            .column = column,
+                            .position = .before,
+                            .reason = .scope_exit,
+                            .comment = if (self.config.debug_mode) "// DRC: early return cleanup" else null,
+                        });
+                        self.stats.decrefs += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // Statement Temporary Management (for nested calls)
+    // ========================================================================
+
+    /// Counter for generating unique temporary names
+    var temp_counter: u32 = 0;
+
+    /// Register a temporary from a nested call expression
+    /// Returns the temporary name for codegen to use
+    pub fn registerTemporary(self: *Drc, line: u32, column: u32) ![]const u8 {
+        const name = try std.fmt.allocPrint(self.allocator, "_tmp_{d}", .{temp_counter});
+        temp_counter += 1;
+
+        try self.statement_temporaries.append(.{
+            .name = name,
+            .line = line,
+            .column = column,
+            .consumed = false,
+        });
+
+        return name;
+    }
+
+    /// Mark a temporary as consumed (e.g., assigned to a variable or returned)
+    pub fn markTemporaryConsumed(self: *Drc, name: []const u8) void {
+        for (self.statement_temporaries.items) |*temp| {
+            if (std.mem.eql(u8, temp.name, name)) {
+                temp.consumed = true;
+                return;
+            }
+        }
+    }
+
+    /// Emit decrefs for all unconsumed temporaries and clear the list
+    /// Called at the end of each expression statement
+    pub fn flushStatementTemporaries(self: *Drc, line: u32, column: u32) !void {
+        for (self.statement_temporaries.items) |temp| {
+            if (!temp.consumed) {
+                try self.addOp(.{
+                    .kind = if (self.config.enable_cycle_detection) .decref_cycle_check else .decref,
+                    .target = temp.name,
+                    .line = line,
+                    .column = column,
+                    .position = .after,
+                    .reason = .scope_exit,
+                    .comment = if (self.config.debug_mode) "// DRC: cleanup nested call temp" else null,
+                });
+                self.stats.decrefs += 1;
+            }
+        }
+        self.statement_temporaries.clearRetainingCapacity();
+    }
+
+    /// Check if there are pending temporaries
+    pub fn hasPendingTemporaries(self: *const Drc) bool {
+        return self.statement_temporaries.items.len > 0;
     }
 
     // ========================================================================
@@ -390,7 +589,16 @@ pub const Drc = struct {
         try self.ownership_analyzer.recordUse(var_name, line, column, toOwnershipContext(context));
 
         // Check for last use optimization
-        if (self.config.enable_move_optimization) {
+        // IMPORTANT: Only apply move optimization for contexts that actually transfer ownership.
+        // Borrowed contexts (read, function_arg_borrowed) don't transfer ownership, so the
+        // caller still needs to clean up the value even if this is the last use in source code.
+        const can_move = switch (context) {
+            .function_arg_owned, .returned, .field_store => true,
+            .read, .function_arg_borrowed => false, // Caller still owns it!
+            else => false,
+        };
+
+        if (self.config.enable_move_optimization and can_move) {
             const is_last = self.ownership_analyzer.isLastUse(var_name, line, column);
             const escapes = self.ownership_analyzer.escapesScope(var_name);
 
@@ -444,8 +652,27 @@ pub const Drc = struct {
                 self.stats.increfs += 1;
             },
             .returned => {
-                // Returning transfers ownership out
+                // Returning transfers ownership to caller
+                // (Lobster calls this "consumes_vars_on_return")
                 if (self.variables.getPtr(var_name)) |vptr| {
+                    if (vptr.ownership_state == .borrowed) {
+                        // CRITICAL: Returning a borrowed parameter!
+                        // Must incref to give caller ownership, otherwise they get
+                        // a dangling reference when our scope ends.
+                        try self.addOp(.{
+                            .kind = .incref,
+                            .target = var_name,
+                            .line = line,
+                            .column = column,
+                            .position = .before,
+                            .reason = .return_value,
+                            .comment = if (self.config.debug_mode) "// DRC: incref borrowed return" else null,
+                        });
+                        self.stats.increfs += 1;
+                    } else if (vptr.ownership_state == .owned) {
+                        // Returning owned value - elide scope cleanup decref
+                        self.stats.ops_elided += 1;
+                    }
                     vptr.escaped = true;
                     vptr.ownership_state = .moved;
                 }
@@ -488,6 +715,182 @@ pub const Drc = struct {
             .function_arg_owned, .function_arg_borrowed => .argument,
             .returned => .returned,
         };
+    }
+
+    // ========================================================================
+    // Lifetime System (Lobster-style)
+    // ========================================================================
+
+    /// Push a borrow onto the borrow stack (like Lobster's PushBorrow)
+    /// Returns a lifetime that can be used to track this borrow
+    pub fn pushBorrow(self: *Drc, var_name: []const u8, line: u32, column: u32) !Lifetime {
+        // Check if this variable is a reference type
+        const v = self.variables.get(var_name) orelse return .any;
+        if (!v.needs_rc) return .any;
+
+        // Check if we already have a borrow for this variable
+        for (self.borrow_stack.items, 0..) |*entry, i| {
+            if (std.mem.eql(u8, entry.var_name, var_name)) {
+                entry.refc += 1;
+                // Return the borrow index as a positive lifetime value
+                return @enumFromInt(@as(i32, @intCast(i)));
+            }
+        }
+
+        // Create new borrow entry
+        const borrow_idx = self.borrow_stack.items.len;
+        try self.borrow_stack.append(BorrowEntry.init(var_name, line, column));
+
+        // Return the borrow index as lifetime
+        return @enumFromInt(@as(i32, @intCast(borrow_idx)));
+    }
+
+    /// Increment borrow count (like Lobster's IncBorrowers)
+    pub fn incBorrowers(self: *Drc, lt: Lifetime) void {
+        const idx = @intFromEnum(lt);
+        if (idx < 0) return; // Not a borrow index
+        if (idx >= self.borrow_stack.items.len) return;
+        self.borrow_stack.items[@intCast(idx)].refc += 1;
+    }
+
+    /// Decrement borrow count (like Lobster's DecBorrowers)
+    pub fn decBorrowers(self: *Drc, lt: Lifetime) void {
+        const idx = @intFromEnum(lt);
+        if (idx < 0) return; // Not a borrow index
+        if (idx >= self.borrow_stack.items.len) return;
+        const entry = &self.borrow_stack.items[@intCast(idx)];
+        if (entry.refc > 0) {
+            entry.refc -= 1;
+        }
+    }
+
+    /// Context for lifetime adjustment - different contexts have different semantics
+    pub const AdjustContext = enum {
+        /// Function argument passing: caller lends, callee borrows temporarily
+        call,
+        /// Storage: assigning to variable/field, creates shared ownership
+        store,
+        /// Return: transferring ownership to caller
+        return_value,
+    };
+
+    /// Adjust lifetime from given to recipient (like Lobster's AdjustLifetime)
+    /// Returns true if an RC operation was emitted
+    ///
+    /// CRITICAL: The context matters!
+    /// - call: KEEP→BORROW = no-op (lending), KEEP→KEEP at last use = move
+    /// - store: KEEP→KEEP = incref (sharing), BORROW→KEEP = incref
+    /// - return: KEEP→KEEP = move (transfer), BORROW→KEEP = incref
+    pub fn adjustLifetime(
+        self: *Drc,
+        given: Lifetime,
+        recipient: Lifetime,
+        var_name: []const u8,
+        line: u32,
+        column: u32,
+    ) !bool {
+        // Default to call context for backwards compatibility
+        return self.adjustLifetimeWithContext(given, recipient, var_name, line, column, .call);
+    }
+
+    /// Adjust lifetime with explicit context
+    pub fn adjustLifetimeWithContext(
+        self: *Drc,
+        given: Lifetime,
+        recipient: Lifetime,
+        var_name: []const u8,
+        line: u32,
+        column: u32,
+        context: AdjustContext,
+    ) !bool {
+        const given_type = given.lifetimeType();
+        const recip_type = recipient.lifetimeType();
+
+        // Check if variable needs RC
+        const v = self.variables.get(var_name) orelse return false;
+        if (!v.needs_rc) return false;
+
+        // Handle based on context
+        switch (context) {
+            .call => {
+                // Function calls: lending semantics
+                if (given_type == .borrow and recip_type == .keep) {
+                    // Callee wants ownership of borrowed value: incref
+                    try self.emitIncref(var_name, line, column, .function_arg);
+                    self.decBorrowers(given);
+                    return true;
+                }
+                // KEEP→BORROW = no-op (lending temporarily)
+                // KEEP→KEEP handled by move optimization in analyzer
+                return false;
+            },
+            .store => {
+                // Storage: sharing semantics
+                if (recip_type == .keep) {
+                    // Storing creates a new reference: incref needed
+                    // (except for fresh allocations, handled elsewhere)
+                    if (given_type == .borrow or given_type == .keep) {
+                        try self.emitIncref(var_name, line, column, .assignment);
+                        if (given_type == .borrow) self.decBorrowers(given);
+                        return true;
+                    }
+                }
+                return false;
+            },
+            .return_value => {
+                // Return: transfer semantics
+                if (given_type == .borrow and recip_type == .keep) {
+                    // Returning borrowed value: must incref to give caller ownership
+                    try self.emitIncref(var_name, line, column, .return_value);
+                    self.decBorrowers(given);
+                    return true;
+                }
+                // KEEP→KEEP = move (ownership transfer, no RC change)
+                return false;
+            },
+        }
+    }
+
+    /// Helper to emit incref
+    fn emitIncref(self: *Drc, var_name: []const u8, line: u32, column: u32, reason: RcOp.Reason) !void {
+        try self.addOp(.{
+            .kind = .incref,
+            .target = var_name,
+            .line = line,
+            .column = column,
+            .position = .before,
+            .reason = reason,
+            .comment = if (self.config.debug_mode) "// DRC: incref" else null,
+        });
+        self.stats.increfs += 1;
+    }
+
+    /// Get the lifetime for a variable based on its current state
+    pub fn getVariableLifetime(self: *Drc, var_name: []const u8) Lifetime {
+        const v = self.variables.get(var_name) orelse return .undef;
+
+        if (!v.needs_rc) return .any;
+
+        return switch (v.ownership_state) {
+            .owned => .keep,
+            .borrowed => .borrow,
+            .moved => .any, // Already moved, no longer matters
+            .unknown => .undef,
+        };
+    }
+
+    /// Infer function argument lifetime (like Lobster's ArgLifetime)
+    /// Returns LT_KEEP if arg takes ownership, LT_BORROW if it borrows
+    pub fn inferArgLifetime(self: *Drc, var_name: []const u8, is_single_assignment: bool) Lifetime {
+        const v = self.variables.get(var_name) orelse return .any;
+
+        if (!v.needs_rc) return .any;
+
+        // Parameters that are reassigned must be LT_KEEP
+        if (!is_single_assignment) return .keep;
+
+        // Default: borrow (caller retains ownership)
+        return .borrow;
     }
 
     // ========================================================================
@@ -762,20 +1165,30 @@ test "Drc value types no RC" {
     try std.testing.expectEqual(@as(usize, 0), rc_ops);
 }
 
-test "Drc move optimization" {
+test "Drc move optimization requires ownership-transfer context" {
+    // Move optimization only applies to ownership-transfer contexts (return, field_store, function_arg_owned)
+    // NOT to read-only contexts (read, function_arg_borrowed)
     var drc = Drc.initWithConfig(std.testing.allocator, .{ .enable_move_optimization = true });
     defer drc.deinit();
 
     try drc.enterScope(1);
     try drc.registerVariable("x", .object, 1, 5, false);
     try drc.registerAllocation("x", 1, 10);
-    try drc.trackUse("x", 3, 1, .read); // Single use = last use
+    try drc.trackUse("x", 3, 1, .returned); // Last use with ownership transfer
     try drc.exitScope(5, 1);
     try drc.finalize();
 
     const stats = drc.getStats();
     try std.testing.expect(stats.moves >= 1);
-    try std.testing.expect(stats.ops_elided >= 1);
+    // Note: returned values don't go through the last-use path in trackUse,
+    // they're handled specially. Check that no scope cleanup decref was emitted.
+    var scope_decrefs: usize = 0;
+    for (drc.getAllOps()) |op| {
+        if ((op.kind == .decref or op.kind == .decref_cycle_check) and op.reason == .scope_exit) {
+            scope_decrefs += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), scope_decrefs);
 }
 
 test "Drc field store requires incref" {
@@ -864,4 +1277,285 @@ test "Drc statistics" {
     const stats = drc.getStats();
     try std.testing.expectEqual(@as(u64, 3), stats.variables_analyzed);
     try std.testing.expectEqual(@as(u64, 2), stats.rc_variables); // object + string, not value
+}
+
+// ============================================================================
+// Tests for Bug Fixes (Dec 5, 2025)
+// ============================================================================
+
+test "Drc borrowed args do NOT trigger move optimization" {
+    // Bug fix: function_arg_borrowed should NOT use move optimization
+    // even if it's the last use, because the caller still owns the value
+    var drc = Drc.initWithConfig(std.testing.allocator, .{ .enable_move_optimization = true });
+    defer drc.deinit();
+
+    try drc.enterScope(1);
+
+    // Create a heap-allocated variable
+    try drc.registerVariable("result", .string, 2, 5, false);
+    try drc.registerAllocation("result", 2, 10);
+
+    // Pass it to a function as borrowed (this is the ONLY use)
+    try drc.trackUse("result", 3, 1, .function_arg_borrowed);
+
+    try drc.exitScope(5, 1);
+    try drc.finalize();
+
+    // Should NOT have a move op (borrowed doesn't transfer ownership)
+    var move_count: usize = 0;
+    for (drc.getAllOps()) |op| {
+        if (op.kind == .move and std.mem.eql(u8, op.target, "result")) {
+            move_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), move_count);
+
+    // Should have a decref at scope exit (caller must clean up)
+    var scope_decref_count: usize = 0;
+    for (drc.getAllOps()) |op| {
+        if ((op.kind == .decref or op.kind == .decref_cycle_check) and
+            op.reason == .scope_exit and
+            std.mem.eql(u8, op.target, "result"))
+        {
+            scope_decref_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), scope_decref_count);
+}
+
+test "Drc read context does NOT trigger move optimization" {
+    // Similar to borrowed args: read-only uses don't transfer ownership
+    var drc = Drc.initWithConfig(std.testing.allocator, .{ .enable_move_optimization = true });
+    defer drc.deinit();
+
+    try drc.enterScope(1);
+    try drc.registerVariable("obj", .object, 2, 5, false);
+    try drc.registerAllocation("obj", 2, 10);
+
+    // Just read the variable (this is the ONLY use)
+    try drc.trackUse("obj", 3, 1, .read);
+
+    try drc.exitScope(5, 1);
+    try drc.finalize();
+
+    // Should NOT have a move op
+    var move_count: usize = 0;
+    for (drc.getAllOps()) |op| {
+        if (op.kind == .move and std.mem.eql(u8, op.target, "obj")) {
+            move_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), move_count);
+
+    // Should have scope cleanup decref
+    var scope_decref_count: usize = 0;
+    for (drc.getAllOps()) |op| {
+        if ((op.kind == .decref or op.kind == .decref_cycle_check) and
+            op.reason == .scope_exit and
+            std.mem.eql(u8, op.target, "obj"))
+        {
+            scope_decref_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), scope_decref_count);
+}
+
+test "Drc ownership-transfer contexts CAN use move optimization" {
+    // Contexts that transfer ownership (return, field_store, function_arg_owned)
+    // should use move optimization when it's the last use
+    var drc = Drc.initWithConfig(std.testing.allocator, .{ .enable_move_optimization = true });
+    defer drc.deinit();
+
+    try drc.enterScope(1);
+    try drc.registerVariable("obj", .object, 2, 5, false);
+    try drc.registerAllocation("obj", 2, 10);
+
+    // Return the variable (ownership transfer, last use)
+    try drc.trackUse("obj", 3, 1, .returned);
+
+    try drc.exitScope(5, 1);
+    try drc.finalize();
+
+    // Should have a move op (ownership transferred to caller)
+    var move_count: usize = 0;
+    for (drc.getAllOps()) |op| {
+        if (op.kind == .move and std.mem.eql(u8, op.target, "obj")) {
+            move_count += 1;
+        }
+    }
+    try std.testing.expect(move_count >= 1);
+
+    // Should NOT have scope cleanup decref (ownership was transferred)
+    var scope_decref_count: usize = 0;
+    for (drc.getAllOps()) |op| {
+        if ((op.kind == .decref or op.kind == .decref_cycle_check) and
+            op.reason == .scope_exit and
+            std.mem.eql(u8, op.target, "obj"))
+        {
+            scope_decref_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), scope_decref_count);
+}
+
+test "Drc value type variables skip all RC ops" {
+    // Value types (integers, booleans, etc.) should never generate RC ops
+    var drc = Drc.init(std.testing.allocator);
+    defer drc.deinit();
+
+    try drc.enterScope(1);
+    try drc.registerVariable("count", .value, 2, 5, false);
+    try drc.trackUse("count", 3, 1, .read);
+    try drc.trackUse("count", 4, 1, .returned);
+    try drc.exitScope(5, 1);
+    try drc.finalize();
+
+    // Should have NO RC operations for value type
+    var rc_ops: usize = 0;
+    for (drc.getAllOps()) |op| {
+        if (std.mem.eql(u8, op.target, "count")) {
+            rc_ops += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), rc_ops);
+}
+
+test "Drc scope cleanup only for owned variables" {
+    // Variables that are borrowed (parameters) or moved should not get scope cleanup
+    var drc = Drc.init(std.testing.allocator);
+    defer drc.deinit();
+
+    try drc.enterScope(1);
+
+    // Borrowed parameter - should not be decreffed
+    try drc.registerVariable("param", .object, 1, 5, true);
+
+    // Owned local - should be decreffed
+    try drc.registerVariable("local", .object, 2, 5, false);
+    try drc.registerAllocation("local", 2, 10);
+
+    try drc.exitScope(5, 1);
+    try drc.finalize();
+
+    // Count scope cleanup decrefs per variable
+    var param_decrefs: usize = 0;
+    var local_decrefs: usize = 0;
+    for (drc.getAllOps()) |op| {
+        if ((op.kind == .decref or op.kind == .decref_cycle_check) and op.reason == .scope_exit) {
+            if (std.mem.eql(u8, op.target, "param")) param_decrefs += 1;
+            if (std.mem.eql(u8, op.target, "local")) local_decrefs += 1;
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), param_decrefs); // Borrowed, not decreffed
+    try std.testing.expectEqual(@as(usize, 1), local_decrefs); // Owned, decreffed
+}
+
+test "Drc multiple variables in scope cleanup" {
+    // Multiple heap-allocated variables should all get cleanup
+    var drc = Drc.init(std.testing.allocator);
+    defer drc.deinit();
+
+    try drc.enterScope(1);
+    try drc.registerVariable("a", .string, 2, 5, false);
+    try drc.registerAllocation("a", 2, 10);
+    try drc.registerVariable("b", .string, 3, 5, false);
+    try drc.registerAllocation("b", 3, 10);
+    try drc.registerVariable("c", .object, 4, 5, false);
+    try drc.registerAllocation("c", 4, 10);
+    try drc.exitScope(10, 1);
+    try drc.finalize();
+
+    // Count scope cleanup decrefs
+    var cleanup_count: usize = 0;
+    var has_cleanup_start = false;
+    var has_cleanup_end = false;
+    for (drc.getAllOps()) |op| {
+        if (op.kind == .scope_cleanup_start) has_cleanup_start = true;
+        if (op.kind == .scope_cleanup_end) has_cleanup_end = true;
+        if ((op.kind == .decref or op.kind == .decref_cycle_check) and op.reason == .scope_exit) {
+            cleanup_count += 1;
+        }
+    }
+
+    try std.testing.expect(has_cleanup_start);
+    try std.testing.expect(has_cleanup_end);
+    try std.testing.expectEqual(@as(usize, 3), cleanup_count); // a, b, c all decreffed
+}
+
+test "Drc nested scopes cleanup correctly" {
+    // Variables should be cleaned up at their own scope exit, not outer scope
+    var drc = Drc.init(std.testing.allocator);
+    defer drc.deinit();
+
+    // Outer scope
+    try drc.enterScope(1);
+    try drc.registerVariable("outer", .object, 2, 5, false);
+    try drc.registerAllocation("outer", 2, 10);
+
+    // Inner scope
+    try drc.enterScope(3);
+    try drc.registerVariable("inner", .object, 4, 5, false);
+    try drc.registerAllocation("inner", 4, 10);
+    try drc.exitScope(6, 1); // Inner scope exits at line 6
+
+    try drc.exitScope(10, 1); // Outer scope exits at line 10
+    try drc.finalize();
+
+    // Check that inner is cleaned up at line 6, outer at line 10
+    var inner_cleanup_line: ?u32 = null;
+    var outer_cleanup_line: ?u32 = null;
+    for (drc.getAllOps()) |op| {
+        if ((op.kind == .decref or op.kind == .decref_cycle_check) and op.reason == .scope_exit) {
+            if (std.mem.eql(u8, op.target, "inner")) inner_cleanup_line = op.line;
+            if (std.mem.eql(u8, op.target, "outer")) outer_cleanup_line = op.line;
+        }
+    }
+
+    try std.testing.expectEqual(@as(?u32, 6), inner_cleanup_line);
+    try std.testing.expectEqual(@as(?u32, 10), outer_cleanup_line);
+}
+
+test "Drc variable copy generates incref" {
+    // let x = y where y is reference type should incref x
+    var drc = Drc.init(std.testing.allocator);
+    defer drc.deinit();
+
+    try drc.enterScope(1);
+    try drc.registerVariable("original", .object, 2, 5, false);
+    try drc.registerAllocation("original", 2, 10);
+
+    try drc.registerVariable("copy", .object, 3, 5, false);
+    try drc.trackVariableCopy("copy", "original", 3, 5);
+
+    try drc.exitScope(5, 1);
+    try drc.finalize();
+
+    // Should have incref for copy
+    var incref_count: usize = 0;
+    for (drc.getAllOps()) |op| {
+        if (op.kind == .incref and std.mem.eql(u8, op.target, "copy")) {
+            incref_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), incref_count);
+}
+
+test "Drc elision rate calculation" {
+    var drc = Drc.initWithConfig(std.testing.allocator, .{ .enable_move_optimization = true });
+    defer drc.deinit();
+
+    try drc.enterScope(1);
+    try drc.registerVariable("obj", .object, 2, 5, false);
+    try drc.registerAllocation("obj", 2, 10);
+    try drc.trackUse("obj", 3, 1, .returned); // Last use with ownership transfer, will be moved
+    try drc.exitScope(5, 1);
+    try drc.finalize();
+
+    const stats = drc.getStats();
+    // Move optimization should elide the scope cleanup decref (ownership transferred to caller)
+    // The move op itself counts as an "elided" decref since we skip the scope cleanup
+    try std.testing.expect(stats.moves >= 1);
+    // elisionRate depends on implementation details, just check it's calculable
+    _ = stats.elisionRate();
 }

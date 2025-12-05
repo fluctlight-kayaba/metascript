@@ -316,6 +316,41 @@ pub const MACRO_DEFINITION =
     \\}
 ;
 
+/// System macro: @extern in function body
+pub const MACRO_EXTERN =
+    \\export function platform(): string {
+    \\    @extern("ms_os_platform");
+    \\}
+;
+
+/// System macro: @target with block body
+pub const MACRO_TARGET_BLOCK =
+    \\export macro readFile(path: string): string {
+    \\    @target("c") {
+    \\        @emit("ms_read_file($path)")
+    \\    }
+    \\    @target("js") {
+    \\        @emit("require('fs').readFileSync($path)")
+    \\    }
+    \\}
+;
+
+/// System macro: @emit as statement
+pub const MACRO_EMIT =
+    \\export macro inline_asm(): void {
+    \\    @emit("asm volatile(\"nop\")");
+    \\}
+;
+
+/// Export macro declaration
+pub const MACRO_EXPORT =
+    \\export macro validate(schema: string): void {
+    \\    @comptime {
+    \\        // validation logic
+    \\    }
+    \\}
+;
+
 // ============================================================================
 // Complex / Integration Fixtures
 // ============================================================================

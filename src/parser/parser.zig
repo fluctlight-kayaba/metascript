@@ -34,6 +34,10 @@ pub const Parser = struct {
     errors: std.ArrayList(ParseError),
     panic_mode: bool,
 
+    // JSDoc comment tracking - the most recent doc comment seen before a declaration
+    // Consumed when attached to a declaration node, reset to null after use
+    pending_doc_comment: ?[]const u8,
+
     pub fn init(allocator: std.mem.Allocator, arena: *ast.ASTArena, lexer: *Lexer, file_id: ast.FileId) Parser {
         const dummy_loc = ast.SourceLocation.dummy();
         const dummy_token = Token.init(.end_of_file, dummy_loc, "");
@@ -47,6 +51,7 @@ pub const Parser = struct {
             .previous = dummy_token,
             .errors = std.ArrayList(ParseError).init(allocator),
             .panic_mode = false,
+            .pending_doc_comment = null,
         };
     }
 
@@ -90,9 +95,29 @@ pub const Parser = struct {
     // ===== Top-Level Declarations =====
 
     fn parseTopLevelDeclaration(self: *Parser) !*ast.Node {
-        // Check for macro keyword (Nim-style: macro derive(ctx) { ... })
+        // IMPORTANT: Capture JSDoc BEFORE parsing decorators
+        // JSDoc applies to the declaration, not to the decorators
+        // Example: /** docs */ @derive(Eq) class User {}
+        const doc_comment = self.consumeDocComment();
+
+        // Check for extern keyword (extern macro @target(...): void;)
+        if (self.check(.keyword_extern)) {
+            self.advance(); // consume 'extern'
+            // Re-attach doc comment for extern declaration to consume
+            self.pending_doc_comment = doc_comment;
+            return self.parseExternDeclaration();
+        }
+
+        // Check for macro keyword: macro function name(params) { ... }
         if (self.check(.keyword_macro)) {
             self.advance(); // consume 'macro'
+            // Expect 'function' keyword after 'macro'
+            if (!self.check(.keyword_function)) {
+                return self.reportError("Expected 'function' after 'macro'");
+            }
+            self.advance(); // consume 'function'
+            // Re-attach doc comment for macro declaration to consume
+            self.pending_doc_comment = doc_comment;
             return self.parseMacroDeclaration();
         }
 
@@ -110,10 +135,13 @@ pub const Parser = struct {
             try decorators.append(decorator);
         }
 
+        // Re-attach doc comment for declaration parsing functions to consume
+        self.pending_doc_comment = doc_comment;
+
         // Parse the declaration
         if (self.check(.keyword_class)) {
             return self.parseClassDeclaration(&decorators);
-        } else if (self.check(.keyword_function)) {
+        } else if (self.check(.keyword_function) or self.check(.keyword_async)) {
             return self.parseFunctionDeclaration(&decorators);
         } else if (self.check(.keyword_interface)) {
             return self.parseInterfaceDeclaration();
@@ -133,12 +161,22 @@ pub const Parser = struct {
         }
     }
 
-    fn parseDecorator(self: *Parser) !*ast.Node {
+    /// Parse a system macro invocation (@target, @emit, @extern, etc.)
+    ///
+    /// System macros:
+    /// - Always require @ prefix
+    /// - Always available without import
+    /// - Used for: @target("c"), @emit("code"), @extern("fn"), @comptime, @inline
+    ///
+    /// Context determines behavior:
+    /// - as_decorator=true: Used before class/function, no block body allowed
+    /// - as_decorator=false: Used as statement, optional block body (@target("c") { ... })
+    fn parseSystemMacro(self: *Parser, as_decorator: bool) !*ast.Node {
         const start_loc = self.current.loc;
 
-        // All macros are now @ + identifier
+        // System macros require @ prefix
         if (!self.check(.at_sign)) {
-            return self.reportError("Expected decorator starting with '@'");
+            return self.reportError("System macros require '@' prefix");
         }
         self.advance(); // consume @
 
@@ -148,24 +186,44 @@ pub const Parser = struct {
         const macro_name = self.current.text;
         self.advance();
 
-        // Parse arguments if present: @derive(Eq, Hash)
+        // Parse arguments: @target("c"), @emit("code"), @derive(Eq, Hash)
         var args = std.ArrayList(ast.node.MacroInvocation.MacroArgument).init(self.allocator);
         defer args.deinit();
 
         if (self.match(.left_paren)) {
             while (!self.check(.right_paren) and !self.check(.end_of_file)) {
-                // Parse argument (identifier, type, or expression)
-                if (self.check(.identifier)) {
+                // Parse argument - can be string literal, identifier, or expression
+                if (self.check(.string)) {
+                    // Strip quotes from string literal: "c" -> c
+                    const text = self.current.text;
+                    const stripped = if (text.len >= 2 and (text[0] == '"' or text[0] == '\''))
+                        text[1 .. text.len - 1]
+                    else
+                        text;
+                    try args.append(.{ .string_literal = stripped });
+                    self.advance();
+                } else if (self.check(.identifier)) {
                     try args.append(.{ .identifier = self.current.text });
                     self.advance();
                 } else {
-                    // For now, skip complex arguments
+                    // Skip complex arguments for now
                     self.advance();
                 }
 
                 if (!self.match(.comma)) break;
             }
-            try self.consume(.right_paren, "Expected ')' after decorator arguments");
+            try self.consume(.right_paren, "Expected ')' after macro arguments");
+        }
+
+        // Block body only allowed for statement macros (not decorators)
+        var body: ?*ast.Node = null;
+        if (!as_decorator) {
+            if (self.check(.left_brace)) {
+                body = try self.parseBlock();
+            } else {
+                // Statement ending with semicolon: @emit("code");
+                _ = self.match(.semicolon);
+            }
         }
 
         const args_slice = try self.arena.allocator().dupe(ast.node.MacroInvocation.MacroArgument, args.items);
@@ -177,13 +235,26 @@ pub const Parser = struct {
                 .macro_invocation = .{
                     .name = macro_name,
                     .arguments = args_slice,
-                    .target = null, // Will be set when we parse the target
+                    .target = body,
                 },
             },
         );
     }
 
+    /// Parse a decorator (system macro before class/function)
+    fn parseDecorator(self: *Parser) !*ast.Node {
+        return self.parseSystemMacro(true);
+    }
+
+    /// Parse a macro statement inside a block (@target("c") { ... }, @emit("code"))
+    fn parseMacroStatement(self: *Parser) !*ast.Node {
+        return self.parseSystemMacro(false);
+    }
+
     fn parseClassDeclaration(self: *Parser, decorators: *std.ArrayList(*ast.Node)) !*ast.Node {
+        // Capture JSDoc comment before parsing (must be done first)
+        const doc_comment = self.consumeDocComment();
+
         const start_loc = self.current.loc;
         try self.consume(.keyword_class, "Expected 'class'");
 
@@ -272,7 +343,7 @@ pub const Parser = struct {
 
         const decorators_slice = try self.arena.allocator().dupe(ast.node.ClassDecl.Decorator, class_decorators.items);
 
-        return try self.arena.createNode(
+        const node = try self.arena.createNode(
             .class_decl,
             self.mergeLoc(start_loc, self.previous.loc),
             .{
@@ -286,9 +357,17 @@ pub const Parser = struct {
                 },
             },
         );
+
+        // Attach JSDoc comment to the node
+        node.doc_comment = doc_comment;
+
+        return node;
     }
 
     fn parseClassMember(self: *Parser) !*ast.Node {
+        // Capture JSDoc comment before parsing (for property/method/constructor)
+        const doc_comment = self.consumeDocComment();
+
         const start_loc = self.current.loc;
 
         // Check for modifiers
@@ -317,7 +396,7 @@ pub const Parser = struct {
 
         // Constructor
         if (self.match(.keyword_constructor)) {
-            return self.parseConstructor(start_loc);
+            return self.parseConstructor(start_loc, doc_comment);
         }
 
         // Method or property
@@ -329,14 +408,14 @@ pub const Parser = struct {
 
         // Method: name(...) { ... }
         if (self.check(.left_paren) or self.check(.less_than)) {
-            return self.parseMethod(start_loc, name);
+            return self.parseMethod(start_loc, name, doc_comment);
         }
 
         // Property: name: Type = value;
-        return self.parseProperty(start_loc, name, is_readonly);
+        return self.parseProperty(start_loc, name, is_readonly, doc_comment);
     }
 
-    fn parseConstructor(self: *Parser, start_loc: ast.SourceLocation) !*ast.Node {
+    fn parseConstructor(self: *Parser, start_loc: ast.SourceLocation, doc_comment: ?[]const u8) !*ast.Node {
         // Parameters
         try self.consume(.left_paren, "Expected '(' after 'constructor'");
         var params = std.ArrayList(ast.node.FunctionExpr.FunctionParam).init(self.allocator);
@@ -349,7 +428,7 @@ pub const Parser = struct {
 
         const params_slice = try self.arena.allocator().dupe(ast.node.FunctionExpr.FunctionParam, params.items);
 
-        return try self.arena.createNode(
+        const node = try self.arena.createNode(
             .constructor_decl,
             self.mergeLoc(start_loc, self.previous.loc),
             .{
@@ -359,9 +438,14 @@ pub const Parser = struct {
                 },
             },
         );
+
+        // Attach JSDoc comment to the node
+        node.doc_comment = doc_comment;
+
+        return node;
     }
 
-    fn parseMethod(self: *Parser, start_loc: ast.SourceLocation, name: []const u8) !*ast.Node {
+    fn parseMethod(self: *Parser, start_loc: ast.SourceLocation, name: []const u8, doc_comment: ?[]const u8) !*ast.Node {
         // Type parameters
         var type_params = std.ArrayList(ast.types.GenericParam).init(self.allocator);
         defer type_params.deinit();
@@ -393,7 +477,7 @@ pub const Parser = struct {
         const type_params_slice = try self.arena.allocator().dupe(ast.types.GenericParam, type_params.items);
         const params_slice = try self.arena.allocator().dupe(ast.node.FunctionExpr.FunctionParam, params.items);
 
-        return try self.arena.createNode(
+        const node = try self.arena.createNode(
             .method_decl,
             self.mergeLoc(start_loc, self.previous.loc),
             .{
@@ -406,9 +490,14 @@ pub const Parser = struct {
                 },
             },
         );
+
+        // Attach JSDoc comment to the node
+        node.doc_comment = doc_comment;
+
+        return node;
     }
 
-    fn parseProperty(self: *Parser, start_loc: ast.SourceLocation, name: []const u8, readonly: bool) !*ast.Node {
+    fn parseProperty(self: *Parser, start_loc: ast.SourceLocation, name: []const u8, readonly: bool, doc_comment: ?[]const u8) !*ast.Node {
         // Type annotation
         var prop_type: ?*ast.types.Type = null;
         if (self.match(.colon)) {
@@ -423,7 +512,7 @@ pub const Parser = struct {
 
         _ = self.match(.semicolon);
 
-        return try self.arena.createNode(
+        const node = try self.arena.createNode(
             .property_decl,
             self.mergeLoc(start_loc, self.previous.loc),
             .{
@@ -435,9 +524,17 @@ pub const Parser = struct {
                 },
             },
         );
+
+        // Attach JSDoc comment to the node
+        node.doc_comment = doc_comment;
+
+        return node;
     }
 
     fn parseFunctionDeclaration(self: *Parser, decorators: *std.ArrayList(*ast.Node)) !*ast.Node {
+        // Capture JSDoc comment before parsing (must be done first)
+        const doc_comment = self.consumeDocComment();
+
         const start_loc = self.current.loc;
         _ = decorators;
 
@@ -483,7 +580,7 @@ pub const Parser = struct {
         const type_params_slice = try self.arena.allocator().dupe(ast.types.GenericParam, type_params.items);
         const params_slice = try self.arena.allocator().dupe(ast.node.FunctionExpr.FunctionParam, params.items);
 
-        return try self.arena.createNode(
+        const node = try self.arena.createNode(
             .function_decl,
             self.mergeLoc(start_loc, self.previous.loc),
             .{
@@ -496,11 +593,20 @@ pub const Parser = struct {
                 },
             },
         );
+
+        // Attach JSDoc comment to the node
+        node.doc_comment = doc_comment;
+
+        return node;
     }
 
-    /// Parse macro declaration (Nim-style)
-    /// macro derive(ctx: MacroContext): void { ... }
+    /// Parse macro declaration
+    /// Syntax: macro function name(params) { ... }
+    /// Usage: name(args) - called like normal function
     fn parseMacroDeclaration(self: *Parser) !*ast.Node {
+        // Capture JSDoc comment before parsing (must be done first)
+        const doc_comment = self.consumeDocComment();
+
         const start_loc = self.current.loc;
 
         // Macro name
@@ -539,7 +645,7 @@ pub const Parser = struct {
         const type_params_slice = try self.arena.allocator().dupe(ast.types.GenericParam, type_params.items);
         const params_slice = try self.arena.allocator().dupe(ast.node.FunctionExpr.FunctionParam, params.items);
 
-        return try self.arena.createNode(
+        const node = try self.arena.createNode(
             .macro_decl,
             self.mergeLoc(start_loc, self.previous.loc),
             .{
@@ -552,9 +658,84 @@ pub const Parser = struct {
                 },
             },
         );
+
+        // Attach JSDoc comment to the node
+        node.doc_comment = doc_comment;
+
+        return node;
+    }
+
+    /// Parse extern declaration (extern macro @target(...): void;)
+    fn parseExternDeclaration(self: *Parser) !*ast.Node {
+        const doc_comment = self.consumeDocComment();
+        const start_loc = self.previous.loc; // 'extern' was already consumed
+
+        // Currently only 'extern macro' is supported
+        if (!self.check(.keyword_macro)) {
+            return self.reportError("Expected 'macro' after 'extern'");
+        }
+        self.advance(); // consume 'macro'
+
+        // Macro name must start with @
+        if (!self.check(.at_sign)) {
+            return self.reportError("Extern macro name must start with '@'");
+        }
+        self.advance(); // consume @
+
+        // Get the identifier
+        if (!self.check(.identifier)) {
+            return self.reportError("Expected macro name after '@'");
+        }
+        const name = self.current.text;
+        self.advance();
+
+        // Type parameters (e.g., <T>)
+        var type_params = std.ArrayList(ast.types.GenericParam).init(self.allocator);
+        defer type_params.deinit();
+        if (self.match(.less_than)) {
+            try self.parseTypeParameters(&type_params);
+        }
+
+        // Parameters
+        try self.consume(.left_paren, "Expected '(' after macro name");
+        var params = std.ArrayList(ast.node.FunctionExpr.FunctionParam).init(self.allocator);
+        defer params.deinit();
+        try self.parseParameters(&params);
+        try self.consume(.right_paren, "Expected ')' after parameters");
+
+        // Return type
+        var return_type: ?*ast.types.Type = null;
+        if (self.match(.colon)) {
+            return_type = try self.parseTypeReference();
+        }
+
+        // Extern macros must end with semicolon (no body)
+        try self.consume(.semicolon, "Expected ';' after extern macro declaration");
+
+        const type_params_slice = try self.arena.allocator().dupe(ast.types.GenericParam, type_params.items);
+        const params_slice = try self.arena.allocator().dupe(ast.node.FunctionExpr.FunctionParam, params.items);
+
+        const node = try self.arena.createNode(
+            .extern_macro_decl,
+            self.mergeLoc(start_loc, self.previous.loc),
+            .{
+                .extern_macro_decl = .{
+                    .name = name,
+                    .type_params = type_params_slice,
+                    .params = params_slice,
+                    .return_type = return_type,
+                },
+            },
+        );
+
+        node.doc_comment = doc_comment;
+        return node;
     }
 
     fn parseInterfaceDeclaration(self: *Parser) !*ast.Node {
+        // Capture JSDoc comment before parsing (must be done first)
+        const doc_comment = self.consumeDocComment();
+
         const start_loc = self.current.loc;
         try self.consume(.keyword_interface, "Expected 'interface'");
 
@@ -598,7 +779,7 @@ pub const Parser = struct {
         const extends_slice = try self.arena.allocator().dupe(*ast.types.Type, extends.items);
         const members_slice = try self.arena.allocator().dupe(*ast.Node, members.items);
 
-        return try self.arena.createNode(
+        const node = try self.arena.createNode(
             .interface_decl,
             self.mergeLoc(start_loc, self.previous.loc),
             .{
@@ -610,9 +791,17 @@ pub const Parser = struct {
                 },
             },
         );
+
+        // Attach JSDoc comment to the node
+        node.doc_comment = doc_comment;
+
+        return node;
     }
 
     fn parseInterfaceMember(self: *Parser) !*ast.Node {
+        // Capture JSDoc comment before parsing (for interface member)
+        const doc_comment = self.consumeDocComment();
+
         const start_loc = self.current.loc;
 
         // Method signature or property
@@ -628,7 +817,7 @@ pub const Parser = struct {
 
         // Method or property?
         if (self.check(.left_paren) or self.check(.less_than)) {
-            return self.parseMethod(start_loc, name);
+            return self.parseMethod(start_loc, name, doc_comment);
         }
 
         // Property signature
@@ -636,7 +825,7 @@ pub const Parser = struct {
         const prop_type = try self.parseTypeReference();
         _ = self.match(.semicolon);
 
-        return try self.arena.createNode(
+        const node = try self.arena.createNode(
             .property_decl,
             self.mergeLoc(start_loc, self.previous.loc),
             .{
@@ -648,9 +837,17 @@ pub const Parser = struct {
                 },
             },
         );
+
+        // Attach JSDoc comment to the node
+        node.doc_comment = doc_comment;
+
+        return node;
     }
 
     fn parseTypeAliasDeclaration(self: *Parser) !*ast.Node {
+        // Capture JSDoc comment before parsing (must be done first)
+        const doc_comment = self.consumeDocComment();
+
         const start_loc = self.current.loc;
         try self.consume(.keyword_type, "Expected 'type'");
 
@@ -673,7 +870,7 @@ pub const Parser = struct {
 
         const type_params_slice = try self.arena.allocator().dupe(ast.types.GenericParam, type_params.items);
 
-        return try self.arena.createNode(
+        const node = try self.arena.createNode(
             .type_alias_decl,
             self.mergeLoc(start_loc, self.previous.loc),
             .{
@@ -684,9 +881,18 @@ pub const Parser = struct {
                 },
             },
         );
+
+        // Attach JSDoc comment to the node
+        node.doc_comment = doc_comment;
+
+        return node;
     }
 
     fn parseEnumDeclaration(self: *Parser) !*ast.Node {
+        // Capture JSDoc comment before parsing (must be done first)
+        const doc_comment = self.consumeDocComment();
+        _ = doc_comment; // TODO: Implement enum nodes with doc_comment support
+
         const start_loc = self.current.loc;
         try self.consume(.keyword_enum, "Expected 'enum'");
 
@@ -729,6 +935,9 @@ pub const Parser = struct {
     }
 
     fn parseVariableDeclaration(self: *Parser) !*ast.Node {
+        // Capture JSDoc comment before parsing (must be done first)
+        const doc_comment = self.consumeDocComment();
+
         const start_loc = self.current.loc;
 
         const kind: ast.node.VariableStmt.VariableKind = if (self.match(.keyword_const))
@@ -755,7 +964,7 @@ pub const Parser = struct {
 
         const decls_slice = try self.arena.allocator().dupe(ast.node.VariableStmt.VariableDeclarator, declarations.items);
 
-        return try self.arena.createNode(
+        const node = try self.arena.createNode(
             .variable_stmt,
             self.mergeLoc(start_loc, self.previous.loc),
             .{
@@ -765,6 +974,11 @@ pub const Parser = struct {
                 },
             },
         );
+
+        // Attach JSDoc comment to the node
+        node.doc_comment = doc_comment;
+
+        return node;
     }
 
     fn parseVariableDeclarator(self: *Parser) !ast.node.VariableStmt.VariableDeclarator {
@@ -875,7 +1089,7 @@ pub const Parser = struct {
             declaration = try self.parseExpression();
             _ = self.match(.semicolon);
         } else if (self.match(.left_brace)) {
-            // Named exports
+            // Named exports: export { x, y } or export { x, y } from "module"
             while (!self.check(.right_brace) and !self.check(.end_of_file)) {
                 if (!self.check(.identifier)) {
                     return self.reportError("Expected export name");
@@ -897,7 +1111,32 @@ pub const Parser = struct {
                 if (!self.match(.comma)) break;
             }
             try self.consume(.right_brace, "Expected '}' after export specifiers");
+
+            // Check for re-export: export { x } from "module"
+            var source: ?[]const u8 = null;
+            if (self.match(.keyword_from)) {
+                if (!self.check(.string)) {
+                    return self.reportError("Expected module path after 'from'");
+                }
+                source = self.current.text;
+                self.advance();
+            }
+
             _ = self.match(.semicolon);
+
+            const specs_slice = try self.arena.allocator().dupe(ast.node.ExportDecl.ExportSpecifier, specifiers.items);
+
+            return try self.arena.createNode(
+                .export_decl,
+                self.mergeLoc(start_loc, self.previous.loc),
+                .{
+                    .export_decl = .{
+                        .declaration = null,
+                        .specifiers = specs_slice,
+                        .source = source,
+                    },
+                },
+            );
         } else {
             // export declaration
             var empty_decorators = std.ArrayList(*ast.Node).init(self.allocator);
@@ -915,6 +1154,14 @@ pub const Parser = struct {
                 declaration = try self.parseTypeAliasDeclaration();
             } else if (self.check(.keyword_enum)) {
                 declaration = try self.parseEnumDeclaration();
+            } else if (self.check(.keyword_macro)) {
+                self.advance(); // consume 'macro'
+                // Expect 'function' keyword after 'macro'
+                if (!self.check(.keyword_function)) {
+                    return self.reportError("Expected 'function' after 'macro'");
+                }
+                self.advance(); // consume 'function'
+                declaration = try self.parseMacroDeclaration();
             } else {
                 return self.reportError("Expected declaration after 'export'");
             }
@@ -929,6 +1176,7 @@ pub const Parser = struct {
                 .export_decl = .{
                     .declaration = declaration,
                     .specifiers = specs_slice,
+                    .source = null,
                 },
             },
         );
@@ -1032,6 +1280,9 @@ pub const Parser = struct {
         while (!self.check(.right_brace) and !self.check(.end_of_file)) {
             if (self.check(.keyword_const) or self.check(.keyword_let) or self.check(.keyword_var)) {
                 try statements.append(try self.parseVariableDeclaration());
+            } else if (self.checkMacro()) {
+                // Handle macro invocations like target("c") { ... } or emit("code")
+                try statements.append(try self.parseMacroStatement());
             } else {
                 try statements.append(try self.parseStatement());
             }
@@ -2052,6 +2303,9 @@ pub const Parser = struct {
 
     fn parseParameters(self: *Parser, params: *std.ArrayList(ast.node.FunctionExpr.FunctionParam)) !void {
         while (!self.check(.right_paren) and !self.check(.end_of_file)) {
+            // Check for rest parameter (...name)
+            const rest = self.match(.dot_dot_dot);
+
             // Parameter name
             if (!self.check(.identifier)) {
                 return self.reportError("Expected parameter name");
@@ -2079,6 +2333,7 @@ pub const Parser = struct {
                 .type = param_type,
                 .optional = optional,
                 .default_value = default_value,
+                .rest = rest,
             });
 
             if (!self.match(.comma)) break;
@@ -2100,6 +2355,13 @@ pub const Parser = struct {
             // Skip newlines (not significant in most contexts)
             if (self.current.kind == .newline) continue;
 
+            // Capture JSDoc comments for attachment to following declarations
+            // Store the most recent doc comment; it will be consumed when attached to a node
+            if (self.current.kind == .doc_comment) {
+                self.pending_doc_comment = self.current.text;
+                continue;
+            }
+
             // Skip syntax errors but record them
             if (self.current.kind == .syntax_error) {
                 self.errors.append(.{
@@ -2114,13 +2376,32 @@ pub const Parser = struct {
         }
     }
 
+    /// Consume the pending doc comment and return it (for attaching to a declaration node)
+    /// Returns null if no doc comment was pending
+    fn consumeDocComment(self: *Parser) ?[]const u8 {
+        const doc = self.pending_doc_comment;
+        self.pending_doc_comment = null;
+        return doc;
+    }
+
     fn check(self: *Parser, kind: TokenKind) bool {
         return self.current.kind == kind;
     }
 
-    fn checkMacro(self: *Parser) bool {
-        // All macros now start with @ sign
+    /// Check if current position is a system macro (requires @ prefix)
+    /// System macros: @target, @emit, @extern, @comptime, @inline
+    /// These are always available without import.
+    ///
+    /// User macros (derive, serialize, etc.) don't use @ and are resolved
+    /// via symbol table after import.
+    fn checkSystemMacro(self: *Parser) bool {
         return self.current.kind == .at_sign;
+    }
+
+    /// Check if current token starts a system macro invocation
+    /// Used for decorator position (before class/function)
+    fn checkMacro(self: *Parser) bool {
+        return self.checkSystemMacro();
     }
 
     /// Peek at the next token and check if it's an identifier with the given name
@@ -2378,4 +2659,85 @@ test "parse call expression" {
     const expr = stmt.data.expression_stmt;
     try std.testing.expectEqual(ast.NodeKind.call_expr, expr.kind);
     try std.testing.expectEqual(@as(usize, 3), expr.data.call_expr.arguments.len);
+}
+
+test "parser: JSDoc comment attached to function" {
+    const allocator = std.testing.allocator;
+    var arena = ast.ASTArena.init(allocator);
+    defer arena.deinit();
+
+    const source =
+        \\/** This is a test function */
+        \\function foo() {}
+    ;
+
+    const file_id = try arena.addFile("test.ms");
+    var lexer = try Lexer.init(allocator, source, file_id);
+    defer lexer.deinit();
+    var parser = Parser.init(allocator, &arena, &lexer, file_id);
+    defer parser.deinit();
+
+    const program = try parser.parse();
+    try std.testing.expectEqual(@as(usize, 1), program.data.program.statements.len);
+
+    const func = program.data.program.statements[0];
+    try std.testing.expectEqual(ast.NodeKind.function_decl, func.kind);
+
+    // JSDoc should be attached
+    try std.testing.expect(func.doc_comment != null);
+    try std.testing.expect(std.mem.indexOf(u8, func.doc_comment.?, "test function") != null);
+}
+
+test "parser: JSDoc comment attached to class" {
+    const allocator = std.testing.allocator;
+    var arena = ast.ASTArena.init(allocator);
+    defer arena.deinit();
+
+    const source =
+        \\/** User class documentation */
+        \\class User {}
+    ;
+
+    const file_id = try arena.addFile("test.ms");
+    var lexer = try Lexer.init(allocator, source, file_id);
+    defer lexer.deinit();
+    var parser = Parser.init(allocator, &arena, &lexer, file_id);
+    defer parser.deinit();
+
+    const program = try parser.parse();
+    try std.testing.expectEqual(@as(usize, 1), program.data.program.statements.len);
+
+    const class = program.data.program.statements[0];
+    try std.testing.expectEqual(ast.NodeKind.class_decl, class.kind);
+
+    // JSDoc should be attached
+    try std.testing.expect(class.doc_comment != null);
+    try std.testing.expect(std.mem.indexOf(u8, class.doc_comment.?, "User class") != null);
+}
+
+test "parser: JSDoc comment attached to variable" {
+    const allocator = std.testing.allocator;
+    var arena = ast.ASTArena.init(allocator);
+    defer arena.deinit();
+
+    const source =
+        \\/** Important constant */
+        \\const MAX_SIZE = 100;
+    ;
+
+    const file_id = try arena.addFile("test.ms");
+    var lexer = try Lexer.init(allocator, source, file_id);
+    defer lexer.deinit();
+    var parser = Parser.init(allocator, &arena, &lexer, file_id);
+    defer parser.deinit();
+
+    const program = try parser.parse();
+    try std.testing.expectEqual(@as(usize, 1), program.data.program.statements.len);
+
+    const var_stmt = program.data.program.statements[0];
+    try std.testing.expectEqual(ast.NodeKind.variable_stmt, var_stmt.kind);
+
+    // JSDoc should be attached
+    try std.testing.expect(var_stmt.doc_comment != null);
+    try std.testing.expect(std.mem.indexOf(u8, var_stmt.doc_comment.?, "Important constant") != null);
 }

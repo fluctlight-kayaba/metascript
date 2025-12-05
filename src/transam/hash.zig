@@ -151,6 +151,7 @@ pub fn hashAstNodeInto(hasher: *std.hash.Wyhash, node: *const ast.Node) void {
             for (mi.arguments) |arg| {
                 switch (arg) {
                     .identifier => |id| hasher.update(id),
+                    .string_literal => |s| hasher.update(s),
                     .expression => |expr| hashAstNodeInto(hasher, expr),
                     .type => {}, // Type hashing not implemented yet
                 }

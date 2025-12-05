@@ -325,6 +325,96 @@ test "parser: parses @macro function definition" {
     try testing.expectEqualStrings("log", stmt.data.macro_decl.name);
 }
 
+test "parser: parses @extern system macro in function body" {
+    var arena = ast_mod.ASTArena.init(testing.allocator);
+    defer arena.deinit();
+
+    const program = try parseWithArena(&arena, fixtures.MACRO_EXTERN);
+
+    // Should have export -> function with macro invocation in body
+    try testing.expect(program.data.program.statements.len >= 1);
+    const stmt = program.data.program.statements[0];
+    try testing.expectEqual(NodeKind.export_decl, stmt.kind);
+}
+
+test "parser: parses @target block with @emit inside" {
+    var arena = ast_mod.ASTArena.init(testing.allocator);
+    defer arena.deinit();
+
+    const program = try parseWithArena(&arena, fixtures.MACRO_TARGET_BLOCK);
+
+    // Should parse export macro declaration
+    try testing.expect(program.data.program.statements.len >= 1);
+    const stmt = program.data.program.statements[0];
+    try testing.expectEqual(NodeKind.export_decl, stmt.kind);
+
+    // The export should contain a macro_decl
+    if (stmt.data.export_decl.declaration) |decl| {
+        try testing.expectEqual(NodeKind.macro_decl, decl.kind);
+        try testing.expectEqualStrings("readFile", decl.data.macro_decl.name);
+    }
+}
+
+test "parser: parses @emit system macro" {
+    var arena = ast_mod.ASTArena.init(testing.allocator);
+    defer arena.deinit();
+
+    const program = try parseWithArena(&arena, fixtures.MACRO_EMIT);
+
+    try testing.expect(program.data.program.statements.len >= 1);
+    const stmt = program.data.program.statements[0];
+    try testing.expectEqual(NodeKind.export_decl, stmt.kind);
+}
+
+test "parser: parses export macro declaration" {
+    var arena = ast_mod.ASTArena.init(testing.allocator);
+    defer arena.deinit();
+
+    const program = try parseWithArena(&arena, fixtures.MACRO_EXPORT);
+
+    try testing.expect(program.data.program.statements.len >= 1);
+    const stmt = program.data.program.statements[0];
+    try testing.expectEqual(NodeKind.export_decl, stmt.kind);
+
+    if (stmt.data.export_decl.declaration) |decl| {
+        try testing.expectEqual(NodeKind.macro_decl, decl.kind);
+        try testing.expectEqualStrings("validate", decl.data.macro_decl.name);
+    }
+}
+
+test "parser: macro string argument has quotes stripped" {
+    var arena = ast_mod.ASTArena.init(testing.allocator);
+    defer arena.deinit();
+
+    // Parse: @target("c") { }
+    const program = try parseWithArena(&arena,
+        \\function test() {
+        \\    @target("c") {
+        \\    }
+        \\}
+    );
+
+    try testing.expect(program.data.program.statements.len >= 1);
+    const func = program.data.program.statements[0];
+    try testing.expectEqual(NodeKind.function_decl, func.kind);
+
+    // Get the function body
+    const body = func.data.function_decl.body orelse unreachable;
+    try testing.expectEqual(NodeKind.block_stmt, body.kind);
+
+    // First statement should be macro invocation
+    const macro_stmt = body.data.block_stmt.statements[0];
+    try testing.expectEqual(NodeKind.macro_invocation, macro_stmt.kind);
+
+    // Verify macro name is "target"
+    try testing.expectEqualStrings("target", macro_stmt.data.macro_invocation.name);
+
+    // Verify argument is "c" not "\"c\""
+    const args = macro_stmt.data.macro_invocation.arguments;
+    try testing.expectEqual(@as(usize, 1), args.len);
+    try testing.expectEqualStrings("c", args[0].string_literal);
+}
+
 // ============================================================================
 // Error Handling Tests
 // ============================================================================

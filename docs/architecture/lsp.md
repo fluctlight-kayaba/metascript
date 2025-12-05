@@ -189,6 +189,8 @@ User edits → Return STALE (0ms) → Background: re-expand → Update
 
 ## Implementation Status
 
+### Infrastructure (Done)
+
 | Feature | Status |
 |---------|--------|
 | Trans-Am query engine | Done |
@@ -199,9 +201,131 @@ User edits → Return STALE (0ms) → Background: re-expand → Update
 | Type cache integration | Done |
 | Completion cache | Done |
 | Background worker | Done |
-| **TypeChecker on expanded AST** | Partial |
-| **Completions from expanded** | Partial |
-| **Go-to-definition for generated** | TODO |
+
+### LSP Features
+
+| Feature | Status | Priority | Notes |
+|---------|--------|----------|-------|
+| Hover | Done | - | Keywords, types, macro preview |
+| Completion (keywords) | Done | - | Static keyword list |
+| **Completion (dot/member)** | TODO | Critical | `obj.` shows properties/methods |
+| Go-to Definition | Done | - | Source symbols |
+| **Go-to Definition (generated)** | TODO | Medium | Navigate to macro-generated code |
+| Document Symbols | Done | - | Lexer-based outline |
+| Semantic Tokens | Done | - | Syntax highlighting |
+| Diagnostics | Done | - | Parse + type errors |
+| **Signature Help** | TODO | High | Parameter hints on `foo(|)` |
+| **Find References** | TODO | Medium | All usages of symbol |
+| **Rename Symbol** | TODO | Medium | Safe multi-file rename |
+| **Inlay Hints** | TODO | Medium | Inline type annotations |
+| **Code Actions** | TODO | Medium | Quick fixes, refactorings |
+| **Workspace Symbols** | TODO | Medium | Project-wide symbol search |
+| **Formatting** | TODO | Low | Code formatting |
+| **Folding Ranges** | TODO | Low | Code folding |
+| **Document Highlights** | TODO | Low | Highlight occurrences |
+
+### Macro Integration
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| TypeChecker on expanded AST | Partial | Needs verification |
+| Completions from expanded AST | Partial | Dot completion missing |
+| Hover shows macro origin | Partial | Preview works, `expansion_origin` not on AST |
+| `expansion_origin` on AST nodes | TODO | Required for proper error messages |
+
+---
+
+## TODO: Feature Implementation Details
+
+### Phase 1: Critical Path (Maximum Impact)
+
+#### 1. Dot/Member Completion
+**Priority:** Critical
+**Impact:** #1 most-used IDE feature
+
+```typescript
+const user = new User();
+user.|  // Should show: name, equals() (from @derive), etc.
+```
+
+**Implementation:**
+- Detect cursor after `.` token
+- Get expression type before dot via Trans-Am
+- Query symbol table for members of that type
+- Include macro-generated members from expanded AST
+
+#### 2. Signature Help
+**Priority:** High
+**Impact:** Reduces cognitive load, fewer doc lookups
+
+```typescript
+Math.pow(|)  // Should show: (x: number, y: number): number
+```
+
+**Implementation:**
+- Detect cursor inside function call `(`
+- Find function being called
+- Return parameter names and types
+
+---
+
+### Phase 2: Refactoring Support
+
+#### 3. Find References
+**Priority:** Medium
+**Impact:** Essential for refactoring
+
+**Implementation:**
+- Scan all open files for symbol usage
+- Use symbol table for scope-aware matching
+- Handle macro-generated references
+
+#### 4. Rename Symbol
+**Priority:** Medium
+**Impact:** Major refactoring capability
+
+**Implementation:**
+- Find all references (above)
+- Apply edits atomically
+- Handle macro-generated code (warn user)
+
+---
+
+### Phase 3: Developer Experience Polish
+
+#### 5. Inlay Hints
+**Priority:** Medium
+**Impact:** TypeScript developers expect this
+
+```typescript
+const x = 42;  // Shows: `: number` inline
+```
+
+#### 6. Code Actions
+**Priority:** Medium
+**Impact:** Quick fixes and refactorings
+
+- "Add missing import"
+- "Generate equals/hashCode"
+- "Convert to arrow function"
+
+#### 7. Workspace Symbols
+**Priority:** Medium
+**Impact:** Project-wide navigation (`Ctrl+T`)
+
+---
+
+## Technical Debt
+
+| Issue | Impact | Status | Notes |
+|-------|--------|--------|-------|
+| Re-lexing on every request | Low | Deferred | Lexer is fast (<5ms), Trans-Am caches syntax tokens |
+| No AST caching for completion | Low | Deferred | Parse cache exists, completion uses it |
+| Completion ignores position context | High | TODO | Blocks dot completion - needs expression type inference |
+| Document symbols uses lexer | Medium | Deferred | Works correctly, AST would add hierarchy support |
+| Hardcoded Math/console hover | Low | Deferred | Needs stdlib type definitions |
+
+**Analysis:** The "re-lexing" items are low priority because lexing is very fast. The critical gap is **position context for completion** which blocks the dot/member completion feature.
 
 ---
 

@@ -189,6 +189,10 @@ pub const RcOp = struct {
     /// Optional comment for debug mode
     comment: ?[]const u8 = null,
 
+    /// Type name for typed decref (e.g., "MyClass" for ms_decref_typed(obj, &MyClass_type))
+    /// Only set for decref_cycle_check operations on class instances
+    type_name: ?[]const u8 = null,
+
     pub const Kind = enum {
         /// RC = 1 (new allocation)
         init,
@@ -258,6 +262,10 @@ pub const Variable = struct {
 
     /// Current ownership state
     ownership_state: OwnershipState = .owned,
+
+    /// Type name for class instances (e.g., "MyClass")
+    /// Used for generating ms_decref_typed() calls with correct TypeInfo
+    type_name: ?[]const u8 = null,
 
     pub const OwnershipState = enum {
         owned,      // We own it, must decref
@@ -458,6 +466,7 @@ pub const Drc = struct {
                             .column = end_column,
                             .position = .before,
                             .reason = .scope_exit,
+                            .type_name = v.type_name,
                         });
                         self.stats.decrefs += 1;
                     }
@@ -525,6 +534,7 @@ pub const Drc = struct {
                             .position = .before,
                             .reason = .scope_exit,
                             .comment = if (self.config.debug_mode) "// DRC: early return cleanup" else null,
+                            .type_name = vptr.type_name,
                         });
                         self.stats.decrefs += 1;
 
@@ -578,6 +588,7 @@ pub const Drc = struct {
                             .position = .before,
                             .reason = .scope_exit,
                             .comment = if (self.config.debug_mode) "// DRC: break cleanup" else null,
+                            .type_name = vptr.type_name,
                         });
                         self.stats.decrefs += 1;
                         // Mark as moved to prevent duplicate cleanup at scope exit
@@ -614,6 +625,7 @@ pub const Drc = struct {
                             .position = .before,
                             .reason = .scope_exit,
                             .comment = if (self.config.debug_mode) "// DRC: continue cleanup" else null,
+                            .type_name = vptr.type_name,
                         });
                         self.stats.decrefs += 1;
                         // Mark as moved to prevent duplicate cleanup at scope exit
@@ -686,6 +698,7 @@ pub const Drc = struct {
     // ========================================================================
 
     /// Register a new variable
+    /// type_name is optional - when provided for class instances, enables ms_decref_typed() emission
     pub fn registerVariable(
         self: *Drc,
         name: []const u8,
@@ -693,6 +706,19 @@ pub const Drc = struct {
         line: u32,
         column: u32,
         is_parameter: bool,
+    ) !void {
+        return self.registerVariableWithType(name, type_kind, line, column, is_parameter, null);
+    }
+
+    /// Register a new variable with optional type name (for class instances)
+    pub fn registerVariableWithType(
+        self: *Drc,
+        name: []const u8,
+        type_kind: ownership.TypeKind,
+        line: u32,
+        column: u32,
+        is_parameter: bool,
+        type_name: ?[]const u8,
     ) !void {
         const needs_rc = type_kind.needsRc();
         const current_scope_depth: u32 = @intCast(self.scope_stack.items.len);
@@ -725,6 +751,7 @@ pub const Drc = struct {
             .is_module_level = is_module_level,
             .initialized = is_parameter, // Parameters are initialized by caller
             .ownership_state = if (is_parameter) .borrowed else .owned,
+            .type_name = type_name,
         };
 
         try self.variables.put(name, variable);

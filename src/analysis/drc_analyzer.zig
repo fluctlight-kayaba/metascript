@@ -105,12 +105,18 @@ pub const DrcAnalyzer = struct {
             var is_copy_from_var = false;
             var source_var_name: ?[]const u8 = null;
             var creates_allocation = false;
+            var class_name: ?[]const u8 = null;
 
             if (decl.init) |init_expr| {
                 if (init_expr.kind == .new_expr) {
                     // new expressions create object types
                     type_kind = .object;
                     creates_allocation = true;
+                    // Extract class name from new expression: new MyClass() -> "MyClass"
+                    const new_expr = &init_expr.data.new_expr;
+                    if (new_expr.callee.kind == .identifier) {
+                        class_name = new_expr.callee.data.identifier;
+                    }
                 } else if (init_expr.kind == .string_literal) {
                     // String literals are INTERNED - they don't need RC!
                     // The interned string pool manages them statically with infinite lifetime.
@@ -158,13 +164,14 @@ pub const DrcAnalyzer = struct {
                 try self.drc.registerAllocation(decl.name, line, col);
             }
 
-            // Register the variable
-            try self.drc.registerVariable(
+            // Register the variable with optional type name for class instances
+            try self.drc.registerVariableWithType(
                 decl.name,
                 type_kind,
                 line,
                 col,
                 false, // not a parameter
+                class_name, // type name for ms_decref_typed()
             );
 
             // If this is a variable copy, register the incref

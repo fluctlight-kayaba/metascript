@@ -257,11 +257,22 @@ pub const CGenerator = struct {
                 try self.emit(");\n");
             },
             .decref_cycle_check => {
-                // Use ms_decref which handles cycle detection internally
+                // Emit typed decref for cycle detection if type info is available
                 try self.emitIndent();
-                try self.emit("ms_decref(");
-                try self.emit(op.target);
-                try self.emit(");\n");
+                if (op.type_name) |type_name| {
+                    // Use ms_decref_typed for objects that may participate in cycles
+                    // This enables Bacon-Rajan cycle collection via ORC runtime
+                    try self.emit("ms_decref_typed(");
+                    try self.emit(op.target);
+                    try self.emit(", &");
+                    try self.emit(type_name);
+                    try self.emit("_type);\n");
+                } else {
+                    // Fall back to simple decref if no type info available
+                    try self.emit("ms_decref(");
+                    try self.emit(op.target);
+                    try self.emit(");\n");
+                }
             },
             .decref_reassign => {
                 // Reassignment decref: save old value before assignment, decref after
@@ -402,6 +413,10 @@ pub const CGenerator = struct {
                 }
             }
 
+            // Collect any remaining cycles before exit
+            try self.emitIndent();
+            try self.emit("ms_collect_cycles();\n");
+
             // Return 0
             try self.emitIndent();
             try self.emit("return 0;\n");
@@ -425,8 +440,14 @@ pub const CGenerator = struct {
         var modules_in_order = std.ArrayList(*module_loader.Module).init(self.allocator);
         defer modules_in_order.deinit();
 
-        // Get entry module
-        const entry_module = loader.modules.get(entry_module_path) orelse {
+        // Normalize path to resolve symlinks (e.g., /tmp -> /private/tmp on macOS)
+        // This matches how ModuleLoader stores paths
+        const normalized_path = std.fs.cwd().realpathAlloc(self.allocator, entry_module_path) catch entry_module_path;
+        defer if (normalized_path.ptr != entry_module_path.ptr) self.allocator.free(normalized_path);
+
+        // Get entry module - try normalized path first, then original
+        const entry_module = loader.modules.get(normalized_path) orelse
+            loader.modules.get(entry_module_path) orelse {
             return error.EntryModuleNotFound;
         };
 
@@ -622,6 +643,10 @@ pub const CGenerator = struct {
                     try self.emitNode(stmt);
                 }
             }
+
+            // Collect any remaining cycles before exit
+            try self.emitIndent();
+            try self.emit("ms_collect_cycles();\n");
 
             try self.emitIndent();
             try self.emit("return 0;\n");
@@ -1752,7 +1777,7 @@ pub const CGenerator = struct {
         if (func.body) |body| {
             try self.emit(" ");
             if (body.kind == .block_stmt) {
-                try self.emitFunctionBlockStmt(body);
+                try self.emitFunctionBlockStmtWithMain(body, is_main);
             } else {
                 // Single expression body - wrap in block with return
                 try self.emit("{\n");
@@ -1950,6 +1975,12 @@ pub const CGenerator = struct {
 
     /// Emit function body block statement (with StringBuilder cleanup before exit)
     fn emitFunctionBlockStmt(self: *Self, node: *ast.Node) !void {
+        try self.emitFunctionBlockStmtWithMain(node, false);
+    }
+
+    /// Emit function body block statement with optional main() handling
+    /// For main(), adds ms_collect_cycles() and return 0 before closing brace
+    fn emitFunctionBlockStmtWithMain(self: *Self, node: *ast.Node, is_main: bool) !void {
         const block = &node.data.block_stmt;
         const block_start_line = node.location.start.line;
 
@@ -2006,6 +2037,14 @@ pub const CGenerator = struct {
             // 1. Build final strings (already done inline via ms_sb_build)
             // 2. Free StringBuilder buffers
             try self.emitStringBuilderCleanup();
+        }
+
+        // For main(), add cycle collection and return 0
+        if (is_main and !ends_with_control_flow) {
+            try self.emitIndent();
+            try self.emit("ms_collect_cycles();\n");
+            try self.emitIndent();
+            try self.emit("return 0;\n");
         }
 
         self.indent_level -= 1;

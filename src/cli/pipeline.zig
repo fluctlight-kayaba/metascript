@@ -51,7 +51,7 @@ pub fn run(allocator: std.mem.Allocator, path: []const u8) !void {
 
     // Stage 2: Register with Trans-Am (Input Layer)
     printStage("[2/6] Registering with Trans-Am...", .{}, .running);
-    _ = try db.setFileText(path, source);
+    _ = try transam.input_queries.setFileText(&db, path, source);
     const revision = db.getRevision();
     printStage("[2/6] Trans-Am revision: {d}", .{revision.value}, .success);
 
@@ -85,7 +85,7 @@ pub fn run(allocator: std.mem.Allocator, path: []const u8) !void {
 
     // Stage 4: Extract macro call sites
     printStage("[4/6] Finding macro invocations...", .{}, .running);
-    const macro_sites = db.getMacroCallSites(path) catch |err| {
+    const macro_sites = transam.macro_queries.getMacroCallSites(&db, path) catch |err| {
         printStage("[4/6] Macro extraction failed: {s}", .{@errorName(err)}, .failed);
         return;
     };

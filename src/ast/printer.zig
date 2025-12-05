@@ -326,6 +326,7 @@ pub const Printer = struct {
             .bit_xor => "^",
             .shl => "<<",
             .shr => ">>",
+            .nullish_coalesce => "??",
         };
         try self.write(op_str);
         try self.write(" ");

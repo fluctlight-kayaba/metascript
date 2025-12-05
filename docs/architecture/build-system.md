@@ -2,7 +2,54 @@
 
 Declarative build configuration via `build.ms`, inspired by **Vite** and **webpack**.
 
-**Status: Design Document** - Implementation pending.
+---
+
+## Implementation Status
+
+> **Last Updated:** 2025-12-06
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| **Core Infrastructure** | | |
+| `msc build` CLI | ✅ Implemented | `src/cli/build.zig` |
+| `build.ms` loader | ✅ Implemented | `src/build/loader.zig` - JS object → JSON parsing |
+| Config schema | ✅ Implemented | `src/build/config.zig` - Full type definitions |
+| CLI argument parsing | ✅ Implemented | `--target`, `--mode`, `--watch`, `--minify`, `--sourcemap` |
+| **Transforms** | | |
+| Transform pipeline | ✅ Implemented | `src/transform/pipeline.zig` - 900 lines |
+| Topological sort | ✅ Implemented | Kahn's algorithm with cycle detection |
+| `varHoist()` | ✅ Implemented | `src/transform/builtin/var_hoist.zig` - 8 tests |
+| `nullishCoalesce()` | ✅ Implemented | `src/transform/builtin/nullish_coalesce.zig` - 9 tests |
+| `optionalChain()` | 🚧 Placeholder | Parser needs `?.` support first |
+| `decoratorDesugar()` | ❌ Not started | |
+| `asyncTransform()` | ❌ Not started | |
+| Custom transforms | 🚧 Partial | Infrastructure ready, external loading pending |
+| **Module Resolution** | | |
+| `resolve.alias` | ✅ Implemented | Config parsing ready |
+| `resolve.extensions` | ✅ Implemented | `.ms`, `.ts`, `.js` defaults |
+| `resolve.nodeCompat` | ✅ Implemented | Config flag ready |
+| **Define** | | |
+| Compile-time constants | ✅ Implemented | Config parsing ready |
+| `.env` file loading | ❌ Not started | `loadEnv()` function |
+| **Dev Server** | | |
+| `msc dev` command | ❌ Not started | |
+| File watching | 🚧 Skeleton | `--watch` flag parsed, logic pending |
+| HMR | ❌ Not started | |
+| **Testing** | | |
+| `msc test` command | ❌ Not started | |
+| Coverage | ❌ Not started | |
+| **Multi-target** | | |
+| `build.targets[]` | ✅ Implemented | Config + iteration logic |
+
+### Test Coverage
+
+| Component | Tests | Coverage |
+|-----------|-------|----------|
+| `pipeline.zig` | 8 | ~80% |
+| `var_hoist.zig` | 8 | ~85% |
+| `nullish_coalesce.zig` | 9 | ~85% |
+| `config.zig` | 4 | ~70% |
+| **Total** | **29** | **~80%** |
 
 ---
 
@@ -11,7 +58,7 @@ Declarative build configuration via `build.ms`, inspired by **Vite** and **webpa
 Metascript targets TypeScript/JavaScript developers. The build system should feel **instantly familiar** - like Vite, webpack, or esbuild configs they already know and love.
 
 | Approach | Example | Target Audience |
-|----------|---------|-----------------|
+|----------|---------|--------------------|
 | Zig-style | `b.addExecutable({...})` | Systems programmers |
 | **Vite-style** | `export default { build: {...} }` | **Web developers** ✓ |
 
@@ -86,11 +133,11 @@ export default defineConfig({
     // =========================================================================
 
     transforms: [
-        // Built-in transforms
-        varHoist(),                          // JS-compatible var hoisting
-        optionalChain(),                     // a?.b → safe access
-        nullishCoalesce(),                   // a ?? b → null check
-        decoratorDesugar({ legacy: true }),  // @decorator → function call
+        // Built-in transforms (✅ = implemented, 🚧 = in progress)
+        varHoist(),                          // ✅ JS-compatible var hoisting
+        nullishCoalesce(),                   // ✅ a ?? b → null check
+        optionalChain(),                     // 🚧 a?.b → safe access (placeholder)
+        decoratorDesugar({ legacy: true }),  // ❌ @decorator → function call
 
         // Custom inline transform
         {
@@ -143,7 +190,7 @@ export default defineConfig({
     },
 
     // =========================================================================
-    // Dev Server (like Vite!)
+    // Dev Server (like Vite!) - NOT YET IMPLEMENTED
     // =========================================================================
 
     server: {
@@ -167,7 +214,7 @@ export default defineConfig({
     },
 
     // =========================================================================
-    // Test (like Vitest!)
+    // Test (like Vitest!) - NOT YET IMPLEMENTED
     // =========================================================================
 
     test: {
@@ -204,86 +251,44 @@ export default defineConfig({
 
 ---
 
-## Environment-aware Config (like Vite!)
-
-```typescript
-// build.ms
-import { defineConfig, loadEnv } from "std/build";
-
-export default defineConfig(({ command, mode }) => {
-    // Load .env files based on mode
-    const env = loadEnv(mode, process.cwd());
-
-    const isDev = mode === "development";
-    const isProd = mode === "production";
-
-    return {
-        root: "src/main.ms",
-
-        define: {
-            __DEV__: isDev.toString(),
-            __API_URL__: JSON.stringify(env.API_URL),
-            __VERSION__: JSON.stringify(env.npm_package_version),
-        },
-
-        build: {
-            target: isProd ? "native" : "js",
-            minify: isProd,
-            sourcemap: isDev,
-            optimize: isProd ? "release" : "debug",
-        },
-
-        server: isDev ? {
-            port: parseInt(env.PORT) || 3000,
-            open: true,
-        } : undefined,
-    };
-});
-```
-
-### Environment Files
+## CLI Commands
 
 ```bash
-.env                # Loaded in all cases
-.env.local          # Loaded in all cases, ignored by git
-.env.development    # Loaded in development mode
-.env.production     # Loaded in production mode
-.env.[mode].local   # Local overrides for specific mode
-```
+# Build (✅ IMPLEMENTED)
+msc build                        # Production build
+msc build --target=js            # Override target
+msc build --mode=production      # Set mode
+msc build --watch                # Watch mode (skeleton only)
+msc build --minify               # Enable minification
+msc build --no-minify            # Disable minification
+msc build --sourcemap            # Enable source maps
+msc build --verbose              # Verbose output
 
----
+# Compile (✅ IMPLEMENTED - legacy command)
+msc compile main.ms              # Direct compilation
+msc compile --target=c main.ms   # C backend
+msc compile --target=js main.ms  # JS backend
 
-## CLI Commands (Vite-style!)
-
-```bash
-# Development
+# Development (❌ NOT IMPLEMENTED)
 msc dev                          # Start dev server
 msc dev --port 3000              # Custom port
 msc dev --host 0.0.0.0           # Expose to network
 msc dev --open                   # Open browser
 
-# Build
-msc build                        # Production build
-msc build --target=js            # Override target
-msc build --mode=staging         # Use .env.staging
-msc build --watch                # Watch mode
-msc build --minify=false         # Disable minification
-
-# Preview (serve production build)
+# Preview (❌ NOT IMPLEMENTED)
 msc preview                      # Preview at localhost:4173
 msc preview --port 8080
 
-# Test (like Vitest!)
+# Test (❌ NOT IMPLEMENTED)
 msc test                         # Run tests once
 msc test --watch                 # Watch mode
 msc test --coverage              # With coverage
 msc test --filter="auth"         # Filter by name
 msc test --parallel=false        # Sequential
 
-# Other
+# Other (✅ IMPLEMENTED)
 msc check                        # Type check only
-msc lint                         # Lint files
-msc format                       # Format files
+msc lsp                          # Start LSP server
 ```
 
 ---
@@ -295,16 +300,15 @@ msc format                       # Format files
 ```typescript
 import {
     varHoist,
-    optionalChain,
     nullishCoalesce,
-    decoratorDesugar,
-    asyncTransform,
+    optionalChain,      // 🚧 placeholder
+    decoratorDesugar,   // ❌ not implemented
+    asyncTransform,     // ❌ not implemented
 } from "std/transforms";
 
 export default {
     transforms: [
         varHoist(),
-        optionalChain(),
         nullishCoalesce(),
     ],
 };
@@ -312,9 +316,19 @@ export default {
 
 ### Transform Details
 
-#### `varHoist()`
+#### `varHoist()` - ✅ IMPLEMENTED
 
 JavaScript-compatible `var` hoisting for TypeScript compatibility.
+
+**Implementation:** `src/transform/builtin/var_hoist.zig` (784 lines, 8 tests)
+
+**Features:**
+- Hoists `var` declarations to function scope top
+- Deduplicates multiple declarations of same variable
+- Preserves `let`/`const` declarations unchanged
+- Handles nested blocks, if/while/for statements
+- Respects function scope boundaries (nested functions have own scope)
+- Converts `for (var i = 0; ...)` initializers correctly
 
 ```typescript
 // Input
@@ -329,10 +343,10 @@ function example() {
 
 // Output (after transform)
 function example() {
-    var x = undefined;
-    var y = undefined;
+    var x;           // hoisted declaration (deduplicated)
+    var y;           // hoisted declaration
     console.log(x);
-    x = 5;
+    x = 5;           // assignment stays in place
     if (true) {
         y = 10;
     }
@@ -340,335 +354,175 @@ function example() {
 }
 ```
 
-#### `optionalChain()`
+#### `nullishCoalesce()` - ✅ IMPLEMENTED
 
-Transform optional chaining to safe access.
+Transform nullish coalescing operator for backends that don't support it natively.
 
-```typescript
-// Input
-const name = user?.profile?.name;
-const first = arr?.[0];
-const result = obj?.method?.();
+**Implementation:** `src/transform/builtin/nullish_coalesce.zig` (412 lines, 9 tests)
 
-// Output
-const name = user != null
-    ? (user.profile != null ? user.profile.name : undefined)
-    : undefined;
-```
+**Features:**
+- Transforms `a ?? b` to conditional expression
+- Detects "simple" expressions (identifiers, literals, member access)
+- Avoids triple evaluation for simple expressions
+- Deep clones AST nodes to prevent aliasing bugs
 
-#### `nullishCoalesce()`
-
-Transform nullish coalescing operator.
+**Known Limitation:** Complex expressions (function calls) may be evaluated multiple times. IIFE wrapper not yet implemented.
 
 ```typescript
 // Input
 const value = input ?? defaultValue;
 
-// Output
-const value = input != null ? input : defaultValue;
+// Output (simple case)
+const value = input !== null && input !== undefined ? input : defaultValue;
+
+// For complex expressions (TODO: implement IIFE wrapper)
+// getValue() ?? "default"
+// Currently evaluates getValue() up to 3 times!
 ```
 
-#### `decoratorDesugar(options?)`
+#### `optionalChain()` - 🚧 PLACEHOLDER
+
+Transform optional chaining to safe null checks.
+
+**Implementation:** `src/transform/builtin/optional_chain.zig` (73 lines, placeholder)
+
+**Status:** Parser needs to support `?.` syntax first. Transform infrastructure is ready.
+
+```typescript
+// Input (when parser supports ?.)
+const name = user?.profile?.name;
+const first = arr?.[0];
+const result = obj?.method?.();
+
+// Output (planned)
+const name = user != null
+    ? (user.profile != null ? user.profile.name : undefined)
+    : undefined;
+```
+
+#### `decoratorDesugar(options?)` - ❌ NOT IMPLEMENTED
 
 Transform decorators to function calls.
 
-```typescript
-// Options
-decoratorDesugar({
-    legacy: true,    // Use legacy decorator semantics
-})
-
-// Input
-@logged
-@memoize({ maxSize: 100 })
-class Calculator {
-    @bound
-    add(a: number, b: number) {
-        return a + b;
-    }
-}
-
-// Output
-class Calculator {
-    add(a: number, b: number) {
-        return a + b;
-    }
-}
-Calculator.prototype.add = bound(Calculator.prototype.add);
-Calculator = memoize({ maxSize: 100 })(logged(Calculator));
-```
-
-#### `asyncTransform()`
+#### `asyncTransform()` - ❌ NOT IMPLEMENTED
 
 Transform async/await to state machine (for C backend).
 
-```typescript
-// Input
-async function fetchData() {
-    const response = await fetch(url);
-    const data = await response.json();
-    return data;
-}
-
-// Output (state machine for C backend)
-// ... generates continuation-passing style code
-```
-
 ---
 
-## Custom Transforms
+## Transform Pipeline Architecture
 
-### Inline Transform
+**Implementation:** `src/transform/pipeline.zig` (900 lines, 8 tests)
 
-```typescript
-export default {
-    transforms: [
-        {
-            name: "add-debug-logs",
+### Pipeline Structure
 
-            visitor: {
-                FunctionDeclaration(node, ctx) {
-                    // Add console.log at function entry
-                    const logStatement = ctx.createNode("ExpressionStatement", {
-                        expression: ctx.createNode("CallExpression", {
-                            callee: ctx.createNode("MemberExpression", {
-                                object: ctx.createNode("Identifier", { name: "console" }),
-                                property: ctx.createNode("Identifier", { name: "log" }),
-                            }),
-                            arguments: [
-                                ctx.createNode("StringLiteral", {
-                                    value: `Entering ${node.name}`
-                                }),
-                            ],
-                        }),
-                    });
-
-                    node.body.statements.unshift(logStatement);
-                    return node;
-                },
-            },
-        },
-    ],
-};
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      Transform Pipeline                          │
+├─────────────────────────────────────────────────────────────────┤
+│  Pipeline                                                        │
+│  ├── transforms: ArrayList(Transform)                           │
+│  ├── builtin_registry: StringHashMap(TransformFn)               │
+│  └── sortTransforms() → Kahn's algorithm (topological sort)     │
+├─────────────────────────────────────────────────────────────────┤
+│  TransformContext                                                │
+│  ├── arena: *ASTArena (for creating new nodes)                  │
+│  ├── allocator: Allocator (for temp work)                       │
+│  ├── file_path: []const u8                                      │
+│  ├── options: ?std.json.Value (from build.ms)                   │
+│  ├── stats: Stats { nodes_visited, nodes_transformed, ... }     │
+│  └── cloneNode() → deep clone for safe transformations          │
+├─────────────────────────────────────────────────────────────────┤
+│  walkAndTransform()                                              │
+│  └── Visits 30+ node types:                                      │
+│      program, block_stmt, function_decl, function_expr,         │
+│      if_stmt, while_stmt, for_stmt, binary_expr, unary_expr,    │
+│      call_expr, member_expr, return_stmt, expression_stmt,      │
+│      variable_stmt, array_expr, object_expr, conditional_expr,  │
+│      class_decl, method_decl, constructor_decl, new_expr,       │
+│      spread_element, move_expr, import_decl, export_decl,       │
+│      property_decl, macro_decl, macro_invocation,               │
+│      comptime_block, quote_expr, and leaf nodes                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### External Transform Module
+### Dependency Resolution
 
-```typescript
-// transforms/strip-console.ms
-import { defineTransform } from "std/transforms";
-
-export default defineTransform({
-    name: "strip-console",
-
-    // Optional: run ordering
-    runAfter: ["var_hoist"],
-    runBefore: ["minify"],
-
-    visitor: {
-        CallExpression(node, ctx) {
-            // Remove console.* calls
-            if (node.callee.type === "MemberExpression" &&
-                node.callee.object.name === "console") {
-                return ctx.remove();
-            }
-            return node;
-        },
-    },
-});
-
-// build.ms
-import stripConsole from "./transforms/strip-console.ms";
-
-export default {
-    transforms: [
-        stripConsole(),
-    ],
-};
-```
-
-### Transform Context API
-
-```typescript
-interface TransformContext {
-    /** Current file path */
-    readonly filePath: string;
-
-    /** Create a new AST node */
-    createNode(type: string, props: object): Node;
-
-    /** Clone existing node */
-    clone(node: Node): Node;
-
-    /** Mark node for removal */
-    remove(): RemoveResult;
-
-    /** Replace with multiple nodes */
-    expand(nodes: Node[]): ExpandResult;
-
-    /** Report warning (continues) */
-    warn(message: string): void;
-
-    /** Report error (stops file) */
-    error(message: string): void;
-
-    /** Get parent node */
-    parent(): Node | null;
-
-    /** Check if inside specific node type */
-    isInside(type: string): boolean;
-
-    /** Store metadata for other transforms */
-    setMeta(key: string, value: any): void;
-
-    /** Get metadata from other transforms */
-    getMeta(key: string): any;
-}
-```
-
----
-
-## Multi-target Builds
+Transforms can specify ordering constraints:
 
 ```typescript
 // build.ms
-import { defineConfig } from "std/build";
-
-export default defineConfig({
-    root: "src/main.ms",
-
-    build: {
-        // Build for multiple targets
-        targets: [
-            {
-                target: "native",
-                outDir: "dist/native",
-                optimize: "release",
-            },
-            {
-                target: "js",
-                outDir: "dist/js",
-                minify: true,
-                rollupOptions: {
-                    output: [
-                        { format: "esm", dir: "dist/js/esm" },
-                        { format: "cjs", dir: "dist/js/cjs" },
-                    ],
-                },
-            },
-            {
-                target: "erlang",
-                outDir: "dist/beam",
-                otpApp: "myapp",
-            },
-        ],
+transforms: [
+    {
+        name: "my-transform",
+        runAfter: ["var_hoist"],      // Run after var_hoist
+        runBefore: ["nullish_coalesce"], // Run before nullish_coalesce
     },
-});
+]
+```
+
+**Algorithm:** Kahn's topological sort with O(V+E) complexity and cycle detection.
+
+```zig
+// From pipeline.zig:227-334
+pub fn sortTransforms(self: *Pipeline) !void {
+    // Build adjacency list from run_after/run_before constraints
+    // Run Kahn's algorithm (BFS from nodes with in_degree = 0)
+    // Detect cycles: if sorted_indices.len != n, cycle exists
+}
+```
+
+### Deep Clone Implementation
+
+The `cloneNode()` function provides safe deep copying:
+
+```zig
+// Supported node types for deep clone:
+.number_literal, .string_literal, .boolean_literal,
+.null_literal, .identifier,
+.binary_expr, .unary_expr, .member_expr,
+.call_expr, .conditional_expr
+
+// Other types fall back to shallow copy (TODO: expand)
 ```
 
 ---
 
-## Monorepo Support
+## Build Configuration Schema
 
-```typescript
-// build.ms (workspace root)
-import { defineConfig } from "std/build";
+**Implementation:** `src/build/config.zig` (468 lines, 4 tests)
 
-export default defineConfig({
-    // Workspace packages
-    workspace: [
-        "packages/*",
-        "apps/*",
-    ],
+```zig
+pub const BuildConfig = struct {
+    root: []const u8,                    // Entry point
+    build: BuildSection,                 // Build options
+    transforms: []const TransformConfig, // Transform plugins
+    resolve: ResolveSection,             // Module resolution
+    define: StringHashMap([]const u8),   // Compile-time constants
+    server: ServerSection,               // Dev server (not implemented)
+    test_config: TestSection,            // Testing (not implemented)
+    workspace: []const []const u8,       // Monorepo packages
+};
 
-    // Shared configuration for all packages
-    shared: {
-        resolve: {
-            alias: {
-                "@myorg/shared": "./packages/shared/src",
-                "@myorg/utils": "./packages/utils/src",
-            },
-        },
-        transforms: [
-            varHoist(),
-            optionalChain(),
-        ],
-    },
-});
+pub const BuildSection = struct {
+    target: Target = .native,            // native | js | erlang | wasm
+    out_dir: []const u8 = "dist",
+    out_file: ?[]const u8 = null,
+    optimize: Optimize = .debug,         // debug | release | release-small | release-safe
+    minify: bool = false,
+    sourcemap: bool = false,
+    targets: []const TargetConfig = &.{}, // Multi-target support
+    rollup_outputs: []const RollupOutput = &.{},
+};
 
-// packages/web/build.ms
-import { defineConfig } from "std/build";
-
-export default defineConfig({
-    root: "src/index.ms",
-
-    build: {
-        target: "js",
-        outDir: "dist",
-    },
-
-    // Package-specific overrides
-    resolve: {
-        alias: {
-            "@": "./src",
-        },
-    },
-});
-```
-
----
-
-## API Reference
-
-### `defineConfig(config)`
-
-Type-safe configuration helper with IntelliSense support.
-
-```typescript
-import { defineConfig } from "std/build";
-
-// Static config
-export default defineConfig({
-    root: "src/main.ms",
-});
-
-// Dynamic config
-export default defineConfig(({ command, mode }) => ({
-    root: "src/main.ms",
-    build: {
-        minify: mode === "production",
-    },
-}));
-```
-
-### `loadEnv(mode, root, prefix?)`
-
-Load environment variables from `.env` files.
-
-```typescript
-import { loadEnv } from "std/build";
-
-const env = loadEnv("production", process.cwd());
-// env.API_URL, env.DATABASE_URL, etc.
-
-// With prefix filter (like Vite's VITE_ prefix)
-const publicEnv = loadEnv("production", process.cwd(), "PUBLIC_");
-// Only variables starting with PUBLIC_
-```
-
-### `mergeConfig(base, override)`
-
-Deep merge two configurations.
-
-```typescript
-import { defineConfig, mergeConfig } from "std/build";
-import baseConfig from "./build.base.ms";
-
-export default mergeConfig(baseConfig, {
-    build: {
-        minify: true,
-    },
-});
+pub const TransformConfig = struct {
+    name: []const u8,
+    builtin: bool = true,
+    path: ?[]const u8 = null,            // For external transforms
+    run_after: []const []const u8 = &.{},
+    run_before: []const []const u8 = &.{},
+    options: ?std.json.Value = null,
+};
 ```
 
 ---
@@ -678,85 +532,28 @@ export default mergeConfig(baseConfig, {
 `build.ms` runs on Hermes VM. For now, write JavaScript directly:
 
 ```
-Phase 0 (Now):     build.ms is JavaScript → Hermes runs directly
-Phase 1 (Soon):    build.ms is Metascript → msc compiles to .js → Hermes runs
-Phase 2 (Future):  build.ms → .js → .hbc (bytecode) → Hermes (fastest)
+Phase 0 (Current):  build.ms is JavaScript → Simple parser extracts config
+Phase 1 (Soon):     build.ms is JavaScript → Hermes runs directly
+Phase 2 (Future):   build.ms is Metascript → msc compiles to .js → Hermes runs
+Phase 3 (Later):    build.ms → .js → .hbc (bytecode) → Hermes (fastest)
 ```
 
-### How It Works
+### Current Loader Implementation
 
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  build.ms   │ ──► │   Hermes    │ ──► │ Build Config│
-│ (JS for now)│     │   Runtime   │     │   Object    │
-└─────────────┘     └─────────────┘     └─────────────┘
-                                               │
-                                               ▼
-                                        ┌─────────────┐
-                                        │ msc compile │
-                                        │  pipeline   │
-                                        └─────────────┘
-```
+**File:** `src/build/loader.zig`
 
----
+```zig
+pub fn loadBuildMs(allocator, build_ms_path, cli_options) !BuildConfig {
+    // 1. Read build.ms file
+    // 2. Try simple JS object literal parsing (no Hermes needed)
+    // 3. Fall back to Hermes execution if complex
+    // 4. Parse JSON output into BuildConfig
+}
 
-## Configuration Schema
-
-```typescript
-interface UserConfig {
-    /** Entry point file */
-    root: string;
-
-    /** Build options */
-    build?: {
-        target?: "native" | "js" | "erlang" | "wasm";
-        outDir?: string;
-        outFile?: string;
-        minify?: boolean;
-        sourcemap?: boolean | "inline" | "hidden";
-        optimize?: "debug" | "release" | "release-small";
-        rollupOptions?: RollupOptions;
-        targets?: BuildTarget[];
-    };
-
-    /** Transform plugins */
-    transforms?: Transform[];
-
-    /** Module resolution */
-    resolve?: {
-        alias?: Record<string, string>;
-        extensions?: string[];
-        mainFields?: string[];
-        nodeCompat?: boolean;
-    };
-
-    /** Compile-time constants */
-    define?: Record<string, string>;
-
-    /** Dev server options */
-    server?: {
-        port?: number;
-        host?: string;
-        open?: boolean;
-        watch?: WatchOptions;
-        hmr?: boolean | HmrOptions;
-    };
-
-    /** Test options */
-    test?: {
-        include?: string[];
-        exclude?: string[];
-        parallel?: boolean;
-        timeout?: number;
-        setupFiles?: string[];
-        coverage?: CoverageOptions;
-    };
-
-    /** Workspace packages (monorepo) */
-    workspace?: string[];
-
-    /** Shared config for workspace */
-    shared?: Partial<UserConfig>;
+fn tryParseSimpleConfig(allocator, source, options) !BuildConfig {
+    // Find "export default { ... }"
+    // Convert JS object literal to JSON (handle unquoted keys, single quotes)
+    // Parse JSON into BuildConfig
 }
 ```
 
@@ -764,30 +561,55 @@ interface UserConfig {
 
 ## Implementation Plan
 
-### Phase 1: Core (Week 1-2)
-- [ ] `msc build` CLI command
-- [ ] `build.ms` loader via Hermes
-- [ ] Basic config parsing (root, build.target, build.outDir)
-- [ ] Integration with existing compile pipeline
+### Phase 1: Core - ✅ COMPLETE
+- [x] `msc build` CLI command
+- [x] `build.ms` loader (simple parser)
+- [x] Basic config parsing (root, build.target, build.outDir)
+- [x] Integration with compile pipeline
 
-### Phase 2: Transforms (Week 3-4)
-- [ ] Transform pipeline infrastructure
-- [ ] `varHoist()` transform
-- [ ] `optionalChain()` transform
-- [ ] `nullishCoalesce()` transform
-- [ ] Custom transform support
+### Phase 2: Transforms - ✅ MOSTLY COMPLETE
+- [x] Transform pipeline infrastructure
+- [x] Topological sort with cycle detection
+- [x] Deep clone for AST nodes
+- [x] `varHoist()` transform (8 tests)
+- [x] `nullishCoalesce()` transform (9 tests)
+- [ ] `optionalChain()` transform (needs parser support)
+- [ ] Custom external transform loading
 
-### Phase 3: Resolution & Define (Week 5-6)
-- [ ] `resolve.alias` implementation
-- [ ] `resolve.extensions` implementation
-- [ ] `define` compile-time constants
+### Phase 3: Resolution & Define - 🚧 PARTIAL
+- [x] `resolve.alias` config parsing
+- [x] `resolve.extensions` config parsing
+- [x] `define` config parsing
+- [ ] Actually apply aliases during module resolution
+- [ ] Actually replace defined constants during compilation
 - [ ] `loadEnv()` function
 
-### Phase 4: Dev Experience (Week 7-8)
+### Phase 4: Dev Experience - ❌ NOT STARTED
 - [ ] `msc dev` command
-- [ ] File watching
+- [ ] File watching implementation
 - [ ] `msc test` command
 - [ ] Coverage reporting
+- [ ] HMR
+
+---
+
+## File Structure
+
+```
+src/
+├── build/
+│   ├── config.zig      # BuildConfig schema + JSON parsing (468 lines)
+│   └── loader.zig      # build.ms loading + JS→JSON conversion (200+ lines)
+├── transform/
+│   ├── pipeline.zig    # Transform pipeline + walker (900 lines)
+│   └── builtin/
+│       ├── var_hoist.zig        # Var hoisting (784 lines)
+│       ├── nullish_coalesce.zig # ?? operator (412 lines)
+│       └── optional_chain.zig   # ?. operator (73 lines, placeholder)
+└── cli/
+    ├── build.zig       # `msc build` command (150+ lines)
+    └── compile.zig     # `msc compile` command (748 lines)
+```
 
 ---
 
@@ -795,12 +617,32 @@ interface UserConfig {
 
 | Feature | Vite | webpack | esbuild | **Metascript** |
 |---------|------|---------|---------|----------------|
-| Config style | Declarative | Declarative | Declarative | **Declarative** |
-| HMR | ✓ | ✓ | ✗ | Planned |
-| Transforms | Plugins | Loaders | Plugins | **Transforms** |
-| TypeScript | ✓ | Via loader | ✓ | **Native** |
-| Multi-target | ✗ | ✗ | ✗ | **✓ (C/JS/Erlang)** |
-| Zero-config | ✓ | ✗ | ✓ | **✓** |
+| Config style | Declarative | Declarative | Declarative | **Declarative** ✅ |
+| HMR | ✓ | ✓ | ✗ | ❌ Not yet |
+| Transforms | Plugins | Loaders | Plugins | **Transforms** ✅ |
+| TypeScript | ✓ | Via loader | ✓ | **Native** ✅ |
+| Multi-target | ✗ | ✗ | ✗ | **✓ (C/JS/Erlang)** ✅ |
+| Zero-config | ✓ | ✗ | ✓ | **✓** ✅ |
+| Transform dependencies | ✗ | ✗ | ✗ | **✓ (topological sort)** ✅ |
+
+---
+
+## Known Issues & TODOs
+
+### High Priority
+1. **IIFE wrapper for nullish_coalesce** - Complex expressions evaluated multiple times
+2. **Optional chain parser support** - Need `?.` token and AST node
+
+### Medium Priority
+3. **Deep clone expansion** - Add array_expr, object_expr, function_expr
+4. **External transform loading** - Load transforms from file paths
+5. **Actually apply resolve.alias** - Currently only parsed, not used
+6. **Actually replace define constants** - Currently only parsed, not used
+
+### Low Priority
+7. **Full Hermes integration** - Currently using simple JS parser
+8. **Dev server** - `msc dev` with file watching and HMR
+9. **Test runner** - `msc test` with coverage
 
 ---
 

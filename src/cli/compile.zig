@@ -12,6 +12,8 @@ const vm_expander = @import("../macro/vm_expander.zig");
 const normalize = @import("../macro/normalize.zig");
 const colors = @import("colors.zig");
 const module_loader = @import("../module/loader.zig");
+const transform_pipeline = @import("../transform/pipeline.zig");
+const build_config = @import("../build/config.zig");
 
 // DRC (Deferred Reference Counting) analysis - optional, disabled by default
 const Drc = @import("../analysis/drc.zig").Drc;
@@ -27,16 +29,54 @@ pub fn run(allocator: std.mem.Allocator, input_file: []const u8) !void {
     return runWithArgs(allocator, input_file, .js, null, true);
 }
 
+/// Run compilation with build config (includes transforms)
+pub fn runWithBuildConfig(
+    allocator: std.mem.Allocator,
+    input_file: []const u8,
+    target: Backend,
+    output_path: ?[]const u8,
+    enable_normalize: bool,
+    cfg: *const build_config.BuildConfig,
+) !void {
+    return compileInternal(allocator, input_file, target, output_path, enable_normalize, cfg);
+}
+
 pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target: Backend, output_path: ?[]const u8, enable_normalize: bool) !void {
+    return compileInternal(allocator, input_file, target, output_path, enable_normalize, null);
+}
+
+/// Internal compilation implementation - unified pipeline with optional transforms
+fn compileInternal(
+    allocator: std.mem.Allocator,
+    input_file: []const u8,
+    target: Backend,
+    output_path: ?[]const u8,
+    enable_normalize: bool,
+    cfg: ?*const build_config.BuildConfig,
+) !void {
+    const has_transforms = cfg != null and cfg.?.transforms.len > 0;
+    const total_phases: u8 = if (has_transforms) 6 else 5;
     const start_time = std.time.milliTimestamp();
+
+    // Phase numbering helper
+    var current_phase: u8 = 0;
+    const nextPhase = struct {
+        fn next(phase: *u8) u8 {
+            phase.* += 1;
+            return phase.*;
+        }
+    }.next;
 
     // Initialize Trans-Am database (same engine as LSP!)
     var db = try transam.TransAmDatabase.init(allocator);
     defer db.deinit();
 
     // Phase 1: Load and parse file
-    std.debug.print("{s}[1/5]{s} Parsing {s}...\n", .{
+    const phase1 = nextPhase(&current_phase);
+    std.debug.print("{s}[{d}/{d}]{s} Parsing {s}...\n", .{
         colors.info.code(),
+        phase1,
+        total_phases,
         colors.Color.reset.code(),
         input_file,
     });
@@ -53,10 +93,10 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
     defer allocator.free(source);
 
     // Register with Trans-Am and parse
-    _ = try db.setFileText(input_file, source);
+    _ = try transam.input_queries.setFileText(&db, input_file, source);
 
     // Check for parse errors via Trans-Am
-    const diagnostics = db.getDiagnostics(input_file) catch |err| {
+    const diagnostics = transam.diagnostics_mod.getDiagnostics(&db, input_file) catch |err| {
         std.debug.print("{s}error:{s} Analysis failed: {s}\n", .{
             colors.error_color.code(),
             colors.Color.reset.code(),
@@ -72,8 +112,10 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
     }
 
     if (diagnostics.len > 0) {
-        std.debug.print("{s}[1/5]{s} Parsing {s}failed{s}\n", .{
+        std.debug.print("{s}[{d}/{d}]{s} Parsing {s}failed{s}\n", .{
             colors.error_color.code(),
+            phase1,
+            total_phases,
             colors.Color.reset.code(),
             colors.Color.bright_red.code(),
             colors.Color.reset.code(),
@@ -82,16 +124,21 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
         return;
     }
 
-    std.debug.print("{s}[1/5]{s} Parsed {s}✓{s}\n", .{
+    std.debug.print("{s}[{d}/{d}]{s} Parsed {s}✓{s}\n", .{
         colors.success.code(),
+        phase1,
+        total_phases,
         colors.Color.reset.code(),
         colors.Color.bright_green.code(),
         colors.Color.reset.code(),
     });
 
     // Phase 2: Get AST and expand macros
-    std.debug.print("{s}[2/5]{s} Expanding macros...\n", .{
+    const phase2 = nextPhase(&current_phase);
+    std.debug.print("{s}[{d}/{d}]{s} Expanding macros...\n", .{
         colors.info.code(),
+        phase2,
+        total_phases,
         colors.Color.reset.code(),
     });
 
@@ -117,8 +164,10 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
 
     // Load standard library macros (@derive, etc.)
     loader.loadStdMacros() catch |err| {
-        std.debug.print("{s}[2/5]{s} Standard macros {s}warning{s}: {s} (continuing without std macros)\n", .{
+        std.debug.print("{s}[{d}/{d}]{s} Standard macros {s}warning{s}: {s} (continuing without std macros)\n", .{
             colors.warning.code(),
+            phase2,
+            total_phases,
             colors.Color.reset.code(),
             colors.Color.bright_yellow.code(),
             colors.Color.reset.code(),
@@ -129,8 +178,10 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
 
     // Load the entry module (this triggers loading of all imported dependencies)
     _ = loader.loadModule(input_file) catch |err| {
-        std.debug.print("{s}[2/5]{s} Module loading {s}warning{s}: {s} (continuing with parsed AST)\n", .{
+        std.debug.print("{s}[{d}/{d}]{s} Module loading {s}warning{s}: {s} (continuing with parsed AST)\n", .{
             colors.warning.code(),
+            phase2,
+            total_phases,
             colors.Color.reset.code(),
             colors.Color.bright_yellow.code(),
             colors.Color.reset.code(),
@@ -151,8 +202,10 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
             bytecode_cache,
             null, // network cache not used in CLI compile
         ) catch |err| {
-            std.debug.print("{s}[2/5]{s} Macro expansion {s}warning{s}: {s}\n", .{
+            std.debug.print("{s}[{d}/{d}]{s} Macro expansion {s}warning{s}: {s}\n", .{
                 colors.warning.code(),
+                phase2,
+                total_phases,
                 colors.Color.reset.code(),
                 colors.Color.bright_yellow.code(),
                 colors.Color.reset.code(),
@@ -164,16 +217,110 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
         break :blk expanded;
     };
 
-    std.debug.print("{s}[2/5]{s} Macros expanded {s}✓{s}\n", .{
+    std.debug.print("{s}[{d}/{d}]{s} Macros expanded {s}✓{s}\n", .{
         colors.success.code(),
+        phase2,
+        total_phases,
         colors.Color.reset.code(),
         colors.Color.bright_green.code(),
         colors.Color.reset.code(),
     });
 
+    // Phase 2.5: Transform Pipeline (optional - runs if transforms configured)
+    const transformed_ast = if (has_transforms) transform_blk: {
+        const phase_transform = nextPhase(&current_phase);
+        std.debug.print("{s}[{d}/{d}]{s} Running transforms...\n", .{
+            colors.info.code(),
+            phase_transform,
+            total_phases,
+            colors.Color.reset.code(),
+        });
+
+        var pipeline = transform_pipeline.Pipeline.init(allocator);
+        defer pipeline.deinit();
+
+        // Load transforms from build config
+        pipeline.loadFromBuildConfig(cfg.?) catch |err| {
+            std.debug.print("{s}[{d}/{d}]{s} Transform loading {s}warning{s}: {s}\n", .{
+                colors.warning.code(),
+                phase_transform,
+                total_phases,
+                colors.Color.reset.code(),
+                colors.Color.bright_yellow.code(),
+                colors.Color.reset.code(),
+                @errorName(err),
+            });
+        };
+
+        // Sort transforms by dependencies
+        pipeline.sortTransforms() catch |err| {
+            std.debug.print("{s}[{d}/{d}]{s} Transform sort {s}warning{s}: {s}\n", .{
+                colors.warning.code(),
+                phase_transform,
+                total_phases,
+                colors.Color.reset.code(),
+                colors.Color.bright_yellow.code(),
+                colors.Color.reset.code(),
+                @errorName(err),
+            });
+            break :transform_blk program_ast;
+        };
+
+        if (pipeline.count() > 0) {
+            const result = pipeline.run(parse_result.arena, allocator, program_ast, input_file) catch |err| {
+                std.debug.print("{s}[{d}/{d}]{s} Transform {s}warning{s}: {s}\n", .{
+                    colors.warning.code(),
+                    phase_transform,
+                    total_phases,
+                    colors.Color.reset.code(),
+                    colors.Color.bright_yellow.code(),
+                    colors.Color.reset.code(),
+                    @errorName(err),
+                });
+                break :transform_blk program_ast;
+            };
+
+            if (result.changed) {
+                std.debug.print("{s}[{d}/{d}]{s} Transforms applied {s}✓{s} ({d} transforms)\n", .{
+                    colors.success.code(),
+                    phase_transform,
+                    total_phases,
+                    colors.Color.reset.code(),
+                    colors.Color.bright_green.code(),
+                    colors.Color.reset.code(),
+                    result.transform_count,
+                });
+            } else {
+                std.debug.print("{s}[{d}/{d}]{s} No transforms needed {s}✓{s}\n", .{
+                    colors.success.code(),
+                    phase_transform,
+                    total_phases,
+                    colors.Color.reset.code(),
+                    colors.Color.bright_green.code(),
+                    colors.Color.reset.code(),
+                });
+            }
+
+            break :transform_blk result.node;
+        } else {
+            std.debug.print("{s}[{d}/{d}]{s} No transforms configured {s}✓{s}\n", .{
+                colors.dim_text.code(),
+                phase_transform,
+                total_phases,
+                colors.Color.reset.code(),
+                colors.Color.bright_green.code(),
+                colors.Color.reset.code(),
+            });
+            break :transform_blk program_ast;
+        }
+    } else program_ast;
+
     // Phase 3: Type checking
-    std.debug.print("{s}[3/5]{s} Type checking...\n", .{
+    const phase3 = nextPhase(&current_phase);
+    std.debug.print("{s}[{d}/{d}]{s} Type checking...\n", .{
         colors.info.code(),
+        phase3,
+        total_phases,
         colors.Color.reset.code(),
     });
 
@@ -192,7 +339,7 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
     type_checker.setModuleLoader(&loader);
     type_checker.setCurrentModulePath(input_file);
 
-    const type_check_ok = type_checker.check(program_ast) catch |err| {
+    const type_check_ok = type_checker.check(transformed_ast) catch |err| {
         std.debug.print("{s}error:{s} Type checking failed: {s}\n", .{
             colors.error_color.code(),
             colors.Color.reset.code(),
@@ -202,8 +349,10 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
     };
 
     if (!type_check_ok) {
-        std.debug.print("{s}[3/5]{s} Type checking {s}failed{s}\n", .{
+        std.debug.print("{s}[{d}/{d}]{s} Type checking {s}failed{s}\n", .{
             colors.error_color.code(),
+            phase3,
+            total_phases,
             colors.Color.reset.code(),
             colors.Color.bright_red.code(),
             colors.Color.reset.code(),
@@ -225,41 +374,25 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
         }
         // Continue anyway for now - type errors shouldn't block codegen
     } else {
-        std.debug.print("{s}[3/5]{s} Type checked {s}✓{s}\n", .{
+        std.debug.print("{s}[{d}/{d}]{s} Type checked {s}✓{s}\n", .{
             colors.success.code(),
+            phase3,
+            total_phases,
             colors.Color.reset.code(),
             colors.Color.bright_green.code(),
             colors.Color.reset.code(),
         });
     }
 
-    // Phase 3.5: AST Normalization (after type checking so we have type info!)
+    // AST Normalization (integrated into type checking phase - no separate phase number)
     const final_ast = if (enable_normalize and type_check_ok) blk: {
-        std.debug.print("{s}[3.5/5]{s} Normalizing AST...\n", .{
-            colors.info.code(),
-            colors.Color.reset.code(),
-        });
-
         var normalize_ctx = normalize.NormalizeContext.init(parse_result.arena, allocator, &type_checker);
-        const normalized_ast = normalize.normalizeAST(&normalize_ctx, program_ast) catch |err| {
-            std.debug.print("{s}[3.5/5]{s} Normalization {s}warning{s}: {s}\n", .{
-                colors.warning.code(),
-                colors.Color.reset.code(),
-                colors.Color.bright_yellow.code(),
-                colors.Color.reset.code(),
-                @errorName(err),
-            });
+        const normalized_ast = normalize.normalizeAST(&normalize_ctx, transformed_ast) catch {
             // Continue with unnormalized AST (normalization is optimization, not required)
-            std.debug.print("{s}[3.5/5]{s} Normalization skipped {s}⚠{s}\n", .{
-                colors.warning.code(),
-                colors.Color.reset.code(),
-                colors.Color.bright_yellow.code(),
-                colors.Color.reset.code(),
-            });
-            break :blk program_ast;
+            break :blk transformed_ast;
         };
 
-        // Print normalization stats
+        // Print normalization stats if any
         if (normalize_ctx.stats.object_spreads_normalized > 0 or
             normalize_ctx.stats.array_chains_fused > 0 or
             normalize_ctx.stats.closures_inlined > 0)
@@ -279,33 +412,19 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
             }
             std.debug.print("\n", .{});
         }
-
-        std.debug.print("{s}[3.5/5]{s} Normalized {s}✓{s}\n", .{
-            colors.success.code(),
-            colors.Color.reset.code(),
-            colors.Color.bright_green.code(),
-            colors.Color.reset.code(),
-        });
         break :blk normalized_ast;
-    } else blk: {
-        if (!enable_normalize) {
-            std.debug.print("{s}[3.5/5]{s} Normalization {s}disabled{s} (--no-normalize)\n", .{
-                colors.dim_text.code(),
-                colors.Color.reset.code(),
-                colors.Color.bright_yellow.code(),
-                colors.Color.reset.code(),
-            });
-        }
-        break :blk program_ast;
-    };
+    } else transformed_ast;
 
     // Phase 4: DRC analysis (for C backend)
+    const phase4 = nextPhase(&current_phase);
     var drc: ?*Drc = null;
     var drc_storage: Drc = undefined;
 
     if (target == .c) {
-        std.debug.print("{s}[4/5]{s} Running DRC analysis...\n", .{
+        std.debug.print("{s}[{d}/{d}]{s} Running DRC analysis...\n", .{
             colors.info.code(),
+            phase4,
+            total_phases,
             colors.Color.reset.code(),
         });
 
@@ -319,8 +438,10 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
 
         var analyzer = DrcAnalyzer.init(drc.?);
         analyzer.analyze(final_ast) catch |err| {
-            std.debug.print("{s}[4/5]{s} DRC analysis {s}warning{s}: {s}\n", .{
+            std.debug.print("{s}[{d}/{d}]{s} DRC analysis {s}warning{s}: {s}\n", .{
                 colors.warning.code(),
+                phase4,
+                total_phases,
                 colors.Color.reset.code(),
                 colors.Color.bright_yellow.code(),
                 colors.Color.reset.code(),
@@ -332,8 +453,10 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
 
         if (drc != null) {
             drc.?.finalize() catch |err| {
-                std.debug.print("{s}[4/5]{s} DRC finalize {s}warning{s}: {s}\n", .{
+                std.debug.print("{s}[{d}/{d}]{s} DRC finalize {s}warning{s}: {s}\n", .{
                     colors.warning.code(),
+                    phase4,
+                    total_phases,
                     colors.Color.reset.code(),
                     colors.Color.bright_yellow.code(),
                     colors.Color.reset.code(),
@@ -346,8 +469,10 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
 
         if (drc != null) {
             const stats = drc.?.getStats();
-            std.debug.print("{s}[4/5]{s} DRC analyzed {s}✓{s} ({d} vars, {d} RC ops, {d:.0}% elided)\n", .{
+            std.debug.print("{s}[{d}/{d}]{s} DRC analyzed {s}✓{s} ({d} vars, {d} RC ops, {d:.0}% elided)\n", .{
                 colors.success.code(),
+                phase4,
+                total_phases,
                 colors.Color.reset.code(),
                 colors.Color.bright_green.code(),
                 colors.Color.reset.code(),
@@ -357,13 +482,17 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
             });
         }
     } else {
-        std.debug.print("{s}[4/5]{s} Preparing codegen...\n", .{
+        std.debug.print("{s}[{d}/{d}]{s} Preparing codegen...\n", .{
             colors.info.code(),
+            phase4,
+            total_phases,
             colors.Color.reset.code(),
         });
 
-        std.debug.print("{s}[4/5]{s} Ready {s}✓{s}\n", .{
+        std.debug.print("{s}[{d}/{d}]{s} Ready {s}✓{s}\n", .{
             colors.success.code(),
+            phase4,
+            total_phases,
             colors.Color.reset.code(),
             colors.Color.bright_green.code(),
             colors.Color.reset.code(),
@@ -373,14 +502,17 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
     defer if (drc) |d| d.deinit();
 
     // Phase 5: Backend code generation
+    const phase5 = nextPhase(&current_phase);
     const target_name = switch (target) {
         .c => "C",
         .js => "JavaScript",
         .erlang => "Erlang",
     };
 
-    std.debug.print("{s}[5/5]{s} Generating {s}...\n", .{
+    std.debug.print("{s}[{d}/{d}]{s} Generating {s}...\n", .{
         colors.info.code(),
+        phase5,
+        total_phases,
         colors.Color.reset.code(),
         target_name,
     });
@@ -400,31 +532,9 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
             };
             defer allocator.free(js_code);
 
-            // Determine output path
-            const out_path = output_path orelse blk: {
-                // Replace .ms extension with .js
-                if (std.mem.endsWith(u8, input_file, ".ms")) {
-                    const base = input_file[0 .. input_file.len - 3];
-                    break :blk std.fmt.allocPrint(allocator, "{s}.js", .{base}) catch {
-                        std.debug.print("{s}error:{s} Failed to allocate output path\n", .{
-                            colors.error_color.code(),
-                            colors.Color.reset.code(),
-                        });
-                        return;
-                    };
-                } else {
-                    break :blk std.fmt.allocPrint(allocator, "{s}.js", .{input_file}) catch {
-                        std.debug.print("{s}error:{s} Failed to allocate output path\n", .{
-                            colors.error_color.code(),
-                            colors.Color.reset.code(),
-                        });
-                        return;
-                    };
-                }
-            };
+            const out_path = getOutputPath(allocator, input_file, output_path, ".js") orelse return;
             defer if (output_path == null) allocator.free(out_path);
 
-            // Write output file
             std.fs.cwd().writeFile(.{ .sub_path = out_path, .data = js_code }) catch |err| {
                 std.debug.print("{s}error:{s} Failed to write {s}: {s}\n", .{
                     colors.error_color.code(),
@@ -435,28 +545,9 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
                 return;
             };
 
-            std.debug.print("{s}[5/5]{s} Generated {s} {s}✓{s}\n", .{
-                colors.success.code(),
-                colors.Color.reset.code(),
-                out_path,
-                colors.Color.bright_green.code(),
-                colors.Color.reset.code(),
-            });
-
-            const elapsed = std.time.milliTimestamp() - start_time;
-            std.debug.print("\n{s}✓{s} Compilation complete ({d}ms)\n", .{
-                colors.success.code(),
-                colors.Color.reset.code(),
-                elapsed,
-            });
-            std.debug.print("  {s}Output:{s} {s}\n", .{
-                colors.dim_text.code(),
-                colors.Color.reset.code(),
-                out_path,
-            });
+            printCompletionMessage(phase5, total_phases, out_path, start_time);
         },
         .c => {
-            // DRC is required for C backend
             if (drc == null) {
                 std.debug.print("{s}error:{s} DRC analysis is required for C backend\n", .{
                     colors.error_color.code(),
@@ -472,7 +563,6 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
             const has_imports = loader.modules.count() > 1;
 
             const c_code = if (has_imports) blk: {
-                // Multi-module: bundle all imported modules into one C file
                 std.debug.print("{s}  Multi-module:{s} bundling {d} modules\n", .{
                     colors.dim_text.code(),
                     colors.Color.reset.code(),
@@ -487,7 +577,6 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
                     return;
                 };
             } else blk: {
-                // Single module: use original generate
                 break :blk gen.generate(final_ast) catch |err| {
                     std.debug.print("{s}error:{s} C generation failed: {s}\n", .{
                         colors.error_color.code(),
@@ -499,31 +588,9 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
             };
             defer allocator.free(c_code);
 
-            // Determine output path
-            const out_path = output_path orelse blk: {
-                // Replace .ms extension with .c
-                if (std.mem.endsWith(u8, input_file, ".ms")) {
-                    const base = input_file[0 .. input_file.len - 3];
-                    break :blk std.fmt.allocPrint(allocator, "{s}.c", .{base}) catch {
-                        std.debug.print("{s}error:{s} Failed to allocate output path\n", .{
-                            colors.error_color.code(),
-                            colors.Color.reset.code(),
-                        });
-                        return;
-                    };
-                } else {
-                    break :blk std.fmt.allocPrint(allocator, "{s}.c", .{input_file}) catch {
-                        std.debug.print("{s}error:{s} Failed to allocate output path\n", .{
-                            colors.error_color.code(),
-                            colors.Color.reset.code(),
-                        });
-                        return;
-                    };
-                }
-            };
+            const out_path = getOutputPath(allocator, input_file, output_path, ".c") orelse return;
             defer if (output_path == null) allocator.free(out_path);
 
-            // Write output file
             std.fs.cwd().writeFile(.{ .sub_path = out_path, .data = c_code }) catch |err| {
                 std.debug.print("{s}error:{s} Failed to write {s}: {s}\n", .{
                     colors.error_color.code(),
@@ -534,25 +601,7 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
                 return;
             };
 
-            std.debug.print("{s}[5/5]{s} Generated {s} {s}✓{s}\n", .{
-                colors.success.code(),
-                colors.Color.reset.code(),
-                out_path,
-                colors.Color.bright_green.code(),
-                colors.Color.reset.code(),
-            });
-
-            const elapsed = std.time.milliTimestamp() - start_time;
-            std.debug.print("\n{s}✓{s} Compilation complete ({d}ms)\n", .{
-                colors.success.code(),
-                colors.Color.reset.code(),
-                elapsed,
-            });
-            std.debug.print("  {s}Output:{s} {s}\n", .{
-                colors.dim_text.code(),
-                colors.Color.reset.code(),
-                out_path,
-            });
+            printCompletionMessage(phase5, total_phases, out_path, start_time);
         },
         .erlang => {
             var gen = try erlgen.ErlangGenerator.init(allocator, input_file);
@@ -568,31 +617,9 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
             };
             defer allocator.free(erl_code);
 
-            // Determine output path
-            const out_path = output_path orelse blk: {
-                // Replace .ms extension with .erl
-                if (std.mem.endsWith(u8, input_file, ".ms")) {
-                    const base = input_file[0 .. input_file.len - 3];
-                    break :blk std.fmt.allocPrint(allocator, "{s}.erl", .{base}) catch {
-                        std.debug.print("{s}error:{s} Failed to allocate output path\n", .{
-                            colors.error_color.code(),
-                            colors.Color.reset.code(),
-                        });
-                        return;
-                    };
-                } else {
-                    break :blk std.fmt.allocPrint(allocator, "{s}.erl", .{input_file}) catch {
-                        std.debug.print("{s}error:{s} Failed to allocate output path\n", .{
-                            colors.error_color.code(),
-                            colors.Color.reset.code(),
-                        });
-                        return;
-                    };
-                }
-            };
+            const out_path = getOutputPath(allocator, input_file, output_path, ".erl") orelse return;
             defer if (output_path == null) allocator.free(out_path);
 
-            // Write output file
             std.fs.cwd().writeFile(.{ .sub_path = out_path, .data = erl_code }) catch |err| {
                 std.debug.print("{s}error:{s} Failed to write {s}: {s}\n", .{
                     colors.error_color.code(),
@@ -603,27 +630,57 @@ pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target:
                 return;
             };
 
-            std.debug.print("{s}[5/5]{s} Generated {s} {s}✓{s}\n", .{
-                colors.success.code(),
-                colors.Color.reset.code(),
-                out_path,
-                colors.Color.bright_green.code(),
-                colors.Color.reset.code(),
-            });
-
-            const elapsed = std.time.milliTimestamp() - start_time;
-            std.debug.print("\n{s}✓{s} Compilation complete ({d}ms)\n", .{
-                colors.success.code(),
-                colors.Color.reset.code(),
-                elapsed,
-            });
-            std.debug.print("  {s}Output:{s} {s}\n", .{
-                colors.dim_text.code(),
-                colors.Color.reset.code(),
-                out_path,
-            });
+            printCompletionMessage(phase5, total_phases, out_path, start_time);
         },
     }
+}
+
+/// Helper to get output path with extension
+fn getOutputPath(allocator: std.mem.Allocator, input_file: []const u8, output_path: ?[]const u8, ext: []const u8) ?[]const u8 {
+    if (output_path) |p| return p;
+
+    if (std.mem.endsWith(u8, input_file, ".ms")) {
+        const base = input_file[0 .. input_file.len - 3];
+        return std.fmt.allocPrint(allocator, "{s}{s}", .{ base, ext }) catch {
+            std.debug.print("{s}error:{s} Failed to allocate output path\n", .{
+                colors.error_color.code(),
+                colors.Color.reset.code(),
+            });
+            return null;
+        };
+    }
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ input_file, ext }) catch {
+        std.debug.print("{s}error:{s} Failed to allocate output path\n", .{
+            colors.error_color.code(),
+            colors.Color.reset.code(),
+        });
+        return null;
+    };
+}
+
+/// Helper to print completion message
+fn printCompletionMessage(phase: u8, total_phases: u8, out_path: []const u8, start_time: i64) void {
+    std.debug.print("{s}[{d}/{d}]{s} Generated {s} {s}✓{s}\n", .{
+        colors.success.code(),
+        phase,
+        total_phases,
+        colors.Color.reset.code(),
+        out_path,
+        colors.Color.bright_green.code(),
+        colors.Color.reset.code(),
+    });
+
+    const elapsed = std.time.milliTimestamp() - start_time;
+    std.debug.print("\n{s}✓{s} Compilation complete ({d}ms)\n", .{
+        colors.success.code(),
+        colors.Color.reset.code(),
+        elapsed,
+    });
+    std.debug.print("  {s}Output:{s} {s}\n", .{
+        colors.dim_text.code(),
+        colors.Color.reset.code(),
+        out_path,
+    });
 }
 
 fn printDiagnostics(path: []const u8, source: []const u8, diagnostics: []const transam.Diagnostic) void {

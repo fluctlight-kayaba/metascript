@@ -279,6 +279,13 @@ pub const TypeInference = struct {
                 return node.type;
             },
 
+            // Move expression - type is the type of the operand being moved
+            .move_expr => {
+                const operand_type = try self.inferNode(node.data.move_expr.operand);
+                node.type = operand_type;
+                return node.type;
+            },
+
             // New expression
             .new_expr => {
                 _ = try self.inferNode(node.data.new_expr.callee);
@@ -518,6 +525,9 @@ pub const TypeInference = struct {
 
             // Bitwise operators → int32 (bitwise ops work on integers)
             .bit_and, .bit_or, .bit_xor, .shl, .shr => try self.createPrimitive(.int32, node.location),
+
+            // Nullish coalesce (??) → type of left if not null, else type of right
+            .nullish_coalesce => left_type orelse right_type orelse try self.createPrimitive(.unknown, node.location),
         };
 
         return node.type;

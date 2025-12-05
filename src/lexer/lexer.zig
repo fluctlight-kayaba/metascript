@@ -97,7 +97,8 @@ pub const Lexer = struct {
             ';' => self.makeToken(.semicolon),
             ',' => self.makeToken(.comma),
             '~' => self.makeToken(.tilde),
-            '?' => self.makeToken(.question),
+            '?' => if (self.match('?')) self.makeToken(.question_question)
+                   else self.makeToken(.question),
             ':' => self.makeToken(.colon),
 
             // Operators (multi-char)

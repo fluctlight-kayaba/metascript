@@ -107,6 +107,11 @@ pub const JSGenerator = struct {
                 try emit_mod.emit(self, "...");
                 try self.emitNode(node.data.spread_element.argument);
             },
+            .move_expr => {
+                // In JavaScript, move is a no-op (V8 GC handles memory)
+                // Just emit the operand expression
+                try self.emitNode(node.data.move_expr.operand);
+            },
 
             // Class members (handled in declarations.zig)
             .property_decl, .method_decl, .constructor_decl => {},

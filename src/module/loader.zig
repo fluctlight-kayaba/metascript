@@ -225,7 +225,16 @@ pub const ModuleLoader = struct {
     /// Load a module from a file path
     /// Returns the loaded module or a LoadError
     pub fn loadModule(self: *ModuleLoader, path: []const u8) LoadError!*Module {
-        return self.loadModuleWithDepth(path, 0);
+        // Normalize path to resolve symlinks (e.g., /tmp -> /private/tmp on macOS)
+        const normalized = std.fs.cwd().realpathAlloc(self.allocator, path) catch |err| {
+            return switch (err) {
+                error.FileNotFound => LoadError.FileNotFound,
+                error.AccessDenied => LoadError.AccessDenied,
+                else => LoadError.IoError,
+            };
+        };
+        defer self.allocator.free(normalized);
+        return self.loadModuleWithDepth(normalized, 0);
     }
 
     /// Load a module from in-memory source content
@@ -661,7 +670,7 @@ pub const ModuleLoader = struct {
                     const symbols_slice = try symbols.toOwnedSlice();
                     errdefer self.allocator.free(symbols_slice);
                     try module.imports.append(.{
-                        .specifier = imp.source,
+                        .specifier = source,
                         .resolved_path = resolved_path,
                         .symbols = symbols_slice,
                     });
@@ -813,13 +822,19 @@ pub const ModuleLoader = struct {
     /// Look up a macro from a specific module (precise, scoped lookup)
     /// This is the preferred method when you know which module the macro comes from
     pub fn getMacroFromModule(self: *const ModuleLoader, module_path: []const u8, macro_name: []const u8) ?*ast.Node {
-        const module = self.modules.get(module_path) orelse return null;
+        // Try with normalized path first (macOS /tmp -> /private/tmp)
+        const normalized = std.fs.cwd().realpathAlloc(self.allocator, module_path) catch module_path;
+        defer if (normalized.ptr != module_path.ptr) self.allocator.free(normalized);
+        const module = self.modules.get(normalized) orelse self.modules.get(module_path) orelse return null;
         return module.macros.get(macro_name);
     }
 
     /// Get the dependency list for a module (for topological sorting/build ordering)
     pub fn getDependencies(self: *const ModuleLoader, module_path: []const u8) ?[]const []const u8 {
-        const dep_list = self.dependencies.get(module_path) orelse return null;
+        // Try with normalized path first (macOS /tmp -> /private/tmp)
+        const normalized = std.fs.cwd().realpathAlloc(self.allocator, module_path) catch module_path;
+        defer if (normalized.ptr != module_path.ptr) self.allocator.free(normalized);
+        const dep_list = self.dependencies.get(normalized) orelse self.dependencies.get(module_path) orelse return null;
         return dep_list.items;
     }
 
@@ -884,7 +899,10 @@ pub const ModuleLoader = struct {
         node: *ast.Node,
         kind: Module.SymbolKind,
     } {
-        const module = self.modules.get(module_path) orelse return null;
+        // Try with normalized path first (macOS /tmp -> /private/tmp)
+        const normalized = std.fs.cwd().realpathAlloc(self.allocator, module_path) catch module_path;
+        defer if (normalized.ptr != module_path.ptr) self.allocator.free(normalized);
+        const module = self.modules.get(normalized) orelse self.modules.get(module_path) orelse return null;
         const exp = module.exports.get(symbol_name) orelse return null;
         return .{
             .path = module.path,
@@ -1001,7 +1019,7 @@ test "macro collection" {
     const allocator = std.testing.allocator;
 
     const test_source =
-        \\macro testMacro(target: class): class {
+        \\macro function testMacro(target) {
         \\    return target;
         \\}
     ;
@@ -1116,7 +1134,10 @@ test "symbol definition lookup" {
     // Look up the symbol
     const def = loader.getSymbolDefinition("findMe");
     try std.testing.expect(def != null);
-    try std.testing.expectEqualStrings(tmp_path, def.?.path);
+    // Compare with normalized path (macOS /tmp -> /private/tmp)
+    const expected_path = try std.fs.cwd().realpathAlloc(allocator, tmp_path);
+    defer allocator.free(expected_path);
+    try std.testing.expectEqualStrings(expected_path, def.?.path);
 
     // Non-existent symbol
     const no_def = loader.getSymbolDefinition("nonexistent");
@@ -1166,7 +1187,7 @@ test "exported macro registration" {
     const allocator = std.testing.allocator;
 
     const test_source =
-        \\export macro derive(target: class): class {
+        \\export macro function derive(target) {
         \\    return target;
         \\}
     ;
@@ -1268,9 +1289,13 @@ test "getSymbolFromModule returns correct module" {
     // They should be different nodes (different ASTs)
     try std.testing.expect(from_mod1.?.node != from_mod2.?.node);
 
-    // Paths should match their respective modules
-    try std.testing.expectEqualStrings(path1, from_mod1.?.path);
-    try std.testing.expectEqualStrings(path2, from_mod2.?.path);
+    // Paths should match their respective modules (normalized)
+    const expected1 = try std.fs.cwd().realpathAlloc(allocator, path1);
+    defer allocator.free(expected1);
+    const expected2 = try std.fs.cwd().realpathAlloc(allocator, path2);
+    defer allocator.free(expected2);
+    try std.testing.expectEqualStrings(expected1, from_mod1.?.path);
+    try std.testing.expectEqualStrings(expected2, from_mod2.?.path);
 }
 
 test "load module with parse error returns error" {
@@ -1732,7 +1757,7 @@ test "import actually loads dependency module" {
 
     // Create a module that exports a macro
     const macro_module =
-        \\macro testMacro(target: class): class {
+        \\macro function testMacro(target) {
         \\    return target;
         \\}
     ;
@@ -1814,12 +1839,12 @@ test "getMacroFromModule returns scoped macro" {
 
     // Create two modules with same-named macros
     const module_a =
-        \\macro sameName(target: class): class {
+        \\macro function sameName(target) {
         \\    return target;
         \\}
     ;
     const module_b =
-        \\macro sameName(target: class): class {
+        \\macro function sameName(target) {
         \\    return target;
         \\}
     ;
@@ -1877,7 +1902,7 @@ test "loadStdMacros with mock directory" {
         const file = try std.fs.cwd().createFile(derive_path, .{});
         defer file.close();
         try file.writeAll(
-            \\macro derive(target: class): class {
+            \\macro function derive(target) {
             \\    return target;
             \\}
         );
@@ -1990,14 +2015,21 @@ test "getModulesInDependencyOrder returns topological order" {
     // Should have all 3 modules
     try std.testing.expectEqual(@as(usize, 3), order.len);
 
-    // Find positions
+    // Find positions (compare with normalized paths)
+    const normalized_a = try std.fs.cwd().realpathAlloc(allocator, path_a);
+    defer allocator.free(normalized_a);
+    const normalized_b = try std.fs.cwd().realpathAlloc(allocator, path_b);
+    defer allocator.free(normalized_b);
+    const normalized_c = try std.fs.cwd().realpathAlloc(allocator, path_c);
+    defer allocator.free(normalized_c);
+
     var pos_a: ?usize = null;
     var pos_b: ?usize = null;
     var pos_c: ?usize = null;
     for (order, 0..) |path, i| {
-        if (std.mem.eql(u8, path, path_a)) pos_a = i;
-        if (std.mem.eql(u8, path, path_b)) pos_b = i;
-        if (std.mem.eql(u8, path, path_c)) pos_c = i;
+        if (std.mem.eql(u8, path, normalized_a)) pos_a = i;
+        if (std.mem.eql(u8, path, normalized_b)) pos_b = i;
+        if (std.mem.eql(u8, path, normalized_c)) pos_c = i;
     }
 
     // All should be found
@@ -2251,7 +2283,7 @@ test "re-export macro from source module" {
 
     // Source with macro
     const source_module =
-        \\macro sourceMacro(target: class): class {
+        \\macro function sourceMacro(target) {
         \\    return target;
         \\}
     ;

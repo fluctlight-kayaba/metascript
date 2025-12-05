@@ -273,6 +273,9 @@ pub const TypeResolver = struct {
             .spread_element => {
                 try self.resolveNode(node.data.spread_element.argument);
             },
+            .move_expr => {
+                try self.resolveNode(node.data.move_expr.operand);
+            },
             // Type alias - resolve the aliased type
             .type_alias_decl => {
                 try self.resolveType(node.data.type_alias_decl.type);

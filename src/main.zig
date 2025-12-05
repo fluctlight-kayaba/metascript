@@ -29,6 +29,7 @@ const cli_expand = @import("cli/expand.zig");
 const cli_check = @import("cli/check.zig");
 const cli_compile = @import("cli/compile.zig");
 const cli_run = @import("cli/run.zig");
+const cli_build = @import("cli/build.zig");
 const colors = @import("cli/colors.zig");
 
 pub fn main() !void {
@@ -131,6 +132,19 @@ pub fn main() !void {
             return;
         }
         try cli_run.run(allocator, args[2]);
+    } else if (std.mem.eql(u8, command, "build")) {
+        // Vite-style build command - uses build.ms config
+        try cli_build.run(allocator, args[2..]);
+    } else if (std.mem.eql(u8, command, "dev")) {
+        // Dev server (placeholder)
+        std.debug.print("{s}msc dev{s} - Development server (coming soon)\n", .{
+            colors.Color.bright_cyan.code(),
+            colors.Color.reset.code(),
+        });
+        std.debug.print("For now, use: {s}msc build --watch{s}\n", .{
+            colors.dim_text.code(),
+            colors.Color.reset.code(),
+        });
     } else if (std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-v")) {
         std.debug.print("Metascript v0.1.0\n", .{});
     } else if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
@@ -162,7 +176,9 @@ fn printUsage() !void {
     });
 
     std.debug.print("{s}{s}COMMANDS:{s}\n", .{ colors.header.code(), colors.Color.bold.code(), colors.Color.reset.code() });
-    std.debug.print("  {s}compile{s} <file>        Compile to target backend\n", .{ colors.Color.bright_white.code(), colors.Color.reset.code() });
+    std.debug.print("  {s}build{s}                 Build using build.ms config (Vite-style)\n", .{ colors.Color.bright_white.code(), colors.Color.reset.code() });
+    std.debug.print("  {s}dev{s}                   Start dev server with hot reload\n", .{ colors.Color.bright_white.code(), colors.Color.reset.code() });
+    std.debug.print("  {s}compile{s} <file>        Compile single file to target backend\n", .{ colors.Color.bright_white.code(), colors.Color.reset.code() });
     std.debug.print("  {s}run{s} <file>            Compile and run\n", .{ colors.Color.bright_white.code(), colors.Color.reset.code() });
     std.debug.print("  {s}check{s} <file>          Type check only (no codegen)\n\n", .{ colors.Color.bright_white.code(), colors.Color.reset.code() });
 

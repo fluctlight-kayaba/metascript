@@ -566,6 +566,12 @@ fn hashAstNodeImpl(hasher: *std.hash.Wyhash, n: *const Node) void {
             }
             // Note: We don't hash file_id - structural equality only
         },
+
+        // Move expression (ownership transfer)
+        .move_expr => {
+            const move = &n.data.move_expr;
+            hashAstNodeImpl(hasher, move.operand);
+        },
     }
 
     // Optionally hash the type annotation if present (for typed ASTs)

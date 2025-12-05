@@ -103,6 +103,7 @@ pub const TokenKind = enum {
     // Metascript keywords
     keyword_defer,    // defer cleanup
     keyword_distinct, // distinct type
+    keyword_move,     // move ownership transfer (DRC optimization)
 
     // Metascript macro keywords (Nim-style)
     keyword_macro,    // macro definition: macro derive(ctx) { }
@@ -161,6 +162,7 @@ pub const TokenKind = enum {
 
     // Other
     question,         // ?
+    question_question, // ?? (nullish coalescing)
     dot,              // .
     dot_dot_dot,      // ...
     arrow,            // =>
@@ -294,6 +296,7 @@ pub const Token = struct {
             .keyword_double,
             .keyword_defer,
             .keyword_distinct,
+            .keyword_move,
             .keyword_macro,
             .keyword_quote,
             .keyword_extern,
@@ -400,6 +403,7 @@ pub fn initKeywordMap(allocator: std.mem.Allocator) !KeywordMap {
     // Metascript keywords
     try map.put("defer", .keyword_defer);
     try map.put("distinct", .keyword_distinct);
+    try map.put("move", .keyword_move);
 
     // Metascript macro keywords (Nim-style)
     try map.put("macro", .keyword_macro);

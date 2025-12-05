@@ -17,6 +17,256 @@
 
 **Production Validation:** Nim 2.0+ uses ORC as default (August 2023).
 
+ ┌─────────────────────────────────────────────────────────────────────────┐
+ │                    METASCRIPT MEMORY MODEL                              │
+ │                    ══════════════════════                               │
+ ├─────────────────────────────────────────────────────────────────────────┤
+ │                                                                         │
+ │                        YOUR CODE                                        │
+ │                           │                                             │
+ │                           ▼                                             │
+ │              ┌────────────────────────┐                                 │
+ │              │   SHARED BY DEFAULT    │  ← Safe, TypeScript-compatible  │
+ │              │   (All refs are RC)    │    Zero learning curve          │
+ │              └────────────────────────┘                                 │
+ │                           │                                             │
+ │                           ▼                                             │
+ │              ┌────────────────────────┐                                 │
+ │              │DRC LOBSTER OPTIMIZATION│  ← Compiler magic (automatic)   │
+ │              │   (Compile-time)       │                                 │
+ │              └────────────────────────┘                                 │
+ │                      /        \                                         │
+ │                     /          \                                        │
+ │                    ▼            ▼                                       │
+ │         ┌──────────────┐  ┌──────────────┐                              │
+ │         │  95% CASES   │  │   5% CASES   │                              │
+ │         │  ──────────  │  │  ──────────  │                              │
+ │         │              │  │              │                              │
+ │         │ Single-owner │  │ Can't prove  │                              │
+ │         │ detected     │  │ single-owner │                              │
+ │         │              │  │              │                              │
+ │         │ → NO RC ops! │  │ → ORC ops    │  ← Still safe! Just slower   │
+ │         │   (elided)   │  │   (shared)   │                              │
+ │         └──────────────┘  └──────────────┘                              │
+ │                                  │                                      │
+ │                                  ▼                                      │
+ │                     ┌────────────────────────┐                          │
+ │                     │  OPTIONAL: move        │  ← User optimization     │
+ │                     │  keyword for 5%        │    Only if they care     │
+ │                     └────────────────────────┘                          │
+ │                                  │                                      │
+ │                                  ▼                                      │
+ │                           → NO RC ops!                                  │
+ │                                                                         │
+ └─────────────────────────────────────────────────────────────────────────┘
+
+ 0%                        95%            100%
+ │                          │               │
+ │ ─────────────────────────┼───────────────│
+ │                          │               │
+ │    AUTOMATIC             │   OPTIONAL    │
+ │    (Lobster)             │   (move)      │
+ │                          │               │
+ │  ✓ Zero effort           │  ✓ Minimal    │
+ │  ✓ 95% of C perf         │  ✓ 100% of C  │
+ │  ✓ TypeScript-like       │  ✓ Opt-in     │
+ │                          │               │
+ └──────────────────────────┴───────────────┘
+          Most developers       Power users
+          stop here             go here
+
+---
+
+## Shared by Default (Critical Design Decision)
+
+### The Core Principle
+
+**Metascript uses "Shared by Default" semantics for all object references.**
+
+This is the most critical design decision in our memory model. Every object reference is **shared** (reference counted) by default, with `move` available as an **optimization** to skip RC overhead.
+
+### Why Shared by Default?
+
+**It matches JavaScript/TypeScript semantics exactly.**
+
+```typescript
+// TypeScript behavior - multiple references to same object
+const user = { name: "Alice" };
+const users = [];
+users.push(user);      // user is still valid!
+console.log(user.name); // Works fine in TS
+
+// This MUST work identically in Metascript
+// If we used "borrow by default", this would break!
+```
+
+| Alternative | Why Not |
+|-------------|---------|
+| **Borrow by Default** | `users.push(user)` would invalidate `user` - BREAKS TypeScript! |
+| **Move by Default** | Same problem - ownership transfer breaks TS semantics |
+| **Inferred Borrow/Move** | Complex, unpredictable, still risks breaking TS patterns |
+| **Shared by Default** ✅ | Matches JS/TS exactly. Use after share is always valid. |
+
+### How It Works
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    SHARED BY DEFAULT                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Every object reference is SHARED (ref-counted):                │
+│                                                                 │
+│    let user = new User("Alice");  // RC = 1                     │
+│    this.users.push(user);          // RC = 2 (incref)           │
+│    console.log(user.name);         // Still valid! (RC = 2)     │
+│    // ... end of scope ...         // RC = 1 (decref)           │
+│    // user goes out of scope       // RC = 0 → freed            │
+│                                                                 │
+│  OPTIMIZATION with `move`:                                      │
+│                                                                 │
+│    let user = new User("Alice");  // RC = 1                     │
+│    return move user;               // No incref! Transfer owner │
+│    // user is INVALID after move   // Caller owns it now        │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### TypeScript Compatibility Guarantee
+
+**Any valid TypeScript pattern involving object references works unchanged:**
+
+```typescript
+// Pattern 1: Store in collection, use original
+const item = createItem();
+collection.add(item);
+item.process();  // ✅ Works - item is shared, not moved
+
+// Pattern 2: Return from function, caller uses
+function getUser(): User {
+    const user = fetchUser();
+    cache.store(user);
+    return user;  // ✅ Works - user shared with cache AND returned
+}
+
+// Pattern 3: Pass to multiple functions
+const data = loadData();
+validate(data);
+transform(data);
+save(data);  // ✅ Works - each call shares, none takes ownership
+```
+
+### The `move` Keyword: Optimization, Not Requirement
+
+`move` is **strictly optional**. It tells the compiler: "I'm done with this value, transfer ownership without RC overhead."
+
+```typescript
+// Without move (default - always correct)
+function processAndReturn(user: User): User {
+    log(user);           // incref for log, decref after
+    return user;         // incref for return, decref at scope exit
+}
+// Total: 2 incref + 2 decref = 4 RC operations
+
+// With move (optimization - saves RC operations)
+function processAndReturn(user: User): User {
+    log(user);           // incref for log, decref after
+    return move user;    // NO incref! Transfer ownership directly
+}
+// Total: 1 incref + 1 decref = 2 RC operations (50% reduction)
+```
+
+### When to Use `move`
+
+| Context | Use `move`? | Reason |
+|---------|-------------|--------|
+| Return value (last use) | ✅ Optional optimization | Saves incref/decref pair |
+| Pass to sink function | ✅ Optional optimization | Function takes ownership |
+| After use in same scope | ❌ Never | Value still needed |
+| Multiple references exist | ❌ Never | Other refs would dangle |
+
+### Comparison with Other Languages
+
+| Language | Default Semantics | Metascript Equivalent |
+|----------|-------------------|----------------------|
+| **JavaScript/TypeScript** | Shared (GC) | **Shared (RC)** ← matches exactly |
+| **Rust** | Move by default | Opposite - explicit `clone()` needed |
+| **C++** | Copy by default | Similar but with manual memory |
+| **Swift** | Shared (ARC) | Same model |
+
+### Why Not Borrow by Default?
+
+**Critical insight from design review:**
+
+```typescript
+// This is VALID TypeScript that millions of developers write:
+class UserManager {
+    private users: User[] = [];
+
+    addUser(user: User): void {
+        this.users.push(user);
+        // TypeScript: user is still valid here
+        // Borrow-by-default: user would be INVALID (ownership transferred)
+    }
+}
+
+const user = new User("Alice");
+manager.addUser(user);
+console.log(user.name);  // TypeScript: Works! Borrow-by-default: CRASH!
+```
+
+**Borrow by default would break the TypeScript superset guarantee.** Developers copying TypeScript code would face silent bugs or crashes.
+
+### Implementation in DRC
+
+```zig
+// src/analysis/drc.zig
+
+pub const UseContext = enum {
+    read,                    // Just reading - no ownership change
+    function_arg_shared,     // DEFAULT: Shared reference (incref)
+    function_arg_owned,      // move: Ownership transfer (no incref)
+    returned,                // Return value - may be shared or moved
+    field_store,             // Storing in object field (incref)
+};
+
+pub fn transfersOwnership(context: UseContext) bool {
+    return switch (context) {
+        .function_arg_owned, .returned => true,  // move contexts
+        .read, .function_arg_shared, .field_store => false,  // shared contexts
+    };
+}
+```
+
+### Generated C Code
+
+```c
+// Shared (default)
+void addUser(UserManager* self, User* user) {
+    ms_incref(user);         // Increment RC - user is SHARED
+    array_push(self->users, user);
+}
+
+// Move (explicit optimization)
+void consumeUser(User* user) {  // Parameter marked with 'move'
+    // No ms_incref - ownership transferred to this function
+    process(user);
+    ms_decref(user);         // We own it, we clean it up
+}
+```
+
+### Summary
+
+| Aspect | Shared by Default |
+|--------|-------------------|
+| **Default behavior** | All references are shared (RC managed) |
+| **TypeScript compatibility** | 100% - same semantics as JS/TS |
+| **Memory safety** | Automatic - RC prevents use-after-free |
+| **Optimization** | `move` keyword for explicit ownership transfer |
+| **Developer experience** | No new concepts - works like TypeScript |
+| **Cognitive load** | Zero for default case, optional optimization |
+
+**This is the right default because it prioritizes correctness and TypeScript compatibility over micro-optimization. Developers who need maximum performance can use `move`, but the 95% common case "just works."**
+
 ---
 
 ## RefHeader Layout
@@ -148,26 +398,49 @@ Algorithm:
 
 ### Goal: Reduce RC operations 50-95%
 
-**Key Insight:** Most values have single owner at compile time.
+**Key Insight:** While semantics are "Shared by Default", the compiler can often prove that sharing is unnecessary, eliminating RC overhead entirely.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│               OPTIMIZATION STRATEGY                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  SEMANTICS: Shared by Default (safe, TypeScript-compatible)    │
+│                 ↓                                               │
+│  ANALYSIS: Detect single-owner patterns at compile time        │
+│                 ↓                                               │
+│  CODEGEN: Elide RC for provably single-owner cases             │
+│                                                                 │
+│  Result: TypeScript semantics + near-C performance             │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ```zig
-pub const OwnershipKind = enum { owned, borrowed, shared };
+pub const OwnershipKind = enum {
+    owned,     // Single owner - can elide RC
+    borrowed,  // Temporary access - no RC change
+    shared,    // Multiple owners - requires RC
+    moved,     // Ownership transferred via `move`
+};
 
 fn analyzeOwnership(expr: *ast.Node) OwnershipKind {
     return switch (expr.kind) {
-        .variable_decl => .owned,
-        .parameter => .borrowed,
-        .field_access => .borrowed,
-        .return_expr => if (owned) .borrowed else .shared,
-        else => .shared,
+        .variable_decl => .owned,       // Initial allocation = single owner
+        .parameter => .borrowed,        // Borrows from caller
+        .field_access => .borrowed,     // Borrows from parent
+        .function_call => .shared,      // May be stored elsewhere
+        .move_expr => .moved,           // Explicit ownership transfer
+        else => .shared,                // Default: safe shared semantics
     };
 }
 
-// Code generation uses ownership
+// Code generation: Optimize based on analysis
 if (ownership == .owned or ownership == .borrowed) {
-    emit("dest = src;");  // No RC
+    emit("dest = src;");                // No RC - provably safe!
+} else if (ownership == .moved) {
+    emit("dest = src;");                // No RC - explicit transfer
 } else {
-    emit("dest = src; ms_incref(src);");  // RC++
+    emit("dest = src; ms_incref(src);"); // RC++ - shared semantics
 }
 ```
 
@@ -176,9 +449,27 @@ if (ownership == .owned or ownership == .borrowed) {
 | Phase | Technique | Impact |
 |-------|-----------|--------|
 | 1 | Basic ownership analysis | 50% RC elimination |
-| 2 | Escape analysis | 20% more elimination |
-| 3 | Inline temporaries | 10% more elimination |
-| 4 | Stack allocation | Avoid heap entirely |
+| 2 | `move` keyword recognition | 10% more elimination |
+| 3 | Escape analysis | 15% more elimination |
+| 4 | Inline temporaries | 10% more elimination |
+| 5 | Stack allocation | Avoid heap entirely |
+
+### Automatic vs Explicit Optimization
+
+```typescript
+// AUTOMATIC: Compiler detects single-owner pattern
+function createUser(name: string): User {
+    const user = new User(name);  // owned - single owner
+    return user;                  // Compiler auto-elides RC
+}
+// Generated C: no incref/decref pair
+
+// EXPLICIT: Developer uses `move` for guaranteed optimization
+function transferUser(user: User): void {
+    process(move user);           // Explicit: skip RC, invalidate user
+}
+// Generated C: no incref, callee responsible for decref
+```
 
 ---
 

@@ -24,7 +24,7 @@ pub fn run(allocator: std.mem.Allocator, path: []const u8) !void {
     defer allocator.free(source);
 
     // Register file with Trans-Am
-    _ = try db.setFileText(path, source);
+    _ = try transam.input_queries.setFileText(&db, path, source);
 
     // Collect all diagnostics (parse errors + type errors)
     var all_diagnostics = std.ArrayList(transam.Diagnostic).init(allocator);
@@ -36,7 +36,7 @@ pub fn run(allocator: std.mem.Allocator, path: []const u8) !void {
     }
 
     // Phase 1: Get parse diagnostics
-    const parse_diagnostics = db.getDiagnostics(path) catch |err| {
+    const parse_diagnostics = transam.diagnostics_mod.getDiagnostics(&db, path) catch |err| {
         std.debug.print("{s}error:{s} Analysis failed: {s}\n", .{
             colors.error_color.code(),
             colors.Color.reset.code(),
@@ -52,7 +52,7 @@ pub fn run(allocator: std.mem.Allocator, path: []const u8) !void {
 
     // Phase 2: Run full type checking (only if no parse errors)
     if (parse_diagnostics.len == 0) {
-        const check_result = db.checkFile(path) catch |err| {
+        const check_result = transam.type_check.checkFile(&db, path) catch |err| {
             std.debug.print("{s}error:{s} Type checking failed: {s}\n", .{
                 colors.error_color.code(),
                 colors.Color.reset.code(),

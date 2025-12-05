@@ -783,16 +783,9 @@ pub const Drc = struct {
         const v = self.variables.get(var_name) orelse return;
         if (!v.needs_rc) return;
 
-        // DIAGNOSTIC: Check for use-after-move
-        if (v.ownership_state == .moved) {
-            try self.emitUseAfterMove(var_name, line, column);
-            // Continue processing - codegen may still need the op, but user is warned
-        }
-
-        // DIAGNOSTIC: Check for uninitialized use
-        if (!v.initialized and !v.is_parameter) {
-            try self.emitUninitializedUse(var_name, line, column);
-        }
+        // NOTE: Use-after-move and uninitialized-use are now handled by the typechecker.
+        // DRC is purely an optimization layer - typechecker handles safety diagnostics.
+        // With "Shared by Default" + explicit move keyword, there's no uncertain ownership.
 
         try self.ownership_analyzer.recordUse(var_name, line, column, toOwnershipContext(context));
 
@@ -1129,7 +1122,7 @@ pub const Drc = struct {
     pub fn trackVariableCopy(
         self: *Drc,
         target_var: []const u8,
-        source_var: []const u8,
+        _: []const u8, // source_var - use-after-move is handled by typechecker
         line: u32,
         column: u32,
     ) !void {
@@ -1137,14 +1130,8 @@ pub const Drc = struct {
         const target = self.variables.get(target_var) orelse return;
         if (!target.needs_rc) return;
 
-        // Check if source is still valid (not moved)
-        // If source was moved, copying from it is a use-after-move error
-        if (self.variables.get(source_var)) |source| {
-            if (source.ownership_state == .moved) {
-                // Source was moved - emit use-after-move warning for LSP
-                try self.emitUseAfterMove(source_var, line, column);
-            }
-        }
+        // NOTE: Use-after-move is now handled by the typechecker.
+        // DRC is purely an optimization layer - typechecker handles safety diagnostics.
 
         // Emit incref for the target variable after the assignment
         // After `target = source`, target and source point to same object
@@ -1177,15 +1164,9 @@ pub const Drc = struct {
         if (self.variables.getPtr(var_name)) |vptr| {
             if (!vptr.needs_rc) return;
 
-            // DIAGNOSTIC: Check for double-free risk
-            // If we're reassigning a variable that was already moved/freed,
-            // the old value path shouldn't be decreffed (it's already gone)
-            // But if somehow the old decref is still emitted, that's a double-free
-            if (vptr.ownership_state == .moved) {
-                // This is actually safe - we're just assigning to a moved variable
-                // But warn in case there's a code path that tries to decref the old value
-                try self.emitDoubleFreeRisk(var_name, line, column);
-            }
+            // NOTE: Reassignment after move is valid in the "Shared by Default" + move model.
+            // Typechecker handles this - we just skip the decref (no old value to free).
+            // No diagnostic needed here anymore.
 
             // Only decref if we still own the old value
             // If it was moved (returned/passed to ownership-taking function),
@@ -2049,9 +2030,12 @@ test "Drc variable shadowing restores outer variable" {
 
 // ============================================================================
 // Diagnostic Tests
+// NOTE: Use-after-move, uninitialized-use, and double-free-risk are now
+// handled by the typechecker. DRC is purely an optimization layer.
+// Only potential_cycle hints remain in DRC.
 // ============================================================================
 
-test "Drc emits use-after-move diagnostic" {
+test "Drc does not emit use-after-move diagnostic (handled by typechecker)" {
     var drc = Drc.initWithConfig(std.testing.allocator, .{ .enable_move_optimization = true });
     defer drc.deinit();
 
@@ -2064,20 +2048,19 @@ test "Drc emits use-after-move diagnostic" {
     // Move the variable (ownership transfer context)
     try drc.trackUse("obj", 3, 1, .returned);
 
-    // Try to use after move - should emit diagnostic
+    // Use after move - DRC no longer emits diagnostic (typechecker handles it)
     try drc.trackUse("obj", 4, 1, .read);
 
     try drc.exitScope(5, 1);
     try drc.exitScope(6, 1);
     try drc.finalize();
 
+    // No diagnostics from DRC - typechecker handles safety
     const diags = drc.getDiagnostics();
-    try std.testing.expectEqual(@as(usize, 1), diags.len);
-    try std.testing.expectEqual(DrcDiagnostic.Code.use_after_move, diags[0].code);
-    try std.testing.expect(std.mem.indexOf(u8, diags[0].message, "obj") != null);
+    try std.testing.expectEqual(@as(usize, 0), diags.len);
 }
 
-test "Drc emits uninitialized-use diagnostic" {
+test "Drc does not emit uninitialized-use diagnostic (handled by typechecker)" {
     var drc = Drc.init(std.testing.allocator);
     defer drc.deinit();
 
@@ -2087,16 +2070,16 @@ test "Drc emits uninitialized-use diagnostic" {
     // Register variable but DON'T allocate/initialize it
     try drc.registerVariable("uninit", .object, 2, 5, false);
 
-    // Try to use it - should emit diagnostic
+    // Use uninitialized - DRC no longer emits diagnostic (typechecker handles it)
     try drc.trackUse("uninit", 3, 1, .read);
 
     try drc.exitScope(5, 1);
     try drc.exitScope(6, 1);
     try drc.finalize();
 
+    // No diagnostics from DRC - typechecker handles safety
     const diags = drc.getDiagnostics();
-    try std.testing.expectEqual(@as(usize, 1), diags.len);
-    try std.testing.expectEqual(DrcDiagnostic.Code.uninitialized_use, diags[0].code);
+    try std.testing.expectEqual(@as(usize, 0), diags.len);
 }
 
 test "Drc emits potential-cycle hint for field stores" {
@@ -2122,7 +2105,7 @@ test "Drc emits potential-cycle hint for field stores" {
     try std.testing.expectEqual(DrcDiagnostic.Severity.hint, diags[0].severity);
 }
 
-test "Drc emits double-free-risk for reassigning moved variable" {
+test "Drc does not emit double-free-risk for reassigning moved variable (valid operation)" {
     var drc = Drc.initWithConfig(std.testing.allocator, .{ .enable_move_optimization = true });
     defer drc.deinit();
 
@@ -2135,16 +2118,17 @@ test "Drc emits double-free-risk for reassigning moved variable" {
     // Move the variable
     try drc.trackUse("x", 3, 1, .returned);
 
-    // Now reassign - variable was moved, emits warning
+    // Reassign - this is valid in "Shared by Default" + move model
+    // Typechecker clears moved state on reassignment
     try drc.trackReassignment("x", 4, 1);
 
     try drc.exitScope(5, 1);
     try drc.exitScope(6, 1);
     try drc.finalize();
 
+    // No diagnostics - reassignment after move is valid
     const diags = drc.getDiagnostics();
-    try std.testing.expectEqual(@as(usize, 1), diags.len);
-    try std.testing.expectEqual(DrcDiagnostic.Code.double_free_risk, diags[0].code);
+    try std.testing.expectEqual(@as(usize, 0), diags.len);
 }
 
 test "Drc parameters don't emit uninitialized-use" {
@@ -2189,23 +2173,23 @@ test "Drc deinit cleans up temporary names on success" {
 }
 
 test "Drc deinit cleans up diagnostics on success" {
-    // Verify that diagnostic messages are freed
-    var drc = Drc.initWithConfig(std.testing.allocator, .{ .enable_move_optimization = true });
+    // Verify that diagnostic messages are freed (using potential_cycle hint)
+    var drc = Drc.initWithConfig(std.testing.allocator, .{
+        .enable_move_optimization = true,
+        .enable_cycle_detection = true,
+    });
 
     try drc.enterScope(1);
-    try drc.registerVariable("obj", .object, 1, 5, false);
-    try drc.registerAllocation("obj", 1, 10);
+    try drc.registerVariable("node", .object, 1, 5, false);
+    try drc.registerAllocation("node", 1, 10);
 
-    // First use with 'returned' - triggers move optimization (marks as moved)
-    try drc.trackUse("obj", 2, 1, .returned);
-
-    // Second use after move - generates diagnostic with allocated message
-    try drc.trackUse("obj", 3, 1, .read);
+    // Field store triggers potential_cycle hint (the only diagnostic still emitted by DRC)
+    try drc.trackUse("node", 2, 1, .field_store);
 
     try drc.exitScope(5, 1);
     try drc.finalize();
 
-    // Verify we got a diagnostic
+    // Verify we got a diagnostic (potential_cycle hint)
     const diags = drc.getDiagnostics();
     try std.testing.expect(diags.len >= 1);
 

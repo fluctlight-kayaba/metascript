@@ -1510,7 +1510,7 @@ pub const Parser = struct {
     }
 
     fn parseAssignment(self: *Parser) Error!*ast.Node {
-        var expr = try self.parseLogicalOr();
+        var expr = try self.parseNullishCoalesce();
 
         if (self.match(.equals) or self.match(.plus_equals) or self.match(.minus_equals) or
             self.match(.star_equals) or self.match(.slash_equals))
@@ -1525,6 +1525,27 @@ pub const Parser = struct {
                         .op = .assign,
                         .left = expr,
                         .right = value,
+                    },
+                },
+            );
+        }
+
+        return expr;
+    }
+
+    fn parseNullishCoalesce(self: *Parser) Error!*ast.Node {
+        var expr = try self.parseLogicalOr();
+
+        while (self.match(.question_question)) {
+            const right = try self.parseLogicalOr();
+            expr = try self.arena.createNode(
+                .binary_expr,
+                self.mergeLoc(expr.location, right.location),
+                .{
+                    .binary_expr = .{
+                        .op = .nullish_coalesce,
+                        .left = expr,
+                        .right = right,
                     },
                 },
             );
@@ -1754,6 +1775,29 @@ pub const Parser = struct {
                     .unary_expr = .{
                         .op = .typeof,
                         .argument = argument,
+                    },
+                },
+            );
+        }
+
+        // move expr - ownership transfer (DRC optimization)
+        // RESTRICTED: move only works with identifiers (variables)
+        // This prevents confusing semantics like `move obj.field` or `move getUser()`
+        if (self.match(.keyword_move)) {
+            const start_loc = self.previous.loc;
+
+            // Must be followed by an identifier
+            if (self.current.kind != .identifier) {
+                return self.reportError("'move' can only be applied to a variable name");
+            }
+
+            const operand = try self.parsePrimary(); // Parse just the identifier
+            return try self.arena.createNode(
+                .move_expr,
+                self.mergeLoc(start_loc, operand.location),
+                .{
+                    .move_expr = .{
+                        .operand = operand,
                     },
                 },
             );

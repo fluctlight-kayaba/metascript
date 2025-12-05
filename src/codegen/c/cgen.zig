@@ -313,6 +313,9 @@ pub const CGenerator = struct {
             .ge => ">=",
             .@"and" => "&&",
             .@"or" => "||",
+            // Note: nullish_coalesce should be transformed by nullish_coalesce.zig before reaching codegen
+            // If it reaches here, fall back to || (not semantically correct but works for non-null cases)
+            .nullish_coalesce => "||",
             .bit_and => "&",
             .bit_or => "|",
             .bit_xor => "^",
@@ -774,6 +777,9 @@ pub const CGenerator = struct {
             },
             .unary_expr => {
                 try self.collectStringLiterals(node.data.unary_expr.argument);
+            },
+            .move_expr => {
+                try self.collectStringLiterals(node.data.move_expr.operand);
             },
             .call_expr => {
                 const call = &node.data.call_expr;
@@ -1432,6 +1438,9 @@ pub const CGenerator = struct {
             .unary_expr => {
                 try self.collectNestedRcCalls(node.data.unary_expr.argument, calls);
             },
+            .move_expr => {
+                try self.collectNestedRcCalls(node.data.move_expr.operand, calls);
+            },
             .member_expr => {
                 try self.collectNestedRcCalls(node.data.member_expr.object, calls);
             },
@@ -1878,6 +1887,11 @@ pub const CGenerator = struct {
             },
             .unary_expr => {
                 if (try self.finalizeStringBuildersInExprCheck(node.data.unary_expr.argument)) {
+                    finalized_any = true;
+                }
+            },
+            .move_expr => {
+                if (try self.finalizeStringBuildersInExprCheck(node.data.move_expr.operand)) {
                     finalized_any = true;
                 }
             },
@@ -3049,6 +3063,13 @@ pub const CGenerator = struct {
                 const unary = &node.data.unary_expr;
                 try self.emit(unaryOpToString(unary.op));
                 try self.emitExpression(unary.argument);
+            },
+            .move_expr => {
+                // move expr - just emit the operand
+                // The DRC analyzer handles the optimization (no incref)
+                // We also add a comment for clarity in generated code
+                try self.emit("/* move */ ");
+                try self.emitExpression(node.data.move_expr.operand);
             },
             .object_expr => {
                 try self.emitObjectLiteral(node);

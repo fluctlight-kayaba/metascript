@@ -262,6 +262,7 @@ fn tokenKindToSemanticType(kind: token_mod.TokenKind) ?SemanticTokenType {
         .keyword_keyof,
         .keyword_defer,    // Metascript: defer cleanup
         .keyword_distinct, // Metascript: distinct types
+        .keyword_move,     // Metascript: move ownership
         .keyword_macro,    // Metascript: macro definition
         .keyword_quote,    // Metascript: quote expression
         .keyword_extern,   // Metascript: extern declaration
@@ -361,6 +362,7 @@ fn tokenKindToSemanticType(kind: token_mod.TokenKind) ?SemanticTokenType {
         .greater_equals,
         .ampersand_ampersand,
         .pipe_pipe,
+        .question_question,
         .bang,
         .ampersand,
         .pipe,
@@ -461,6 +463,7 @@ fn getHoverContent(kind: token_mod.TokenKind, text: []const u8) ?[]const u8 {
         .keyword_macro => "**macro** - Macro declaration\n\nDefines a compile-time macro with zero runtime cost.\n\n```typescript\nmacro function deriveEq(target) {\n    // Compile-time code\n    return target;\n}\n\n// Usage: called like normal function\nderiveEq(User);\n```",
         .keyword_defer => "**defer** - Defer statement\n\nExecutes cleanup code when scope exits.",
         .keyword_distinct => "**distinct** - Distinct type\n\nCreates a nominally distinct type.",
+        .keyword_move => "**move** - Transfer ownership\n\nOptimization: transfers ownership without reference counting overhead.\n\n```typescript\nfunction consume(move user: User): void {\n    // user ownership transferred here\n    // No incref/decref overhead\n}\n\nlet u = new User();\nconsume(move u);  // u is invalid after this\n```",
         .keyword_quote => "**quote** - Quote expression\n\nConverts code to AST at compile-time.",
         .keyword_extern => "**extern** - External declaration\n\nDeclares implementation provided externally.\n\n```typescript\nextern function printf(fmt: string): i32;\nextern class FILE;\nextern macro @target(...platforms: string[]): void;\n```",
 
@@ -1043,7 +1046,7 @@ pub const Server = struct {
             if (import_decl.resolved_path) |resolved| {
                 // Record the import relationship in Trans-Am
                 if (self.transam_db) |*db| {
-                    db.recordModuleImport(file_path, resolved) catch {};
+                    transam.module_graph.recordModuleImport(db, file_path, resolved) catch {};
                 }
 
                 // Load the dependency if not already loaded
@@ -1082,7 +1085,7 @@ pub const Server = struct {
         // Try to get content from Trans-Am (editor's in-memory buffer)
         // This is critical: the editor may have unsaved changes
         const source = if (self.transam_db) |*db|
-            db.getFileText(file_path)
+            transam.input_queries.getFileText(db, file_path)
         else
             null;
 
@@ -1106,7 +1109,7 @@ pub const Server = struct {
         for (module.imports.items) |import_decl| {
             if (import_decl.resolved_path) |resolved| {
                 if (self.transam_db) |*db| {
-                    db.recordModuleImport(file_path, resolved) catch {};
+                    transam.module_graph.recordModuleImport(db, file_path, resolved) catch {};
                 }
             }
         }
@@ -1432,7 +1435,7 @@ pub const Server = struct {
         // Feed into Trans-Am for incremental computation
         // Use file_path (not uri.string) to match handleDidChange and reloadModule
         if (self.transam_db) |*db| {
-            const changed = db.setFileText(file_path, text.string) catch false;
+            const changed = transam.input_queries.setFileText(db, file_path, text.string) catch false;
             if (changed) {
                 try stderr.print("[mls] Trans-Am: file registered (revision {d})\n", .{db.getRevision().value});
             }
@@ -1469,7 +1472,7 @@ pub const Server = struct {
         // Cancel all pending queries immediately (rust-analyzer pattern)
         // When user types, all in-flight macro expansions, type checks, etc. should abort
         if (self.transam_db) |*db| {
-            db.cancelPendingQueries();
+            transam.cancellation.cancelPendingQueries(db);
         }
 
         const params = msg.get("params") orelse return;
@@ -1525,18 +1528,18 @@ pub const Server = struct {
         var content_changed = false;
         if (self.transam_db) |*db| {
             if (entry.text) |current_text| {
-                content_changed = db.setFileText(file_path, current_text) catch false;
+                content_changed = transam.input_queries.setFileText(db, file_path, current_text) catch false;
                 if (content_changed) {
                     try stderr.print("[mls] Trans-Am: revision {d}\n", .{db.getRevision().value});
 
                     // Invalidate modules that depend on this file
-                    const invalidated = db.invalidateDependents(file_path) catch 0;
+                    const invalidated = transam.module_graph.invalidateDependents(db, file_path) catch 0;
                     if (invalidated > 0) {
                         try stderr.print("[mls] Invalidated {d} dependent module(s)\n", .{invalidated});
                     }
 
                     // Clear old imports before reloading
-                    db.clearModuleImports(file_path);
+                    transam.module_graph.clearModuleImports(db, file_path);
                 }
             }
         }
@@ -1691,7 +1694,7 @@ pub const Server = struct {
                         // This ensures we find the correct symbol when multiple variables share the same name
                         // Note: LSP uses 0-based lines, our parser uses 1-based, so add 1 to convert
                         const parser_line = line + 1;
-                        const symbol_result = db.lookupSymbolAtPosition(path, tok.text, parser_line, character) catch null;
+                        const symbol_result = transam.type_check.lookupSymbolAtPosition(db, path, tok.text, parser_line, character) catch null;
                         if (symbol_result) |symbol| {
                             const hover_text = formatSymbolHover(self.allocator, symbol) catch null;
                             if (hover_text) |content| {
@@ -2400,7 +2403,7 @@ pub const Server = struct {
                 // Use position-aware lookup to handle shadowed variables correctly
                 // LSP uses 0-based lines, parser uses 1-based, so add 1 to convert
                 const parser_line = line + 1;
-                const symbol_opt = db.lookupSymbolAtPosition(path, target_name.?, parser_line, character) catch null;
+                const symbol_opt = transam.type_check.lookupSymbolAtPosition(db, path, target_name.?, parser_line, character) catch null;
                 if (symbol_opt) |symbol| {
                     // Found symbol in type checker's symbol table
                     var buf = std.ArrayList(u8).init(self.allocator);
@@ -2788,7 +2791,7 @@ pub const Server = struct {
         // Add symbols from document using cached completions (L4)
         // Use file_path (not uri.string) to match setFileText key
         if (self.transam_db) |*db| {
-            const completions = if (file_path) |path| db.getCompletions(path) catch null else null;
+            const completions = if (file_path) |path| transam.completion.getCompletions(db, path) catch null else null;
             if (completions) |result| {
                 defer self.allocator.free(result.items);
                 for (result.items) |item| {
@@ -2866,7 +2869,7 @@ pub const Server = struct {
         // Try Trans-Am first (fast path with caching) - use file_path to match setFileText key
         const used_transam = if (self.transam_db) |*db| blk: {
             const path = file_path orelse break :blk false;
-            const syntax_tokens = db.getSyntaxTokens(path) catch {
+            const syntax_tokens = transam.highlight.getSyntaxTokens(db, path) catch {
                 break :blk false;
             };
             defer self.allocator.free(syntax_tokens);
@@ -3071,10 +3074,10 @@ pub const Server = struct {
         // Try Trans-Am first (fast path with caching) - use file_path to match setFileText key
         const used_transam = if (self.transam_db) |*db| blk: {
             const path = file_path orelse break :blk false;
-            const transam_diags = db.getDiagnostics(path) catch {
+            const transam_diags = transam.diagnostics_mod.getDiagnostics(db, path) catch {
                 break :blk false;
             };
-            defer db.freeDiagnostics(transam_diags);
+            defer transam.diagnostics_mod.freeDiagnostics(db, transam_diags);
 
             for (transam_diags) |td| {
                 // Copy message before freeDiagnostics is called (defer above)
@@ -3098,7 +3101,7 @@ pub const Server = struct {
             // Run type checker using cached Trans-Am infrastructure
             // (avoids creating new TypeChecker each time)
             if (transam_diags.len == 0) {
-                const check_result = db.checkFile(path) catch {
+                const check_result = transam.type_check.checkFile(db, path) catch {
                     break :blk true;
                 };
 
@@ -3124,8 +3127,8 @@ pub const Server = struct {
                 // Run DRC analysis for memory management diagnostics (use-after-move, cycles)
                 // Only run if no type errors - DRC needs a clean AST
                 if (check_result.errors.len == 0) {
-                    const drc_diags = db.getDrcDiagnostics(path) catch &[_]transam.DrcDiagnosticType{};
-                    defer db.freeDrcDiagnostics(drc_diags);
+                    const drc_diags = transam.type_check.getDrcDiagnostics(db, path) catch &[_]transam.DrcDiagnosticType{};
+                    defer transam.type_check.freeDrcDiagnostics(db, drc_diags);
 
                     for (drc_diags) |drc_diag| {
                         // Copy message before freeDrcDiagnostics is called (defer above)
@@ -3206,7 +3209,7 @@ pub const Server = struct {
 
         // Reset cancellation flag after diagnostics complete
         if (self.transam_db) |*db| {
-            db.resetAfterCancellation();
+            transam.cancellation.resetAfterCancellation(db);
         }
 
         // Send publishDiagnostics notification
@@ -3354,7 +3357,7 @@ pub const Server = struct {
         // Fall back to Trans-Am on-demand query
         const file_path = uriToPath(uri) orelse return null;
         if (self.transam_db) |*db| {
-            const ownership = db.getVariableOwnership(file_path, var_name) catch return null;
+            const ownership = transam.type_check.getVariableOwnership(db, file_path, var_name) catch return null;
             if (ownership) |o| {
                 // Create a temporary variable struct for formatting
                 const variable = drc_mod.Variable{

@@ -30,6 +30,8 @@ pub const TypeError = struct {
         readonly_assignment,
         missing_implementation,
         incompatible_override,
+        use_after_move,
+        move_in_loop,
     };
 };
 
@@ -52,6 +54,8 @@ pub const TypeChecker = struct {
     loader: ?*module_loader.ModuleLoader = null,
     /// Current module path being type-checked (for import resolution)
     current_module_path: ?[]const u8 = null,
+    /// Track variables that have been moved (use-after-move detection)
+    moved_variables: std.StringHashMap(location.SourceLocation) = undefined,
 
     pub fn init(allocator: std.mem.Allocator) !TypeChecker {
         return .{
@@ -63,6 +67,7 @@ pub const TypeChecker = struct {
             .current_class_type = null,
             .loader = null,
             .current_module_path = null,
+            .moved_variables = std.StringHashMap(location.SourceLocation).init(allocator),
         };
     }
 
@@ -81,6 +86,7 @@ pub const TypeChecker = struct {
         self.errors.deinit();
         self.message_arena.deinit();
         self.type_arena.deinit();
+        self.moved_variables.deinit();
     }
 
     /// Format a type mismatch error message with actual type names
@@ -672,9 +678,27 @@ pub const TypeChecker = struct {
                 }
             },
             .binary_expr => {
-                try self.checkTypes(node.data.binary_expr.left);
-                try self.checkTypes(node.data.binary_expr.right);
-                try self.checkBinaryExpr(node);
+                const bin = &node.data.binary_expr;
+
+                // P1 FIX: Handle reassignment to moved variable
+                // Assignment to a moved variable resets its state (it now holds a fresh value)
+                if (bin.op == .assign and bin.left.kind == .identifier) {
+                    const name = bin.left.data.identifier;
+
+                    // Check right side first (may use moved vars)
+                    try self.checkTypes(bin.right);
+
+                    // Clear moved state - variable now holds a new value
+                    _ = self.moved_variables.remove(name);
+
+                    // Don't check left side - it's the assignment target, not a use
+                    try self.checkBinaryExpr(node);
+                } else {
+                    // Normal case - check both sides
+                    try self.checkTypes(bin.left);
+                    try self.checkTypes(bin.right);
+                    try self.checkBinaryExpr(node);
+                }
             },
             .block_stmt => {
                 for (node.data.block_stmt.statements) |stmt| {
@@ -748,6 +772,9 @@ pub const TypeChecker = struct {
                     try self.symbols.enterScopeWithLocation(.function, body.location);
                     defer self.symbols.exitScope();
 
+                    // Clear moved variables tracking for new function scope
+                    self.moved_variables.clearRetainingCapacity();
+
                     // Register function parameters in scope
                     for (func.params) |param| {
                         var param_sym = symbol.Symbol.init(param.name, .parameter, node.location);
@@ -802,6 +829,9 @@ pub const TypeChecker = struct {
                     try self.symbols.enterScopeWithLocation(.function, body.location);
                     defer self.symbols.exitScope();
 
+                    // Clear moved variables tracking for new method scope
+                    self.moved_variables.clearRetainingCapacity();
+
                     // Register method parameters in scope
                     for (method.params) |param| {
                         var param_sym = symbol.Symbol.init(param.name, .parameter, node.location);
@@ -841,6 +871,9 @@ pub const TypeChecker = struct {
                 // Enter function scope and set return type
                 try self.symbols.enterScopeWithLocation(.function, body.location);
                 defer self.symbols.exitScope();
+
+                // Clear moved variables tracking for new lambda scope
+                self.moved_variables.clearRetainingCapacity();
 
                 // Register function expression parameters in scope
                 for (func_expr.params) |param| {
@@ -944,6 +977,71 @@ pub const TypeChecker = struct {
                             }
                         }
                     }
+                }
+            },
+            .move_expr => {
+                // Mark the variable as moved
+                const operand = node.data.move_expr.operand;
+                if (operand.kind == .identifier) {
+                    const name = operand.data.identifier;
+
+                    // P0 FIX: Move inside loop body is always an error
+                    // The loop executes multiple times, so 2nd iteration = use-after-move
+                    if (self.symbols.isInLoop()) {
+                        const arena_alloc = self.message_arena.allocator();
+                        const msg = std.fmt.allocPrint(arena_alloc, "cannot move '{s}' inside a loop - variable would be invalid on next iteration", .{name}) catch "cannot move inside loop";
+                        try self.errors.append(.{
+                            .message = msg,
+                            .location = node.location,
+                            .kind = .move_in_loop,
+                        });
+                        // Don't mark as moved - already errored
+                    } else if (self.moved_variables.get(name)) |prev_move_loc| {
+                        // Check for double-move (moving already-moved variable)
+                        const arena_alloc = self.message_arena.allocator();
+                        const msg = std.fmt.allocPrint(arena_alloc, "variable '{s}' was already moved at line {d}", .{ name, prev_move_loc.start.line }) catch "variable already moved";
+                        try self.errors.append(.{
+                            .message = msg,
+                            .location = node.location,
+                            .kind = .use_after_move,
+                        });
+                    } else {
+                        // Mark as moved
+                        try self.moved_variables.put(name, node.location);
+                    }
+                }
+                // NOTE: Don't recurse into operand - the identifier inside move is not a regular use
+                // The move consumes the variable, it doesn't use it in the regular sense
+            },
+            .identifier => {
+                // Check if this variable has been moved
+                const name = node.data.identifier;
+                if (self.moved_variables.get(name)) |move_loc| {
+                    const arena_alloc = self.message_arena.allocator();
+                    const msg = std.fmt.allocPrint(arena_alloc, "use of moved variable '{s}' (moved at line {d})", .{ name, move_loc.start.line }) catch "use of moved variable";
+                    try self.errors.append(.{
+                        .message = msg,
+                        .location = node.location,
+                        .kind = .use_after_move,
+                    });
+                }
+            },
+            .member_expr => {
+                // Check the object part for use-after-move
+                try self.checkTypes(node.data.member_expr.object);
+            },
+            .unary_expr => {
+                try self.checkTypes(node.data.unary_expr.argument);
+            },
+            .array_expr => {
+                for (node.data.array_expr.elements) |elem| {
+                    try self.checkTypes(elem);
+                }
+            },
+            .new_expr => {
+                const new_expr = &node.data.new_expr;
+                for (new_expr.arguments) |arg| {
+                    try self.checkTypes(arg);
                 }
             },
             else => {},
@@ -1164,6 +1262,16 @@ pub const TypeChecker = struct {
                         .message = "bitwise operation requires integer operands",
                         .location = node.location,
                         .kind = .invalid_operation,
+                    });
+                }
+            },
+            // Nullish coalesce (??) - right side must be compatible with left
+            .nullish_coalesce => {
+                if (!self.typesCompatible(left_type.?, right_type.?)) {
+                    try self.errors.append(.{
+                        .message = "nullish coalesce requires compatible types",
+                        .location = node.location,
+                        .kind = .type_mismatch,
                     });
                 }
             },

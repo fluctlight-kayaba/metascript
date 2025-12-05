@@ -24,6 +24,7 @@ pub const NodeKind = enum {
     function_expr,    // function() {} or () => {}
     conditional_expr, // a ? b : c
     spread_element,   // ...expr (in object/array literals)
+    move_expr,        // move expr (ownership transfer)
 
     // ===== Statements =====
     block_stmt,       // { ... }
@@ -87,6 +88,7 @@ pub const BinaryOp = enum {
     // Logical
     @"and",   // &&
     @"or",    // ||
+    nullish_coalesce, // ??
 
     // Bitwise
     bit_and,  // &
@@ -143,6 +145,7 @@ pub const Node = struct {
         function_expr: FunctionExpr,
         conditional_expr: ConditionalExpr,
         spread_element: SpreadElement,
+        move_expr: MoveExpr,
 
         // Statements
         block_stmt: BlockStmt,
@@ -198,6 +201,7 @@ pub const Node = struct {
             .array_expr,
             .object_expr,
             .spread_element,
+            .move_expr,
             .function_expr,
             .conditional_expr,
             => true,
@@ -295,6 +299,12 @@ pub const ConditionalExpr = struct {
 
 pub const SpreadElement = struct {
     argument: *Node, // The expression being spread
+};
+
+/// Move expression - transfers ownership without RC overhead
+/// Used for optimization: `move expr` tells compiler to transfer ownership
+pub const MoveExpr = struct {
+    operand: *Node, // The expression being moved (typically an identifier)
 };
 
 // ===== Statement node types =====

@@ -53,6 +53,7 @@ pub fn binaryOpToJS(op: node_mod.BinaryOp) []const u8 {
         .ge => ">=",
         .@"and" => "&&",
         .@"or" => "||",
+        .nullish_coalesce => "??",
         .bit_and => "&",
         .bit_or => "|",
         .bit_xor => "^",

@@ -107,17 +107,20 @@ pub const ModuleResolver = struct {
         defer self.allocator.free(joined);
 
         // Try with .ms extension if not present
-        const resolved = if (std.mem.endsWith(u8, specifier, ".ms"))
+        const with_ext = if (std.mem.endsWith(u8, specifier, ".ms"))
             try self.allocator.dupe(u8, joined)
         else
             try std.fmt.allocPrint(self.allocator, "{s}.ms", .{joined});
+        defer self.allocator.free(with_ext);
 
-        if (self.fileExists(resolved)) {
-            return resolved;
-        }
+        // Normalize the path using realpath to resolve ./././ chains
+        const resolved = std.fs.cwd().realpathAlloc(self.allocator, with_ext) catch |err| {
+            // File doesn't exist or can't be resolved
+            if (err == error.FileNotFound) return null;
+            return null;
+        };
 
-        self.allocator.free(resolved);
-        return null;
+        return resolved;
     }
 
     /// Resolve package imports (future: node_modules style)

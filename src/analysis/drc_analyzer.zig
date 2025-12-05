@@ -368,16 +368,37 @@ pub const DrcAnalyzer = struct {
                 // to prevent incorrect move optimization on duplicates like f(x, x)
                 for (call.arguments, 0..) |arg, arg_idx| {
                     // Use lifetime system for function arguments (Lobster-style)
-                    if (arg.kind == .identifier) {
-                        const name = arg.data.identifier;
-                        const arg_line = arg.location.start.line;
-                        const arg_col = arg.location.start.column;
+                    // Handle both plain identifiers and move expressions
+
+                    // Check if this is a move expression wrapping an identifier
+                    const is_move_expr = arg.kind == .move_expr;
+                    const actual_arg = if (is_move_expr) arg.data.move_expr.operand else arg;
+
+                    if (actual_arg.kind == .identifier) {
+                        const name = actual_arg.data.identifier;
+                        const arg_line = actual_arg.location.start.line;
+                        const arg_col = actual_arg.location.start.column;
+
+                        // Explicit move: transfer ownership unconditionally
+                        if (is_move_expr) {
+                            // User explicitly marked this as move - force ownership transfer
+                            if (self.drc.variables.getPtr(name)) |vptr| {
+                                vptr.ownership_state = .moved;
+                                self.drc.stats.ops_elided += 1; // Elided the incref
+                                self.drc.stats.moves += 1;
+                            }
+                            // Track as owned (ownership transferred)
+                            try self.drc.trackUse(name, arg_line, arg_col, .function_arg_owned);
+                            try self.analyzeExpression(actual_arg);
+                            continue;
+                        }
 
                         // Count how many times this variable appears in the call args
                         var occurrence_count: usize = 0;
                         for (call.arguments) |other_arg| {
-                            if (other_arg.kind == .identifier) {
-                                if (std.mem.eql(u8, other_arg.data.identifier, name)) {
+                            const check_arg = if (other_arg.kind == .move_expr) other_arg.data.move_expr.operand else other_arg;
+                            if (check_arg.kind == .identifier) {
+                                if (std.mem.eql(u8, check_arg.data.identifier, name)) {
                                     occurrence_count += 1;
                                 }
                             }
@@ -449,6 +470,11 @@ pub const DrcAnalyzer = struct {
             .unary_expr => {
                 const un = &node.data.unary_expr;
                 try self.analyzeExpression(un.argument);
+            },
+            .move_expr => {
+                // Explicit move expression - analyze the operand
+                // The actual move handling is done in call_expr processing above
+                try self.analyzeExpression(node.data.move_expr.operand);
             },
             else => {},
         }

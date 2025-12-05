@@ -1140,6 +1140,9 @@ pub const ErlangGenerator = struct {
             .ge => ">=",
             .@"and" => "andalso",
             .@"or" => "orelse",
+            // Note: nullish_coalesce should be transformed before reaching codegen
+            // Fall back to orelse which has similar short-circuit behavior
+            .nullish_coalesce => "orelse",
             .bit_and => "band",
             .bit_or => "bor",
             .bit_xor => "bxor",

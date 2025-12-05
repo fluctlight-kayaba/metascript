@@ -129,7 +129,8 @@ typedef struct msTypeInfo {
 typedef struct {
     uint8_t color : 2;      /* Bacon-Rajan color (BLACK, PURPLE, GRAY, WHITE) */
     uint8_t buffered : 1;   /* In root list for cycle detection */
-    uint8_t _reserved : 5;  /* Reserved for future use */
+    uint8_t scheduled : 1;  /* Scheduled for collection (in to_free list) */
+    uint8_t _reserved : 4;  /* Reserved for future use */
 } msFlags;
 
 /*
@@ -253,6 +254,55 @@ MS_ORC_EXTERN uint64_t ms_stats_deallocations;
 MS_ORC_EXTERN uint64_t ms_stats_cycle_collections;
 MS_ORC_EXTERN uint64_t ms_stats_acyclic_skipped;
 
+/*
+ * ============================================================================
+ * LEAK DETECTION DEBUG MODE
+ * ============================================================================
+ *
+ * When MS_DEBUG_LEAKS is defined, all allocations are tracked with file:line
+ * info. Call ms_report_leaks() at program exit to see unreleased memory.
+ *
+ * Usage:
+ *   #define MS_DEBUG_LEAKS
+ *   #define MS_ORC_IMPLEMENTATION
+ *   #include "orc.h"
+ *
+ *   // ... your code ...
+ *
+ *   // At program exit:
+ *   ms_report_leaks();  // Prints all unreleased allocations
+ *
+ * For automatic reporting, use MS_DEBUG_LEAKS_ATEXIT:
+ *   #define MS_DEBUG_LEAKS
+ *   #define MS_DEBUG_LEAKS_ATEXIT
+ *   #include "orc.h"
+ *   // ms_report_leaks() called automatically at exit
+ */
+#ifdef MS_DEBUG_LEAKS
+
+#include <stdio.h>
+
+#ifndef MS_MAX_TRACKED_ALLOCS
+#define MS_MAX_TRACKED_ALLOCS 65536
+#endif
+
+/* Allocation tracking entry */
+typedef struct {
+    void* ptr;              /* User pointer (after header) */
+    const char* file;       /* Source file */
+    int line;               /* Source line */
+    size_t size;            /* Allocation size */
+    const char* type_name;  /* Type name if known */
+} msAllocInfo;
+
+/* Global tracking state */
+MS_ORC_EXTERN msAllocInfo ms_alloc_tracker[MS_MAX_TRACKED_ALLOCS];
+MS_ORC_EXTERN size_t ms_alloc_tracker_count;
+MS_ORC_EXTERN size_t ms_peak_allocations;
+MS_ORC_EXTERN size_t ms_total_bytes_allocated;
+
+#endif /* MS_DEBUG_LEAKS */
+
 /* Forward declaration */
 static inline void ms_collect_cycles(void);
 
@@ -276,6 +326,7 @@ static inline void* ms_alloc(size_t size) {
     header->rc = 1;
     header->flags.color = MS_COLOR_BLACK;
     header->flags.buffered = 0;
+    header->flags.scheduled = 0;
     header->flags._reserved = 0;
     ms_set_type_id(header, 0);  /* Unknown type initially */
 
@@ -287,12 +338,130 @@ static inline void* ms_alloc(size_t size) {
  * Set type info for an object (registers type if needed)
  * Should be called once after allocation for cyclic types
  */
+#ifndef MS_DEBUG_LEAKS
 static inline void ms_set_type(void* ptr, const msTypeInfo* type_info) {
     if (ptr == NULL || type_info == NULL) return;
     msRefHeader* header = ms_get_header(ptr);
     uint32_t type_id = ms_register_type(type_info);
     ms_set_type_id(header, type_id);
 }
+#endif
+
+/*
+ * ============================================================================
+ * LEAK DETECTION INLINE FUNCTIONS
+ * ============================================================================
+ */
+#ifdef MS_DEBUG_LEAKS
+
+/* Track an allocation (internal) */
+static inline void ms_track_alloc(void* ptr, size_t size, const char* file, int line) {
+    if (ms_alloc_tracker_count >= MS_MAX_TRACKED_ALLOCS) {
+        fprintf(stderr, "[MS_DEBUG_LEAKS] WARNING: Tracker full at %s:%d\n", file, line);
+        return;
+    }
+    ms_alloc_tracker[ms_alloc_tracker_count] = (msAllocInfo){
+        .ptr = ptr,
+        .file = file,
+        .line = line,
+        .size = size,
+        .type_name = NULL,
+    };
+    ms_alloc_tracker_count++;
+    ms_total_bytes_allocated += size;
+    if (ms_alloc_tracker_count > ms_peak_allocations) {
+        ms_peak_allocations = ms_alloc_tracker_count;
+    }
+}
+
+/* Untrack an allocation (internal) */
+static inline void ms_untrack_alloc(void* ptr) {
+    for (size_t i = 0; i < ms_alloc_tracker_count; i++) {
+        if (ms_alloc_tracker[i].ptr == ptr) {
+            ms_alloc_tracker[i] = ms_alloc_tracker[ms_alloc_tracker_count - 1];
+            ms_alloc_tracker_count--;
+            return;
+        }
+    }
+    fprintf(stderr, "[MS_DEBUG_LEAKS] WARNING: Freeing untracked %p\n", ptr);
+}
+
+/* Set type name for tracked allocation */
+static inline void ms_track_set_type(void* ptr, const char* type_name) {
+    for (size_t i = 0; i < ms_alloc_tracker_count; i++) {
+        if (ms_alloc_tracker[i].ptr == ptr) {
+            ms_alloc_tracker[i].type_name = type_name;
+            return;
+        }
+    }
+}
+
+/* Report all leaked allocations */
+static inline void ms_report_leaks(void) {
+    if (ms_alloc_tracker_count == 0) {
+        printf("[MS_DEBUG_LEAKS] No memory leaks detected.\n");
+        printf("[MS_DEBUG_LEAKS] Peak: %zu allocs, Total: %zu bytes\n",
+               ms_peak_allocations, ms_total_bytes_allocated);
+        return;
+    }
+
+    printf("\n============================================================\n");
+    printf("[MS_DEBUG_LEAKS] MEMORY LEAK REPORT\n");
+    printf("============================================================\n");
+    printf("Leaked: %zu allocations\n", ms_alloc_tracker_count);
+    printf("Peak: %zu allocations\n", ms_peak_allocations);
+    printf("Total allocated: %zu bytes\n", ms_total_bytes_allocated);
+    printf("------------------------------------------------------------\n");
+
+    size_t total_leaked = 0;
+    for (size_t i = 0; i < ms_alloc_tracker_count; i++) {
+        msAllocInfo* info = &ms_alloc_tracker[i];
+        printf("  [%zu] %s:%d - %zu bytes",
+               i + 1, info->file ? info->file : "?", info->line, info->size);
+        if (info->type_name) printf(" (%s)", info->type_name);
+        printf(" @ %p\n", info->ptr);
+        total_leaked += info->size;
+    }
+
+    printf("------------------------------------------------------------\n");
+    printf("Total leaked: %zu bytes\n", total_leaked);
+    printf("============================================================\n\n");
+}
+
+/* Tracked allocation with file:line info */
+static inline void* ms_alloc_tracked(size_t size, const char* file, int line) {
+    void* mem = malloc(sizeof(msRefHeader) + size);
+    if (mem == NULL) return NULL;
+
+    msRefHeader* header = (msRefHeader*)mem;
+    header->rc = 1;
+    header->flags.color = MS_COLOR_BLACK;
+    header->flags.buffered = 0;
+    header->flags.scheduled = 0;
+    header->flags._reserved = 0;
+    ms_set_type_id(header, 0);
+
+    ms_stats_allocations++;
+    void* ptr = (char*)mem + sizeof(msRefHeader);
+    ms_track_alloc(ptr, size, file, line);
+    return ptr;
+}
+
+/* Tracked ms_set_type */
+static inline void ms_set_type_tracked(void* ptr, const msTypeInfo* type_info) {
+    if (ptr == NULL || type_info == NULL) return;
+    msRefHeader* header = ms_get_header(ptr);
+    uint32_t type_id = ms_register_type(type_info);
+    ms_set_type_id(header, type_id);
+    ms_track_set_type(ptr, type_info->name);
+}
+
+/* Override ms_alloc and ms_set_type with tracked versions */
+#undef ms_alloc
+#define ms_alloc(size) ms_alloc_tracked(size, __FILE__, __LINE__)
+#define ms_set_type(ptr, type_info) ms_set_type_tracked(ptr, type_info)
+
+#endif /* MS_DEBUG_LEAKS */
 
 /*
  * Increment reference count
@@ -355,6 +524,11 @@ static inline void ms_free_object(void* ptr, msRefHeader* header, const msTypeIn
     if (header->flags.buffered) {
         ms_remove_from_roots(header);
     }
+
+#ifdef MS_DEBUG_LEAKS
+    /* Untrack this allocation */
+    ms_untrack_alloc(ptr);
+#endif
 
     /* Free memory */
     free(header);
@@ -568,16 +742,81 @@ static void ms_scan(msRefHeader* header, void* obj, const msTypeInfo* type_info)
 /*
  * Collect (free) a WHITE object and its WHITE children recursively.
  *
- * ELEGANT O(1) DESIGN:
- * - Check color != WHITE at entry → skip already-processed objects
- * - Mark BLACK immediately → prevent re-entry during recursion
- * - Trace children first (depth-first) → children freed before parent
- * - Then free this object
+ * DESIGN: Two-phase approach for cycle safety
+ * - Objects in to_free (scheduled=1) are freed without tracing
+ * - Non-root children (scheduled=0) are traced and freed recursively
  *
- * No temporary arrays needed. No O(n) searches. Just recursive traversal
- * with proper state management.
+ * The key insight: In a cycle where all members are roots, they're all in
+ * to_free with scheduled=1. We don't trace them to avoid use-after-free
+ * when one member's child pointer points to an already-freed member.
+ * For non-root children (only reachable from a root), we trace normally.
  */
 static void ms_collect_white_callback(void* child);
+
+/*
+ * Hash set for tracking freed pointers during collection.
+ * Uses open addressing with linear probing for O(1) average insert/lookup.
+ * This prevents use-after-free when tracing cycles with already-freed members.
+ */
+static void** ms_freed_buckets = NULL;
+static size_t ms_freed_capacity = 0;
+static size_t ms_freed_count = 0;
+
+/* FNV-1a hash for pointers */
+static inline size_t ms_ptr_hash(void* ptr) {
+    uintptr_t val = (uintptr_t)ptr;
+    /* Mix bits for better distribution */
+    val ^= val >> 33;
+    val *= 0xff51afd7ed558ccdULL;
+    val ^= val >> 33;
+    val *= 0xc4ceb9fe1a85ec53ULL;
+    val ^= val >> 33;
+    return (size_t)val;
+}
+
+static void ms_freed_init(size_t expected_count) {
+    /* Size to ~50% load factor for good performance */
+    ms_freed_capacity = expected_count * 2;
+    if (ms_freed_capacity < 16) ms_freed_capacity = 16;
+    ms_freed_buckets = (void**)calloc(ms_freed_capacity, sizeof(void*));
+    ms_freed_count = 0;
+}
+
+static void ms_freed_cleanup(void) {
+    if (ms_freed_buckets) {
+        free(ms_freed_buckets);
+        ms_freed_buckets = NULL;
+    }
+    ms_freed_capacity = 0;
+    ms_freed_count = 0;
+}
+
+static void ms_freed_add(void* ptr) {
+    if (ms_freed_buckets == NULL || ms_freed_count >= ms_freed_capacity / 2) {
+        return;  /* Safety: don't overflow */
+    }
+    size_t idx = ms_ptr_hash(ptr) % ms_freed_capacity;
+    /* Linear probing */
+    while (ms_freed_buckets[idx] != NULL) {
+        if (ms_freed_buckets[idx] == ptr) return;  /* Already present */
+        idx = (idx + 1) % ms_freed_capacity;
+    }
+    ms_freed_buckets[idx] = ptr;
+    ms_freed_count++;
+}
+
+static bool ms_freed_contains(void* ptr) {
+    if (ms_freed_buckets == NULL) return false;
+    size_t idx = ms_ptr_hash(ptr) % ms_freed_capacity;
+    size_t start = idx;
+    /* Linear probing */
+    while (ms_freed_buckets[idx] != NULL) {
+        if (ms_freed_buckets[idx] == ptr) return true;
+        idx = (idx + 1) % ms_freed_capacity;
+        if (idx == start) break;  /* Full circle */
+    }
+    return false;
+}
 
 static void ms_collect_white(msRefHeader* header) {
     /* Only process WHITE objects - skip BLACK/GRAY/already-collected */
@@ -594,22 +833,34 @@ static void ms_collect_white(msRefHeader* header) {
     printf("[ORC]   Collecting: %s\n", type_info ? type_info->name : "unknown");
 #endif
 
-    /* First, recursively collect WHITE children (depth-first post-order) */
+    /* Recursively collect WHITE children that are NOT scheduled.
+     * Scheduled children are in to_free and will be freed by the iteration. */
     if (type_info && type_info->trace_fn) {
         type_info->trace_fn(obj, ms_collect_white_callback);
     }
 
-    /* Now free this object (children already freed) */
+    /* Now free this object (children already freed or scheduled) */
     header->flags.buffered = 0;
+    header->flags.scheduled = 0;
     if (type_info && type_info->destroy_fn) {
         type_info->destroy_fn(obj);
     }
+#ifdef MS_DEBUG_LEAKS
+    ms_untrack_alloc(obj);
+#endif
+    ms_freed_add(obj);  /* Track freed pointer */
     free(header);
     ms_stats_deallocations++;
 }
 
 static void ms_collect_white_callback(void* child) {
+    /* Check if already freed (prevents use-after-free in cycles) */
+    if (ms_freed_contains(child)) return;
+
     msRefHeader* header = ms_get_header(child);
+    /* Skip children that are scheduled for collection (they're in to_free list
+     * and will be freed by the iteration in collect_cycles). */
+    if (header->flags.scheduled) return;
     ms_collect_white(header);
 }
 
@@ -673,20 +924,29 @@ static inline void ms_collect_cycles(void) {
     }
 
     /* Phase 3: Collect garbage (WHITE objects)
-     * - ms_collect_white checks color==WHITE, skips non-WHITE
-     * - Marks BLACK immediately to prevent double-free
-     * - Recursively frees children first (depth-first post-order)
+     *
+     * CRITICAL: Two-pass approach to avoid use-after-free!
+     * When ms_collect_white recursively frees children, those children may also
+     * be in the roots array. If we check header->flags.color on a freed header,
+     * we get use-after-free. Solution:
+     *   Pass 1: Scan all roots while headers are still valid, collect WHITE ones
+     *   Pass 2: Free collected WHITE headers (recursive free is now safe)
      */
 #ifdef DEBUG_ORC
     printf("[ORC] Phase3: Collecting garbage\n");
 #endif
+
+    /* Pass 1: Collect WHITE roots into to_free list (all headers still valid) */
+    msRefHeader* to_free[MS_MAX_ROOTS];
+    size_t to_free_count = 0;
+
     for (size_t i = 0; i < ms_root_count; i++) {
         msRefHeader* header = ms_roots[i].header;
 #ifdef DEBUG_ORC
         printf("[ORC] Phase3 root[%zu]: rc=%u color=%d\n", i, header->rc, header->flags.color);
 #endif
         if (header->flags.color == MS_COLOR_WHITE) {
-            ms_collect_white(header);
+            to_free[to_free_count++] = header;
         } else {
             /* Live object - reset to clean state */
             header->flags.color = MS_COLOR_BLACK;
@@ -694,8 +954,25 @@ static inline void ms_collect_cycles(void) {
         }
     }
 
-    /* All roots processed - clear the list */
+    /* Clear roots before freeing (prevent re-add during recursive free) */
     ms_root_count = 0;
+
+    /* Mark all to_free headers as scheduled (prevents recursive free from
+     * processing them - they'll be freed by the iteration below) */
+    for (size_t i = 0; i < to_free_count; i++) {
+        to_free[i]->flags.scheduled = 1;
+    }
+
+    /* Initialize freed pointer tracking (prevents use-after-free in cycles) */
+    ms_freed_init(to_free_count * 2);  /* Extra capacity for non-root children */
+
+    /* Pass 2: Free all collected WHITE headers */
+    for (size_t i = 0; i < to_free_count; i++) {
+        ms_collect_white(to_free[i]);
+    }
+
+    /* Cleanup freed pointer tracking */
+    ms_freed_cleanup();
 
 #ifdef DEBUG_ORC
     printf("[ORC] Collect done\n");
@@ -795,6 +1072,23 @@ uint64_t ms_stats_allocations = 0;
 uint64_t ms_stats_deallocations = 0;
 uint64_t ms_stats_cycle_collections = 0;
 uint64_t ms_stats_acyclic_skipped = 0;
+
+#ifdef MS_DEBUG_LEAKS
+/* Leak tracking storage */
+msAllocInfo ms_alloc_tracker[MS_MAX_TRACKED_ALLOCS] = {0};
+size_t ms_alloc_tracker_count = 0;
+size_t ms_peak_allocations = 0;
+size_t ms_total_bytes_allocated = 0;
+
+#ifdef MS_DEBUG_LEAKS_ATEXIT
+/* Auto-register ms_report_leaks at exit */
+__attribute__((constructor))
+static void ms_register_leak_report(void) {
+    atexit(ms_report_leaks);
+}
+#endif /* MS_DEBUG_LEAKS_ATEXIT */
+
+#endif /* MS_DEBUG_LEAKS */
 
 #endif /* MS_ORC_IMPLEMENTATION */
 

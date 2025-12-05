@@ -465,6 +465,7 @@ fn binaryOpToJS(op: ast.BinaryOp) []const u8 {
         .bit_xor => "^",
         .shl => "<<",
         .shr => ">>",
+        .nullish_coalesce => "??",
     };
 }
 

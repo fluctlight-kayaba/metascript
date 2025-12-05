@@ -93,23 +93,16 @@ typedef struct msTypeInfo {
   │                         COMPILER PIPELINE                           │
   ├─────────────────────────────────────────────────────────────────────┤
   │                                                                     │
-  │   Source → Parse → Type Check → OWNERSHIP ANALYSIS → RC ANNOTATION  │
-  │                                  ↓                   ↓              │
-  │                            ownership.zig      rc_annotation.zig     │
-  │                                                      ↓              │
-  │                                              Annotated AST          │
-  │                                                      ↓              │
-  │                    ┌─────────────────────────────────┼──────────────┤
-  │                    ▼                                 ▼              │
-  │               CYCLE DETECTION                    CODEGEN            │
-  │            cycle_detection.zig              (reads annotations)     │
-  │                    │                                 │              │
-  │                    └────────────┬────────────────────┘              │
-  │                                 ▼                                   │
-  │                            rc_trait.zig                             │
-  │                         (how to emit RC)                            │
-  │                                 │                                   │
-  │          ┌───────────┬──────────┼───────────┬────────────┐          │
+  │   Source → Parse → Type Check → DRC ANALYSIS → CODEGEN              │
+  │                                      ↓             ↓                │
+  │                                   drc.zig    (reads annotations)    │
+  │                                      │                              │
+  │                          ┌───────────┼───────────┐                  │
+  │                          ▼           ▼           ▼                  │
+  │                   ownership.zig  cycle_detection.zig  rc_trait.zig  │
+  │                   (semantic)     (Bacon-Rajan)     (emit helpers)   │
+  │                                                                     │
+  │          ┌───────────┬──────────┬───────────┬────────────┐          │
   │          ▼           ▼          ▼           ▼            ▼          │
   │          C          Zig       Rust       Swift         JS/Erlang    │
   │     ms_incref   @atomicAdd  Rc::clone    (ARC)         (noop)       │

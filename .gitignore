@@ -44,11 +44,11 @@ src/runtime/drc_test
 /examples/output/
 
 # Generated C/JS files from .ms sources
-examples/*.c
-examples/*.js
-examples/*.erl
-examples/*.dump
-examples/*.beam
+examples/**/*.c
+examples/**/*.js
+examples/**/*.erl
+examples/**/*.dump
+examples/**/*.beam
 !examples/README.md
 
 /tests/fixtures/**/*.c

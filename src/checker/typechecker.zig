@@ -240,6 +240,7 @@ pub const TypeChecker = struct {
                 // Create object type for the class (with name for debugging and is_cyclic for ORC)
                 sym.type = try self.createClassTypeNamed(class.name, class.members, node.location);
                 sym.doc_comment = node.doc_comment; // Propagate JSDoc from AST
+                sym.decl_node = node; // Store AST node for inheritance checking
 
                 self.symbols.define(sym) catch {
                     try self.errors.append(.{
@@ -266,6 +267,7 @@ pub const TypeChecker = struct {
                 const iface = &node.data.interface_decl;
                 var sym = symbol.Symbol.init(iface.name, .interface, node.location);
                 sym.doc_comment = node.doc_comment; // Propagate JSDoc from AST
+                sym.decl_node = node; // Store AST node for interface implementation checking
 
                 self.symbols.define(sym) catch {
                     try self.errors.append(.{
@@ -1049,88 +1051,216 @@ pub const TypeChecker = struct {
     fn checkInterfaceImplementation(self: *TypeChecker, class_node: *ast.Node, iface_type: *types.Type) !void {
         const class = &class_node.data.class_decl;
 
-        // Resolve interface type to get its methods
-        if (iface_type.kind != .object and iface_type.kind != .type_reference) {
-            return; // Not a valid interface type
-        }
+        // Get interface name from type reference
+        const iface_name = switch (iface_type.kind) {
+            .type_reference => iface_type.data.type_reference.name,
+            .object => {
+                // Already resolved object type - use old path
+                return self.checkInterfaceImplementationFromObject(class_node, iface_type.data.object);
+            },
+            else => return, // Not a valid interface type
+        };
 
-        // For type_reference, we'd need to look up the interface definition
-        // For now, handle object types directly
-        if (iface_type.kind == .object) {
-            const iface = iface_type.data.object;
+        // Look up interface symbol
+        const iface_sym = self.symbols.lookup(iface_name) orelse return;
+        if (iface_sym.kind != .interface) return;
 
-            // Check each interface method is implemented
-            for (iface.methods) |iface_method| {
-                var found = false;
-                for (class.members) |member| {
-                    if (member.kind == .method_decl) {
-                        const method = &member.data.method_decl;
-                        if (std.mem.eql(u8, method.name, iface_method.name)) {
-                            found = true;
-                            // Check method signature compatibility
-                            if (method.return_type) |ret_type| {
-                                if (iface_method.type.kind == .function) {
-                                    // Check return type is compatible
-                                    const iface_func = iface_method.type.data.function;
-                                    if (!self.typesCompatible(iface_func.return_type, ret_type)) {
-                                        const msg = self.formatTypeMismatch(iface_func.return_type, ret_type, "method override") catch "incompatible method override";
-                                        try self.errors.append(.{
-                                            .message = msg,
-                                            .location = member.location,
-                                            .kind = .incompatible_override,
-                                        });
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                    }
-                }
+        // Get interface AST node
+        const iface_node = iface_sym.decl_node orelse return;
+        if (iface_node.kind != .interface_decl) return;
+        const iface_decl = &iface_node.data.interface_decl;
 
-                if (!found and !iface_method.optional) {
-                    const arena_alloc = self.message_arena.allocator();
-                    const msg = std.fmt.allocPrint(arena_alloc, "class '{s}' missing implementation of interface method '{s}'", .{ class.name, iface_method.name }) catch "missing interface method implementation";
-                    try self.errors.append(.{
-                        .message = msg,
-                        .location = class_node.location,
-                        .kind = .missing_implementation,
-                    });
-                }
-            }
+        // Check each interface member is implemented in the class
+        for (iface_decl.members) |iface_member| {
+            switch (iface_member.kind) {
+                .method_decl => {
+                    const iface_method = &iface_member.data.method_decl;
+                    var found = false;
 
-            // Also check required properties
-            for (iface.properties) |iface_prop| {
-                var found = false;
-                for (class.members) |member| {
-                    if (member.kind == .property_decl) {
-                        const prop = &member.data.property_decl;
-                        if (std.mem.eql(u8, prop.name, iface_prop.name)) {
-                            found = true;
-                            // Check type compatibility
-                            if (prop.type) |prop_type| {
-                                if (!self.typesCompatible(iface_prop.type, prop_type)) {
-                                    const msg = self.formatTypeMismatch(iface_prop.type, prop_type, "property type") catch "incompatible property type";
+                    for (class.members) |class_member| {
+                        if (class_member.kind != .method_decl) continue;
+                        const class_method = &class_member.data.method_decl;
+
+                        if (!std.mem.eql(u8, class_method.name, iface_method.name)) continue;
+
+                        found = true;
+
+                        // Check return type compatibility
+                        if (class_method.return_type) |class_ret| {
+                            if (iface_method.return_type) |iface_ret| {
+                                if (!self.typesCompatible(iface_ret, class_ret)) {
+                                    const arena_alloc = self.message_arena.allocator();
+                                    const msg = std.fmt.allocPrint(
+                                        arena_alloc,
+                                        "method '{s}' has incompatible return type with interface '{s}'",
+                                        .{ class_method.name, iface_name },
+                                    ) catch "incompatible interface method";
                                     try self.errors.append(.{
                                         .message = msg,
-                                        .location = member.location,
+                                        .location = class_member.location,
+                                        .kind = .incompatible_override,
+                                    });
+                                }
+                            }
+                        }
+
+                        // Check parameter count
+                        if (class_method.params.len != iface_method.params.len) {
+                            const arena_alloc = self.message_arena.allocator();
+                            const msg = std.fmt.allocPrint(
+                                arena_alloc,
+                                "method '{s}' has different parameter count than interface '{s}'",
+                                .{ class_method.name, iface_name },
+                            ) catch "incompatible interface method params";
+                            try self.errors.append(.{
+                                .message = msg,
+                                .location = class_member.location,
+                                .kind = .incompatible_override,
+                            });
+                        }
+
+                        break;
+                    }
+
+                    if (!found) {
+                        const arena_alloc = self.message_arena.allocator();
+                        const msg = std.fmt.allocPrint(
+                            arena_alloc,
+                            "class '{s}' missing implementation of interface method '{s}' from '{s}'",
+                            .{ class.name, iface_method.name, iface_name },
+                        ) catch "missing interface method";
+                        try self.errors.append(.{
+                            .message = msg,
+                            .location = class_node.location,
+                            .kind = .missing_implementation,
+                        });
+                    }
+                },
+                .property_decl => {
+                    const iface_prop = &iface_member.data.property_decl;
+                    var found = false;
+
+                    for (class.members) |class_member| {
+                        if (class_member.kind != .property_decl) continue;
+                        const class_prop = &class_member.data.property_decl;
+
+                        if (!std.mem.eql(u8, class_prop.name, iface_prop.name)) continue;
+
+                        found = true;
+
+                        // Check type compatibility
+                        if (class_prop.type) |class_type| {
+                            if (iface_prop.type) |iface_prop_type| {
+                                if (!self.typesCompatible(iface_prop_type, class_type)) {
+                                    const arena_alloc = self.message_arena.allocator();
+                                    const msg = std.fmt.allocPrint(
+                                        arena_alloc,
+                                        "property '{s}' has incompatible type with interface '{s}'",
+                                        .{ class_prop.name, iface_name },
+                                    ) catch "incompatible interface property";
+                                    try self.errors.append(.{
+                                        .message = msg,
+                                        .location = class_member.location,
                                         .kind = .type_mismatch,
                                     });
                                 }
                             }
-                            break;
                         }
+
+                        break;
+                    }
+
+                    if (!found) {
+                        const arena_alloc = self.message_arena.allocator();
+                        const msg = std.fmt.allocPrint(
+                            arena_alloc,
+                            "class '{s}' missing implementation of interface property '{s}' from '{s}'",
+                            .{ class.name, iface_prop.name, iface_name },
+                        ) catch "missing interface property";
+                        try self.errors.append(.{
+                            .message = msg,
+                            .location = class_node.location,
+                            .kind = .missing_implementation,
+                        });
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// Helper for already-resolved object types (used by unit tests)
+    fn checkInterfaceImplementationFromObject(self: *TypeChecker, class_node: *ast.Node, iface: *types.ObjectType) !void {
+        const class = &class_node.data.class_decl;
+
+        // Check each interface method is implemented
+        for (iface.methods) |iface_method| {
+            var found = false;
+            for (class.members) |member| {
+                if (member.kind == .method_decl) {
+                    const method = &member.data.method_decl;
+                    if (std.mem.eql(u8, method.name, iface_method.name)) {
+                        found = true;
+                        if (method.return_type) |ret_type| {
+                            if (iface_method.type.kind == .function) {
+                                const iface_func = iface_method.type.data.function;
+                                if (!self.typesCompatible(iface_func.return_type, ret_type)) {
+                                    const msg = self.formatTypeMismatch(iface_func.return_type, ret_type, "method override") catch "incompatible method override";
+                                    try self.errors.append(.{
+                                        .message = msg,
+                                        .location = member.location,
+                                        .kind = .incompatible_override,
+                                    });
+                                }
+                            }
+                        }
+                        break;
                     }
                 }
+            }
 
-                if (!found and !iface_prop.optional) {
-                    const arena_alloc = self.message_arena.allocator();
-                    const msg = std.fmt.allocPrint(arena_alloc, "class '{s}' missing implementation of interface property '{s}'", .{ class.name, iface_prop.name }) catch "missing interface property implementation";
-                    try self.errors.append(.{
-                        .message = msg,
-                        .location = class_node.location,
-                        .kind = .missing_implementation,
-                    });
+            if (!found and !iface_method.optional) {
+                const arena_alloc = self.message_arena.allocator();
+                const msg = std.fmt.allocPrint(arena_alloc, "class '{s}' missing implementation of interface method '{s}'", .{ class.name, iface_method.name }) catch "missing interface method implementation";
+                try self.errors.append(.{
+                    .message = msg,
+                    .location = class_node.location,
+                    .kind = .missing_implementation,
+                });
+            }
+        }
+
+        // Check required properties
+        for (iface.properties) |iface_prop| {
+            var found = false;
+            for (class.members) |member| {
+                if (member.kind == .property_decl) {
+                    const prop = &member.data.property_decl;
+                    if (std.mem.eql(u8, prop.name, iface_prop.name)) {
+                        found = true;
+                        if (prop.type) |prop_type| {
+                            if (!self.typesCompatible(iface_prop.type, prop_type)) {
+                                const msg = self.formatTypeMismatch(iface_prop.type, prop_type, "property type") catch "incompatible property type";
+                                try self.errors.append(.{
+                                    .message = msg,
+                                    .location = member.location,
+                                    .kind = .type_mismatch,
+                                });
+                            }
+                        }
+                        break;
+                    }
                 }
+            }
+
+            if (!found and !iface_prop.optional) {
+                const arena_alloc = self.message_arena.allocator();
+                const msg = std.fmt.allocPrint(arena_alloc, "class '{s}' missing implementation of interface property '{s}'", .{ class.name, iface_prop.name }) catch "missing interface property implementation";
+                try self.errors.append(.{
+                    .message = msg,
+                    .location = class_node.location,
+                    .kind = .missing_implementation,
+                });
             }
         }
     }
@@ -1140,28 +1270,90 @@ pub const TypeChecker = struct {
     fn checkClassInheritance(self: *TypeChecker, class_node: *ast.Node, parent_type: *types.Type) !void {
         const class = &class_node.data.class_decl;
 
-        // Parent must be an object type to have methods
-        if (parent_type.kind != .object) {
-            return;
-        }
+        // Get parent class name from type reference
+        const parent_name = switch (parent_type.kind) {
+            .type_reference => parent_type.data.type_reference.name,
+            .object => {
+                // Already resolved object type - use old path
+                return self.checkClassInheritanceFromObject(class_node, parent_type.data.object);
+            },
+            else => return, // Not a class type
+        };
 
-        const parent_obj = parent_type.data.object;
+        // Look up parent class symbol
+        const parent_sym = self.symbols.lookup(parent_name) orelse return;
+        if (parent_sym.kind != .class) return;
+
+        // Get parent class AST node
+        const parent_node = parent_sym.decl_node orelse return;
+        if (parent_node.kind != .class_decl) return;
+        const parent_class = &parent_node.data.class_decl;
 
         // Check each child method against parent methods
         for (class.members) |member| {
             if (member.kind != .method_decl) continue;
-
             const child_method = &member.data.method_decl;
 
-            // Look for matching method in parent properties
+            // Look for matching method in parent class
+            for (parent_class.members) |parent_member| {
+                if (parent_member.kind != .method_decl) continue;
+                const parent_method = &parent_member.data.method_decl;
+
+                if (!std.mem.eql(u8, parent_method.name, child_method.name)) continue;
+
+                // Found a method with the same name - check return type compatibility
+                if (child_method.return_type) |child_ret| {
+                    if (parent_method.return_type) |parent_ret| {
+                        if (!self.typesCompatible(parent_ret, child_ret)) {
+                            const arena_alloc = self.message_arena.allocator();
+                            const msg = std.fmt.allocPrint(
+                                arena_alloc,
+                                "method '{s}' has incompatible return type with parent class '{s}'",
+                                .{ child_method.name, parent_name },
+                            ) catch "incompatible override return type";
+                            try self.errors.append(.{
+                                .message = msg,
+                                .location = member.location,
+                                .kind = .incompatible_override,
+                            });
+                        }
+                    }
+                }
+
+                // Check parameter count
+                if (child_method.params.len != parent_method.params.len) {
+                    const arena_alloc = self.message_arena.allocator();
+                    const msg = std.fmt.allocPrint(
+                        arena_alloc,
+                        "method '{s}' has different parameter count than parent class '{s}'",
+                        .{ child_method.name, parent_name },
+                    ) catch "incompatible override parameter count";
+                    try self.errors.append(.{
+                        .message = msg,
+                        .location = member.location,
+                        .kind = .incompatible_override,
+                    });
+                }
+
+                break; // Found matching method, stop searching
+            }
+        }
+    }
+
+    /// Helper for already-resolved object types (used by unit tests)
+    fn checkClassInheritanceFromObject(self: *TypeChecker, class_node: *ast.Node, parent_obj: *types.ObjectType) !void {
+        const class = &class_node.data.class_decl;
+
+        // Check each child method against parent methods
+        for (class.members) |member| {
+            if (member.kind != .method_decl) continue;
+            const child_method = &member.data.method_decl;
+
+            // Check properties array
             for (parent_obj.properties) |parent_prop| {
                 if (!std.mem.eql(u8, parent_prop.name, child_method.name)) continue;
-
-                // Found a method with the same name - check compatibility
                 if (parent_prop.type.kind == .function) {
                     const parent_func = parent_prop.type.data.function;
-
-                    // Child return type must be compatible with parent return type (covariant)
                     if (child_method.return_type) |child_ret| {
                         if (!self.typesCompatible(parent_func.return_type, child_ret)) {
                             const arena_alloc = self.message_arena.allocator();
@@ -1177,8 +1369,6 @@ pub const TypeChecker = struct {
                             });
                         }
                     }
-
-                    // Parameter types should be compatible
                     if (child_method.params.len != parent_func.params.len) {
                         const arena_alloc = self.message_arena.allocator();
                         const msg = std.fmt.allocPrint(
@@ -1196,13 +1386,11 @@ pub const TypeChecker = struct {
                 break;
             }
 
-            // Also check methods array
+            // Check methods array
             for (parent_obj.methods) |parent_method| {
                 if (!std.mem.eql(u8, parent_method.name, child_method.name)) continue;
-
                 if (parent_method.type.kind == .function) {
                     const parent_func = parent_method.type.data.function;
-
                     if (child_method.return_type) |child_ret| {
                         if (!self.typesCompatible(parent_func.return_type, child_ret)) {
                             const arena_alloc = self.message_arena.allocator();

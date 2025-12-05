@@ -76,9 +76,9 @@ pub fn compileToBytescode(
         // Clean up on failure
         tmp_dir.deleteFile(output_filename) catch {};
 
-        std.log.err("[hermesc] Compilation failed for {s}:", .{source_name});
+        std.log.warn("[hermesc] Compilation failed for {s}:", .{source_name});
         if (result.stderr.len > 0) {
-            std.log.err("[hermesc] {s}", .{result.stderr});
+            std.log.warn("[hermesc] {s}", .{result.stderr});
         }
         allocator.free(result.stderr);
         return error.CompilationFailed;

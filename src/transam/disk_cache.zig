@@ -141,7 +141,7 @@ pub const BytecodeCache = struct {
 
         // SECURITY: Validate path doesn't contain traversal sequences
         if (containsPathTraversal(root)) {
-            std.log.err("[Cache] Path traversal detected in project_root: {s}", .{root});
+            std.log.warn("[Cache] Path traversal detected in project_root: {s}", .{root});
             return error.PathTraversalDetected;
         }
 

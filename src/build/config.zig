@@ -78,10 +78,37 @@ pub const RollupOutput = struct {
     name: ?[]const u8 = null, // For IIFE
 };
 
+/// C compiler configuration (for native target)
+pub const CCompilerConfig = struct {
+    /// C compiler to use (default: auto-detect clang/gcc/cc)
+    compiler: []const u8 = "cc",
+
+    /// Additional include paths
+    include_paths: []const []const u8 = &.{},
+
+    /// Additional library paths
+    lib_paths: []const []const u8 = &.{},
+
+    /// Libraries to link
+    libs: []const []const u8 = &.{},
+
+    /// Additional compiler flags
+    cflags: []const []const u8 = &.{},
+
+    /// Additional linker flags
+    ldflags: []const []const u8 = &.{},
+
+    /// Keep intermediate .c file after compilation
+    keep_c: bool = false,
+
+    /// Enable compiler warnings
+    warnings: bool = true,
+};
+
 /// Build section configuration
 pub const BuildSection = struct {
     target: Target = .native,
-    out_dir: []const u8 = "dist",
+    out_dir: []const u8 = "out",
     out_file: ?[]const u8 = null,
     optimize: Optimize = .debug,
     minify: bool = false,
@@ -92,6 +119,12 @@ pub const BuildSection = struct {
 
     // JS-specific options
     rollup_outputs: []const RollupOutput = &.{},
+
+    // C compiler options (native target)
+    cc: CCompilerConfig = .{},
+
+    // Skip C compilation, only generate .c file
+    emit_c_only: bool = false,
 };
 
 /// Resolve section configuration
@@ -180,21 +213,59 @@ pub const BuildConfig = struct {
 
     allocator: std.mem.Allocator,
 
+    /// Track if strings were allocated (for proper cleanup)
+    owns_strings: bool = false,
+
     pub fn init(allocator: std.mem.Allocator) BuildConfig {
         return .{
             .root = "src/main.ms",
             .resolve = ResolveSection.init(allocator),
             .define = std.StringHashMap([]const u8).init(allocator),
             .allocator = allocator,
+            .owns_strings = false,
         };
     }
 
     pub fn deinit(self: *const BuildConfig, allocator: std.mem.Allocator) void {
-        _ = allocator;
-        var resolve = self.resolve;
-        resolve.deinit();
+        // Free duplicated root string (if allocated - check by tracking ownership)
+        if (self.owns_strings) {
+            allocator.free(self.root);
+            allocator.free(self.build.out_dir);
+            if (self.build.out_file) |out_file| {
+                allocator.free(out_file);
+            }
+        }
+
+        // Free transforms
+        for (self.transforms) |t| {
+            if (t.name.len > 0) {
+                allocator.free(t.name);
+            }
+            if (t.path) |p| {
+                allocator.free(p);
+            }
+        }
+        if (self.transforms.len > 0) {
+            allocator.free(self.transforms);
+        }
+
+        // Free define keys and values
         var define = self.define;
+        var it = define.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
         define.deinit();
+
+        // Free resolve aliases
+        var resolve = self.resolve;
+        var alias_it = resolve.alias.iterator();
+        while (alias_it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        resolve.deinit();
     }
 };
 
@@ -213,18 +284,9 @@ pub fn loadConfig(allocator: std.mem.Allocator, options: anytype) !BuildConfig {
     };
     file.close();
 
-    // Try to load and parse build.ms
-    std.debug.print("  {s}Loading build.ms...{s}\n", .{
-        "\x1b[2m",
-        "\x1b[0m",
-    });
-
-    return loader.loadBuildMs(allocator, build_ms_path, options) catch |err| {
-        std.debug.print("  {s}Warning: Could not parse build.ms ({s}), using defaults{s}\n", .{
-            "\x1b[33m",
-            @errorName(err),
-            "\x1b[0m",
-        });
+    // Try to load and parse build.ms (silently)
+    return loader.loadBuildMs(allocator, build_ms_path, options) catch {
+        // Fall back to defaults silently
         return loadDefaultConfig(allocator, options);
     };
 }
@@ -402,6 +464,9 @@ pub fn parseJsonConfig(allocator: std.mem.Allocator, json_str: []const u8) !Buil
             }
         }
     }
+
+    // Mark that we allocated strings that need freeing
+    config.owns_strings = true;
 
     return config;
 }

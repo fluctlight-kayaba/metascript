@@ -137,6 +137,12 @@ pub const Stats = struct {
     /// Cycles collected (if cycle detection ran)
     cycles_collected: u64 = 0,
 
+    /// Return Value Optimizations applied (elided decref on return)
+    rvo_applied: u64 = 0,
+
+    /// Stack allocations (escape analysis optimization)
+    stack_allocations: u64 = 0,
+
     pub fn elisionRate(self: Stats) f64 {
         if (self.total_ops + self.ops_elided == 0) return 0;
         return @as(f64, @floatFromInt(self.ops_elided)) /
@@ -250,6 +256,12 @@ pub const Variable = struct {
     /// Has this variable escaped its scope?
     escaped: bool = false,
 
+    /// Why this variable escapes (if it does)
+    /// Used by codegen for stack allocation optimization:
+    /// - .none: Can be stack-allocated (doesn't escape)
+    /// - .returned/.stored_in_field/.captured_by_closure: Must be heap-allocated
+    escape_reason: ownership.EscapeReason = .none,
+
     /// Is this a parameter (borrowed by default)?
     is_parameter: bool = false,
 
@@ -325,6 +337,26 @@ pub const Drc = struct {
     /// Used for break/continue to know which scopes to clean up
     loop_scope_stack: std.ArrayList(u32),
 
+    /// Function scope stack for tracking current function context.
+    /// Variables are qualified as "funcName.varName" using the INNERMOST function name.
+    /// This fixes the bug where variables from different functions with the same name collide.
+    ///
+    /// NOTE: For nested functions (rare in practice), only the innermost name is used.
+    /// This handles 99% of cases. True nested function collision (two different outer
+    /// functions with identically-named inner functions) would need full path qualification.
+    ///
+    /// ARCHITECTURE NOTE: This stack is used in TWO phases:
+    /// 1. DrcAnalyzer phase: Populates the variables HashMap with escape analysis
+    /// 2. Codegen phase: Queries the HashMap to check canStackAllocate(), getEscapeReason()
+    /// Both phases call enterFunction/exitFunction independently - this is intentional.
+    function_stack: std.ArrayList([]const u8),
+
+    /// Allocated qualified names (owned, freed in deinit)
+    /// These are the keys used in the variables HashMap.
+    /// Only contains ALLOCATED names - unqualified global names are NOT tracked here
+    /// since they reference AST-owned memory.
+    allocated_qualified_names: std.ArrayList([]const u8),
+
     /// Statistics
     stats: Stats,
 
@@ -386,6 +418,8 @@ pub const Drc = struct {
             .borrow_stack = std.ArrayList(BorrowEntry).init(allocator),
             .statement_temporaries = std.ArrayList(Temporary).init(allocator),
             .loop_scope_stack = std.ArrayList(u32).init(allocator),
+            .function_stack = std.ArrayList([]const u8).init(allocator),
+            .allocated_qualified_names = std.ArrayList([]const u8).init(allocator),
             .stats = .{},
             .diagnostics = std.ArrayList(DrcDiagnostic).init(allocator),
         };
@@ -416,12 +450,106 @@ pub const Drc = struct {
         }
         self.statement_temporaries.deinit();
         self.loop_scope_stack.deinit();
+        self.function_stack.deinit();
+
+        // Free allocated qualified names (keys in variables HashMap)
+        for (self.allocated_qualified_names.items) |name| {
+            self.allocator.free(name);
+        }
+        self.allocated_qualified_names.deinit();
 
         // Free diagnostic messages (allocated via allocPrint in emitUseAfterMove/emitPotentialCycle)
         for (self.diagnostics.items) |diag| {
             self.allocator.free(diag.message);
         }
         self.diagnostics.deinit();
+    }
+
+    // ========================================================================
+    // Function Scope Management (for variable name qualification)
+    // ========================================================================
+
+    /// Maximum length for qualified variable names (function.varName format)
+    /// 1KB is generous - handles any realistic function + variable name combination.
+    const MAX_QUALIFIED_NAME_LEN = 1024;
+
+    /// Enter a function scope - pushes onto function stack for nested function support.
+    /// Variables are qualified as "funcName.varName" using the INNERMOST function only.
+    /// For nested functions, we use just the innermost name (covers 99% of cases).
+    pub fn enterFunction(self: *Drc, function_name: []const u8) void {
+        self.function_stack.append(function_name) catch |err| {
+            // On allocation failure, we'll fall back to unqualified names
+            // This is safe but may cause collisions in pathological cases
+            std.debug.print("DRC: enterFunction allocation failed for '{s}': {}\n", .{ function_name, err });
+        };
+    }
+
+    /// Exit function scope - pops from function stack.
+    pub fn exitFunction(self: *Drc) void {
+        if (self.function_stack.items.len > 0) {
+            _ = self.function_stack.pop();
+        }
+    }
+
+    /// Get the current function context (innermost function name, or null if global)
+    fn currentFunction(self: *const Drc) ?[]const u8 {
+        if (self.function_stack.items.len > 0) {
+            return self.function_stack.items[self.function_stack.items.len - 1];
+        }
+        return null;
+    }
+
+    /// Get the qualified name for a variable (function.varName or just varName).
+    /// For global variables (no function context), returns the original name WITHOUT allocation.
+    /// For function-scoped variables, allocates and tracks for cleanup.
+    fn getQualifiedName(self: *Drc, var_name: []const u8) ![]const u8 {
+        if (self.currentFunction()) |func_name| {
+            // Allocate qualified name for function-scoped variable
+            const name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ func_name, var_name });
+            try self.allocated_qualified_names.append(name);
+            return name;
+        }
+        // Global variable: return original name without allocation
+        // The name comes from AST which outlives DRC, so this is safe
+        return var_name;
+    }
+
+    /// Build qualified name into provided buffer for lookups (no allocation).
+    /// Returns null if buffer is too small.
+    fn buildQualifiedName(self: *const Drc, var_name: []const u8, buf: []u8) ?[]const u8 {
+        if (self.currentFunction()) |func_name| {
+            return std.fmt.bufPrint(buf, "{s}.{s}", .{ func_name, var_name }) catch null;
+        }
+        return null;
+    }
+
+    /// Look up a variable by name (const version for read-only access).
+    /// Uses qualified name based on current function scope to avoid collisions.
+    pub fn getVariable(self: *const Drc, var_name: []const u8) ?Variable {
+        // First try qualified lookup (function.varName)
+        var buf: [MAX_QUALIFIED_NAME_LEN]u8 = undefined;
+        if (self.buildQualifiedName(var_name, &buf)) |qualified| {
+            if (self.variables.get(qualified)) |v| {
+                return v;
+            }
+        }
+        // Fall back to unqualified (global/module-level variables)
+        return self.variables.get(var_name);
+    }
+
+    /// Look up a variable by name (mutable version for modification).
+    /// Uses qualified name based on current function scope to avoid collisions.
+    pub fn getVariablePtr(self: *Drc, var_name: []const u8) ?*Variable {
+        // First try qualified lookup (function.varName)
+        // Note: *Drc coerces to *const Drc for buildQualifiedName call
+        var buf: [MAX_QUALIFIED_NAME_LEN]u8 = undefined;
+        if (self.buildQualifiedName(var_name, &buf)) |qualified| {
+            if (self.variables.getPtr(qualified)) |v| {
+                return v;
+            }
+        }
+        // Fall back to unqualified (global/module-level variables)
+        return self.variables.getPtr(var_name);
     }
 
     // ========================================================================
@@ -452,7 +580,7 @@ pub const Drc = struct {
             });
 
             for (scope.variables.items) |var_name| {
-                if (self.variables.get(var_name)) |v| {
+                if (self.getVariable(var_name)) |v| {
                     // Only decref if:
                     // - It needs RC management
                     // - We still own it (not moved/borrowed)
@@ -517,7 +645,7 @@ pub const Drc = struct {
                     if (std.mem.eql(u8, var_name, ret_var)) continue;
                 }
 
-                if (self.variables.getPtr(var_name)) |vptr| {
+                if (self.getVariablePtr(var_name)) |vptr| {
                     // Only decref non-parameter variables that need RC
                     // NOTE: We ONLY check is_parameter here, NOT ownership_state or escaped.
                     // - Parameters are borrowed (caller owns them) - never decref
@@ -577,7 +705,7 @@ pub const Drc = struct {
             i -= 1;
             const scope = self.scope_stack.items[i];
             for (scope.variables.items) |var_name| {
-                if (self.variables.getPtr(var_name)) |vptr| {
+                if (self.getVariablePtr(var_name)) |vptr| {
                     // Only decref if we still own it (not already moved/returned)
                     if (vptr.needs_rc and !vptr.is_parameter and vptr.ownership_state == .owned) {
                         try self.addOp(.{
@@ -614,7 +742,7 @@ pub const Drc = struct {
             i -= 1;
             const scope = self.scope_stack.items[i];
             for (scope.variables.items) |var_name| {
-                if (self.variables.getPtr(var_name)) |vptr| {
+                if (self.getVariablePtr(var_name)) |vptr| {
                     // Only decref if we still own it (not already moved/returned)
                     if (vptr.needs_rc and !vptr.is_parameter and vptr.ownership_state == .owned) {
                         try self.addOp(.{
@@ -723,15 +851,19 @@ pub const Drc = struct {
         const needs_rc = type_kind.needsRc();
         const current_scope_depth: u32 = @intCast(self.scope_stack.items.len);
 
-        // Check if a variable with this name exists in an outer scope.
+        // Use qualified name as key to avoid collisions across functions
+        // e.g., "localOnly.p" vs "escapes.p" instead of both being "p"
+        const qualified_name = try self.getQualifiedName(name);
+
+        // Check if a variable with this qualified name exists in an outer scope.
         // If so, save it to the current scope's shadowed_variables so we can
         // restore it when this scope exits.
-        if (self.variables.get(name)) |existing| {
+        if (self.variables.get(qualified_name)) |existing| {
             // Only save if it's from an outer scope (lower depth)
             if (existing.scope_depth < current_scope_depth) {
                 if (self.scope_stack.items.len > 0) {
                     const current = &self.scope_stack.items[self.scope_stack.items.len - 1];
-                    try current.shadowed_variables.put(name, existing);
+                    try current.shadowed_variables.put(qualified_name, existing);
                 }
             }
         }
@@ -741,7 +873,7 @@ pub const Drc = struct {
         const is_module_level = (current_scope_depth == 1) and !is_parameter;
 
         const variable = Variable{
-            .name = name,
+            .name = name, // Keep unqualified name for C code emission
             .type_kind = type_kind,
             .scope_depth = current_scope_depth,
             .line = line,
@@ -754,20 +886,23 @@ pub const Drc = struct {
             .type_name = type_name,
         };
 
-        try self.variables.put(name, variable);
+        try self.variables.put(qualified_name, variable);
         self.stats.variables_analyzed += 1;
 
         if (needs_rc) {
             self.stats.rc_variables += 1;
 
-            // Add to current scope for cleanup tracking
+            // Add UNQUALIFIED name to current scope for cleanup tracking
+            // We use unqualified names in scope because:
+            // 1. RcOp.target gets emitted to C code (needs unqualified: "p" not "main.p")
+            // 2. Qualified names are only for internal HashMap lookups to avoid collisions
             if (self.scope_stack.items.len > 0) {
                 const current = &self.scope_stack.items[self.scope_stack.items.len - 1];
                 try current.variables.append(name);
             }
         }
 
-        // Record in ownership analyzer
+        // Record in ownership analyzer (unqualified name for semantic analysis)
         try self.ownership_analyzer.recordDefinition(name, line, column, is_parameter, type_kind);
     }
 
@@ -790,7 +925,7 @@ pub const Drc = struct {
         });
 
         // Mark variable as initialized
-        if (self.variables.getPtr(var_name)) |vptr| {
+        if (self.getVariablePtr(var_name)) |vptr| {
             vptr.initialized = true;
         }
     }
@@ -807,7 +942,7 @@ pub const Drc = struct {
         column: u32,
         context: UseContext,
     ) !void {
-        const v = self.variables.get(var_name) orelse return;
+        const v = self.getVariable(var_name) orelse return;
         if (!v.needs_rc) return;
 
         // NOTE: Use-after-move and uninitialized-use are now handled by the typechecker.
@@ -845,7 +980,7 @@ pub const Drc = struct {
                 self.stats.ops_elided += 1; // Elided a decref
 
                 // Mark as moved
-                if (self.variables.getPtr(var_name)) |vptr| {
+                if (self.getVariablePtr(var_name)) |vptr| {
                     vptr.ownership_state = .moved;
                 }
                 return;
@@ -866,6 +1001,12 @@ pub const Drc = struct {
                     .comment = if (self.config.debug_mode) "// DRC: incref for field store" else null,
                 });
                 self.stats.increfs += 1;
+
+                // Mark as escaping via field store (outlives current scope)
+                if (self.getVariablePtr(var_name)) |vptr| {
+                    vptr.escape_reason = .stored_in_field;
+                    vptr.escaped = true;
+                }
 
                 // DIAGNOSTIC: Field stores to object types can form cycles
                 // Emit hint so user knows cycle detection is active
@@ -888,7 +1029,10 @@ pub const Drc = struct {
             .returned => {
                 // Returning transfers ownership to caller
                 // (Lobster calls this "consumes_vars_on_return")
-                if (self.variables.getPtr(var_name)) |vptr| {
+                if (self.getVariablePtr(var_name)) |vptr| {
+                    // Mark as escaping via return
+                    vptr.escape_reason = .returned;
+
                     if (vptr.ownership_state == .borrowed) {
                         // CRITICAL: Returning a borrowed parameter!
                         // Must incref to give caller ownership, otherwise they get
@@ -914,7 +1058,9 @@ pub const Drc = struct {
                     } else if (vptr.ownership_state == .owned) {
                         // Returning owned value - elide scope cleanup decref
                         // For owned values, we DO mark as moved since we're transferring ownership
+                        // This is Return Value Optimization (RVO) in action
                         self.stats.ops_elided += 1;
+                        self.stats.rvo_applied += 1;
                         vptr.escaped = true;
                         vptr.ownership_state = .moved;
                     }
@@ -968,7 +1114,7 @@ pub const Drc = struct {
     /// Returns a lifetime that can be used to track this borrow
     pub fn pushBorrow(self: *Drc, var_name: []const u8, line: u32, column: u32) !Lifetime {
         // Check if this variable is a reference type
-        const v = self.variables.get(var_name) orelse return .any;
+        const v = self.getVariable(var_name) orelse return .any;
         if (!v.needs_rc) return .any;
 
         // Check if we already have a borrow for this variable
@@ -1050,7 +1196,7 @@ pub const Drc = struct {
         const recip_type = recipient.lifetimeType();
 
         // Check if variable needs RC
-        const v = self.variables.get(var_name) orelse return false;
+        const v = self.getVariable(var_name) orelse return false;
         if (!v.needs_rc) return false;
 
         // Handle based on context
@@ -1110,7 +1256,7 @@ pub const Drc = struct {
 
     /// Get the lifetime for a variable based on its current state
     pub fn getVariableLifetime(self: *Drc, var_name: []const u8) Lifetime {
-        const v = self.variables.get(var_name) orelse return .undef;
+        const v = self.getVariable(var_name) orelse return .undef;
 
         if (!v.needs_rc) return .any;
 
@@ -1125,7 +1271,7 @@ pub const Drc = struct {
     /// Infer function argument lifetime (like Lobster's ArgLifetime)
     /// Returns LT_KEEP if arg takes ownership, LT_BORROW if it borrows
     pub fn inferArgLifetime(self: *Drc, var_name: []const u8, is_single_assignment: bool) Lifetime {
-        const v = self.variables.get(var_name) orelse return .any;
+        const v = self.getVariable(var_name) orelse return .any;
 
         if (!v.needs_rc) return .any;
 
@@ -1154,7 +1300,7 @@ pub const Drc = struct {
         column: u32,
     ) !void {
         // Check if target is a reference type that needs RC
-        const target = self.variables.get(target_var) orelse return;
+        const target = self.getVariable(target_var) orelse return;
         if (!target.needs_rc) return;
 
         // NOTE: Use-after-move is now handled by the typechecker.
@@ -1188,7 +1334,7 @@ pub const Drc = struct {
         line: u32,
         column: u32,
     ) !void {
-        if (self.variables.getPtr(var_name)) |vptr| {
+        if (self.getVariablePtr(var_name)) |vptr| {
             if (!vptr.needs_rc) return;
 
             // NOTE: Reassignment after move is valid in the "Shared by Default" + move model.
@@ -1232,6 +1378,42 @@ pub const Drc = struct {
         return &[_]RcOp{};
     }
 
+    /// Get the type name for a variable (if it's a class instance)
+    /// Returns null for non-class variables or unknown variables
+    pub fn getVariableTypeName(self: *Drc, var_name: []const u8) ?[]const u8 {
+        if (self.getVariable(var_name)) |v| {
+            return v.type_name;
+        }
+        return null;
+    }
+
+    /// Check if a variable is a class instance (heap-allocated pointer)
+    pub fn isClassInstance(self: *Drc, var_name: []const u8) bool {
+        if (self.getVariable(var_name)) |v| {
+            return v.type_name != null;
+        }
+        return false;
+    }
+
+    /// Get escape reason for a variable
+    /// Used by codegen to determine if stack allocation is safe:
+    /// - .none: Can use stack allocation (variable doesn't escape)
+    /// - .returned: Must heap allocate (escapes via return)
+    /// - .stored_in_field: Must heap allocate (outlives scope via field)
+    /// - .captured_by_closure: Must heap allocate (escapes via closure)
+    pub fn getEscapeReason(self: *Drc, var_name: []const u8) ownership.EscapeReason {
+        if (self.getVariable(var_name)) |v| {
+            return v.escape_reason;
+        }
+        // Also check the ownership analyzer for escape info
+        return self.ownership_analyzer.getEscapeReason(var_name);
+    }
+
+    /// Check if a variable can be stack-allocated (doesn't escape)
+    pub fn canStackAllocate(self: *Drc, var_name: []const u8) bool {
+        return self.getEscapeReason(var_name) == .none;
+    }
+
     /// Get all RC operations
     pub fn getAllOps(self: *Drc) []const RcOp {
         return self.operations.items;
@@ -1272,7 +1454,7 @@ pub const Drc = struct {
 
     /// Check if a variable needs RC management
     pub fn needsRc(self: *const Drc, var_name: []const u8) bool {
-        if (self.variables.get(var_name)) |v| {
+        if (self.getVariable(var_name)) |v| {
             return v.needs_rc;
         }
         return false;
@@ -1442,6 +1624,18 @@ pub const Drc = struct {
 
         // Update stats
         self.stats.total_ops = @intCast(self.operations.items.len);
+
+        // Count stack-allocatable variables (non-escaping object types)
+        var var_iter = self.variables.valueIterator();
+        while (var_iter.next()) |v| {
+            // Count variables eligible for stack allocation:
+            // - Must need RC (object type)
+            // - Must not be a parameter (parameters are not allocated here)
+            // - Must not escape (escape_reason == .none)
+            if (v.needs_rc and !v.is_parameter and v.escape_reason == .none) {
+                self.stats.stack_allocations += 1;
+            }
+        }
     }
 
     // ========================================================================
@@ -2250,4 +2444,241 @@ test "Drc multiple scopes cleanup correctly" {
     // deinit should free everything without leaking
     drc.deinit();
     // std.testing.allocator will panic if anything leaked
+}
+
+// ============================================================================
+// Escape Analysis Tests (P1 - Stack Allocation Safety)
+// ============================================================================
+
+test "getEscapeReason returns .none for non-escaping local variable" {
+    var drc = Drc.init(std.testing.allocator);
+    defer drc.deinit();
+
+    drc.enterFunction("localOnly");
+    defer drc.exitFunction();
+
+    try drc.enterScope(1);
+
+    // Register a local variable (not returned, not stored in field)
+    try drc.registerVariable("p", .object, 1, 5, false);
+    try drc.registerAllocation("p", 1, 10);
+
+    // Just read it - doesn't escape
+    try drc.trackUse("p", 2, 1, .read);
+
+    // Should be safe for stack allocation
+    const reason = drc.getEscapeReason("p");
+    try std.testing.expectEqual(ownership.EscapeReason.none, reason);
+
+    try drc.exitScope(5, 1);
+}
+
+test "getEscapeReason returns .returned for variable returned from function" {
+    var drc = Drc.init(std.testing.allocator);
+    defer drc.deinit();
+
+    drc.enterFunction("escapes");
+    defer drc.exitFunction();
+
+    try drc.enterScope(1);
+
+    // Register a local variable that gets returned
+    try drc.registerVariable("p", .object, 1, 5, false);
+    try drc.registerAllocation("p", 1, 10);
+
+    // Return it - escapes via return
+    try drc.trackUse("p", 2, 1, .returned);
+
+    // Should NOT be safe for stack allocation (escapes)
+    const reason = drc.getEscapeReason("p");
+    try std.testing.expectEqual(ownership.EscapeReason.returned, reason);
+
+    try drc.exitScope(5, 1);
+}
+
+test "getEscapeReason returns .stored_in_field for variable stored in object field" {
+    var drc = Drc.init(std.testing.allocator);
+    defer drc.deinit();
+
+    drc.enterFunction("storesInField");
+    defer drc.exitFunction();
+
+    try drc.enterScope(1);
+
+    // Register a local variable that gets stored in a field
+    try drc.registerVariable("node", .object, 1, 5, false);
+    try drc.registerAllocation("node", 1, 10);
+
+    // Store in field - escapes via field store
+    try drc.trackUse("node", 2, 1, .field_store);
+
+    // Should NOT be safe for stack allocation (escapes via field)
+    const reason = drc.getEscapeReason("node");
+    try std.testing.expectEqual(ownership.EscapeReason.stored_in_field, reason);
+
+    try drc.exitScope(5, 1);
+}
+
+test "canStackAllocate returns true for non-escaping variable" {
+    var drc = Drc.init(std.testing.allocator);
+    defer drc.deinit();
+
+    drc.enterFunction("localOnly");
+    defer drc.exitFunction();
+
+    try drc.enterScope(1);
+
+    try drc.registerVariable("p", .object, 1, 5, false);
+    try drc.registerAllocation("p", 1, 10);
+    try drc.trackUse("p", 2, 1, .read);
+
+    // Non-escaping = can stack allocate
+    try std.testing.expect(drc.canStackAllocate("p"));
+
+    try drc.exitScope(5, 1);
+}
+
+test "canStackAllocate returns false for escaping variable" {
+    var drc = Drc.init(std.testing.allocator);
+    defer drc.deinit();
+
+    drc.enterFunction("escapes");
+    defer drc.exitFunction();
+
+    try drc.enterScope(1);
+
+    try drc.registerVariable("p", .object, 1, 5, false);
+    try drc.registerAllocation("p", 1, 10);
+    try drc.trackUse("p", 2, 1, .returned);
+
+    // Escaping = cannot stack allocate
+    try std.testing.expect(!drc.canStackAllocate("p"));
+
+    try drc.exitScope(5, 1);
+}
+
+test "function scope qualification prevents variable name collision" {
+    // This tests the P0 fix: variables with same name in different functions don't collide
+    var drc = Drc.init(std.testing.allocator);
+    defer drc.deinit();
+
+    // First function: p doesn't escape
+    drc.enterFunction("localOnly");
+    try drc.enterScope(1);
+    try drc.registerVariable("p", .object, 1, 5, false);
+    try drc.registerAllocation("p", 1, 10);
+    try drc.trackUse("p", 2, 1, .read);
+    try std.testing.expect(drc.canStackAllocate("p")); // Should be stack-allocatable
+    try drc.exitScope(5, 1);
+    drc.exitFunction();
+
+    // Second function: p escapes
+    drc.enterFunction("escapes");
+    try drc.enterScope(1);
+    try drc.registerVariable("p", .object, 1, 5, false);
+    try drc.registerAllocation("p", 1, 10);
+    try drc.trackUse("p", 2, 1, .returned);
+    try std.testing.expect(!drc.canStackAllocate("p")); // Should NOT be stack-allocatable
+    try drc.exitScope(5, 1);
+    drc.exitFunction();
+
+    // Re-enter first function - verify its state is preserved
+    drc.enterFunction("localOnly");
+    try std.testing.expect(drc.canStackAllocate("p")); // Still stack-allocatable
+    drc.exitFunction();
+}
+
+test "nested function scope qualification" {
+    // Test that nested functions create proper qualified names
+    var drc = Drc.init(std.testing.allocator);
+    defer drc.deinit();
+
+    // Outer function
+    drc.enterFunction("outer");
+    try drc.enterScope(1);
+    try drc.registerVariable("x", .object, 1, 1, false);
+    try drc.registerAllocation("x", 1, 5);
+
+    // Nested function (inner)
+    drc.enterFunction("inner");
+    try drc.enterScope(2);
+    try drc.registerVariable("x", .object, 2, 1, false); // Same name, different scope
+    try drc.registerAllocation("x", 2, 5);
+
+    // Inner x should be tracked separately from outer x
+    // Both should be stack-allocatable (neither escapes)
+    try std.testing.expect(drc.canStackAllocate("x")); // inner.x
+
+    try drc.exitScope(3, 1);
+    drc.exitFunction(); // exit inner
+
+    // Now we're back in outer, should see outer.x
+    try std.testing.expect(drc.canStackAllocate("x")); // outer.x
+
+    try drc.exitScope(4, 1);
+    drc.exitFunction(); // exit outer
+}
+
+test "function stack handles deep nesting" {
+    var drc = Drc.init(std.testing.allocator);
+    defer drc.deinit();
+
+    // Create deeply nested function scopes
+    drc.enterFunction("level1");
+    drc.enterFunction("level2");
+    drc.enterFunction("level3");
+
+    try drc.enterScope(1);
+    try drc.registerVariable("deep", .object, 1, 1, false);
+    try drc.registerAllocation("deep", 1, 5);
+
+    // Should be able to find the variable
+    try std.testing.expect(drc.canStackAllocate("deep"));
+
+    try drc.exitScope(2, 1);
+
+    // Exit all functions
+    drc.exitFunction();
+    drc.exitFunction();
+    drc.exitFunction();
+
+    // Extra exitFunction should be safe (no-op)
+    drc.exitFunction();
+}
+
+test "qualified name format verification" {
+    // Explicitly verify the "funcName.varName" format is used correctly
+    var drc = Drc.init(std.testing.allocator);
+    defer drc.deinit();
+
+    // Register a global variable (no function context)
+    try drc.enterScope(0);
+    try drc.registerVariable("globalVar", .object, 0, 1, false);
+    try drc.exitScope(1, 0);
+
+    // Should be stored as "globalVar" (unqualified)
+    try std.testing.expect(drc.variables.contains("globalVar"));
+
+    // Enter function and register variable
+    drc.enterFunction("myFunc");
+    try drc.enterScope(2);
+    try drc.registerVariable("localVar", .object, 2, 1, false);
+    try drc.exitScope(3, 2);
+
+    // Should be stored as "myFunc.localVar" (qualified)
+    try std.testing.expect(drc.variables.contains("myFunc.localVar"));
+    // Should NOT be stored as just "localVar"
+    try std.testing.expect(!drc.variables.contains("localVar"));
+
+    // Lookup should work via getVariable (which handles qualification)
+    const v = drc.getVariable("localVar");
+    try std.testing.expect(v != null);
+    // Verify it's the correct variable by checking its name
+    try std.testing.expectEqualStrings("localVar", v.?.name);
+
+    drc.exitFunction();
+
+    // After exiting function, lookup for "localVar" should fail (no function context)
+    const v2 = drc.getVariable("localVar");
+    try std.testing.expect(v2 == null);
 }

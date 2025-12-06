@@ -41,7 +41,6 @@ pub fn loadBuildMs(allocator: std.mem.Allocator, build_ms_path: []const u8, cli_
         return executeViaHermes(allocator, build_ms_source, cli_options);
     };
 
-    std.debug.print("  {s}Parsed build.ms successfully{s}\n", .{ "\x1b[32m", "\x1b[0m" });
     return cfg;
 }
 

@@ -74,7 +74,7 @@ export default {
 
     build: {
         target: "native",
-        outDir: "dist",
+        outDir: "out",
     },
 };
 ```
@@ -104,7 +104,7 @@ export default defineConfig({
         target: "native",
 
         /** Output directory */
-        outDir: "dist",
+        outDir: "out",
 
         /** Output filename (without extension) */
         outFile: "myapp",
@@ -121,9 +121,9 @@ export default defineConfig({
         /** Multi-format output (JS target) */
         rollupOptions: {
             output: [
-                { format: "esm", dir: "dist/esm" },
-                { format: "cjs", dir: "dist/cjs" },
-                { format: "iife", dir: "dist/browser", name: "MyApp" },
+                { format: "esm", dir: "out/esm" },
+                { format: "cjs", dir: "out/cjs" },
+                { format: "iife", dir: "out/browser", name: "MyApp" },
             ],
         },
     },
@@ -206,7 +206,7 @@ export default defineConfig({
         /** File watching */
         watch: {
             include: ["src/**/*.ms"],
-            exclude: ["node_modules", "dist"],
+            exclude: ["node_modules", "out"],
         },
 
         /** Hot Module Replacement (JS target) */
@@ -506,7 +506,7 @@ pub const BuildConfig = struct {
 
 pub const BuildSection = struct {
     target: Target = .native,            // native | js | erlang | wasm
-    out_dir: []const u8 = "dist",
+    out_dir: []const u8 = "out",
     out_file: ?[]const u8 = null,
     optimize: Optimize = .debug,         // debug | release | release-small | release-safe
     minify: bool = false,

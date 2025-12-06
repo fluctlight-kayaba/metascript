@@ -137,8 +137,7 @@ pub fn compile(
             // DRC analysis is required for C backend
             var drc = drc_mod.Drc.init(allocator);
             defer drc.deinit();
-            drc.annotate(ast) catch {}; // Annotate AST with RC operations
-
+            // DRC is passed to CGenerator which uses it during codegen
             var generator = c_codegen.CGenerator.init(allocator, &drc);
             defer generator.deinit();
             break :blk try generator.generate(ast);

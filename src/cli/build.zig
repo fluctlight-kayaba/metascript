@@ -10,7 +10,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const config_loader = @import("../build/config.zig");
-const compile = @import("compile.zig");
+const executor = @import("../build/executor.zig");
 const colors = @import("colors.zig");
 
 pub const BuildOptions = struct {
@@ -19,6 +19,7 @@ pub const BuildOptions = struct {
     watch: bool = false,
     minify: ?bool = null,
     sourcemap: ?bool = null,
+    emit_c_only: bool = false,
     verbose: bool = false,
 };
 
@@ -42,6 +43,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             options.sourcemap = true;
         } else if (std.mem.eql(u8, arg, "--no-sourcemap")) {
             options.sourcemap = false;
+        } else if (std.mem.eql(u8, arg, "--emit-c")) {
+            options.emit_c_only = true;
         } else if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
             options.verbose = true;
         }
@@ -116,70 +119,35 @@ fn executeBuild(
     target_override: ?config_loader.TargetConfig,
     options: BuildOptions,
 ) !void {
-    // Determine effective settings
-    const target = if (target_override) |t| t.target else config.build.target;
-    const out_dir = if (target_override) |t| t.out_dir orelse config.build.out_dir else config.build.out_dir;
-    const optimize = if (target_override) |t| t.optimize orelse config.build.optimize else config.build.optimize;
-    const minify = options.minify orelse config.build.minify;
-    const sourcemap = options.sourcemap orelse config.build.sourcemap;
+    // Apply target override if provided
+    var effective_config = config;
+    if (target_override) |t| {
+        effective_config.build.target = t.target;
+        if (t.out_dir) |dir| effective_config.build.out_dir = dir;
+        if (t.optimize) |opt| effective_config.build.optimize = opt;
+    }
 
-    _ = optimize;
-    _ = minify;
-    _ = sourcemap;
-
+    // Print build info
     std.debug.print("{s}Building{s} {s} → {s} ({s})\n", .{
         colors.info.code(),
         colors.Color.reset.code(),
-        config.root,
-        out_dir,
-        @tagName(target),
+        effective_config.root,
+        effective_config.build.out_dir,
+        @tagName(effective_config.build.target),
     });
 
-    // Map target to backend
-    const backend: compile.Backend = switch (target) {
-        .native => .c,
-        .js => .js,
-        .erlang => .erlang,
-        .wasm => .js, // WASM uses JS backend for now
-    };
-
-    // Determine output path
-    const out_file = config.build.out_file orelse blk: {
-        // Extract filename from root without extension
-        const basename = std.fs.path.basename(config.root);
-        if (std.mem.lastIndexOf(u8, basename, ".")) |dot_idx| {
-            break :blk basename[0..dot_idx];
-        }
-        break :blk basename;
-    };
-
-    const extension = switch (backend) {
-        .c => ".c",
-        .js => ".js",
-        .erlang => ".erl",
-    };
-
-    const output_path = try std.fmt.allocPrint(allocator, "{s}/{s}{s}", .{
-        out_dir,
-        out_file,
-        extension,
+    // Use shared executor
+    const emit_c_only = options.emit_c_only or config.build.emit_c_only;
+    const result = try executor.execute(allocator, &effective_config, .{
+        .run_after_build = false,
+        .emit_c_only = emit_c_only,
+        .keep_c = config.build.cc.keep_c,
+        .verbose = options.verbose,
     });
-    defer allocator.free(output_path);
 
-    // Ensure output directory exists
-    std.fs.cwd().makePath(out_dir) catch |err| {
-        if (err != error.PathAlreadyExists) {
-            std.debug.print("{s}error:{s} Failed to create output directory: {s}\n", .{
-                colors.error_color.code(),
-                colors.Color.reset.code(),
-                @errorName(err),
-            });
-            return err;
-        }
-    };
-
-    // Run compilation with build config (includes transforms!)
-    try compile.runWithBuildConfig(allocator, config.root, backend, output_path, true, &config);
+    // Free allocated paths
+    allocator.free(result.output_path);
+    if (result.exe_path) |p| allocator.free(p);
 }
 
 pub fn printUsage() void {
@@ -196,11 +164,13 @@ pub fn printUsage() void {
         \\  --no-minify          Disable minification
         \\  --sourcemap          Enable source maps
         \\  --no-sourcemap       Disable source maps
+        \\  --emit-c             Only emit C code, don't compile to native
         \\  --verbose, -v        Verbose output
         \\
         \\Examples:
-        \\  msc build                    Build with defaults
+        \\  msc build                    Build with defaults (native executable)
         \\  msc build --target=js        Build for JavaScript
+        \\  msc build --emit-c           Generate C only (no native compile)
         \\  msc build --mode=staging     Use .env.staging
         \\  msc build --watch            Watch mode
         \\

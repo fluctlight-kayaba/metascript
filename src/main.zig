@@ -1,5 +1,10 @@
 const std = @import("std");
 
+// Set log level to warn by default (suppresses debug/info noise)
+pub const std_options: std.Options = .{
+    .log_level = .warn,
+};
+
 // Import core compiler modules (pub for visibility tools)
 pub const ast = @import("ast/ast.zig");
 pub const lexer_mod = @import("lexer/lexer.zig");
@@ -126,12 +131,8 @@ pub fn main() !void {
 
         try cli_compile.runWithArgs(allocator, input_file.?, target, output_path, enable_normalize);
     } else if (std.mem.eql(u8, command, "run")) {
-        if (args.len < 3) {
-            std.debug.print("Error: run command requires input file\n", .{});
-            try printUsage();
-            return;
-        }
-        try cli_run.run(allocator, args[2]);
+        // Build and run - uses build.ms config (or optional explicit file)
+        try cli_run.run(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "build")) {
         // Vite-style build command - uses build.ms config
         try cli_build.run(allocator, args[2..]);

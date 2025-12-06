@@ -351,7 +351,7 @@ pub const ModuleLoader = struct {
             return cached;
         }
 
-        std.log.info("[ModuleLoader] Loading module: {s}", .{path});
+        std.log.debug("[ModuleLoader] Loading module: {s}", .{path});
 
         // Read file
         const file = std.fs.cwd().openFile(path, .{}) catch |err| {
@@ -432,7 +432,7 @@ pub const ModuleLoader = struct {
     /// Internal: Load a module from in-memory source content with depth tracking
     /// Fixes: C7 (module loss), C8/C9 (atomic swap), C10 (double-free), C11 (restore leak)
     fn loadModuleFromSourceWithDepth(self: *ModuleLoader, path: []const u8, source: []const u8, depth: usize) LoadError!*Module {
-        std.log.info("[ModuleLoader] Loading module from source: {s}", .{path});
+        std.log.debug("[ModuleLoader] Loading module from source: {s}", .{path});
 
         // === PHASE 1: Create new module (don't touch cache yet) ===
 
@@ -2110,12 +2110,16 @@ test "multiple imports from same module deduplicates dependencies" {
 
     _ = try loader.loadModule(consumer_path);
 
+    // Normalize path for lookup (macOS /tmp -> /private/tmp)
+    const normalized_path = try std.fs.cwd().realpathAlloc(allocator, consumer_path);
+    defer allocator.free(normalized_path);
+
     // Should have 2 import entries (one for each import statement)
-    const module = loader.modules.get(consumer_path).?;
+    const module = loader.modules.get(normalized_path).?;
     try std.testing.expectEqual(@as(usize, 2), module.imports.items.len);
 
     // But dependencies should be deduplicated - only 1 unique dependency
-    const deps = loader.getDependencies(consumer_path);
+    const deps = loader.getDependencies(normalized_path);
     try std.testing.expect(deps != null);
     try std.testing.expectEqual(@as(usize, 1), deps.?.len);
 }

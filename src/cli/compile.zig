@@ -25,6 +25,14 @@ pub const Backend = enum {
     erlang,
 };
 
+/// Compilation options
+pub const CompileOptions = struct {
+    /// Show verbose output (all phases). Default is quiet/Cargo-style.
+    verbose: bool = false,
+    /// Enable AST normalization
+    enable_normalize: bool = true,
+};
+
 pub fn run(allocator: std.mem.Allocator, input_file: []const u8) !void {
     return runWithArgs(allocator, input_file, .js, null, true);
 }
@@ -38,11 +46,17 @@ pub fn runWithBuildConfig(
     enable_normalize: bool,
     cfg: *const build_config.BuildConfig,
 ) !void {
-    return compileInternal(allocator, input_file, target, output_path, enable_normalize, cfg);
+    return compileInternal(allocator, input_file, target, output_path, .{
+        .enable_normalize = enable_normalize,
+        .verbose = false,
+    }, cfg);
 }
 
 pub fn runWithArgs(allocator: std.mem.Allocator, input_file: []const u8, target: Backend, output_path: ?[]const u8, enable_normalize: bool) !void {
-    return compileInternal(allocator, input_file, target, output_path, enable_normalize, null);
+    return compileInternal(allocator, input_file, target, output_path, .{
+        .enable_normalize = enable_normalize,
+        .verbose = true, // CLI compile command uses verbose
+    }, null);
 }
 
 /// Internal compilation implementation - unified pipeline with optional transforms
@@ -51,12 +65,13 @@ fn compileInternal(
     input_file: []const u8,
     target: Backend,
     output_path: ?[]const u8,
-    enable_normalize: bool,
+    options: CompileOptions,
     cfg: ?*const build_config.BuildConfig,
 ) !void {
     const has_transforms = cfg != null and cfg.?.transforms.len > 0;
     const total_phases: u8 = if (has_transforms) 6 else 5;
     const start_time = std.time.milliTimestamp();
+    const verbose = options.verbose;
 
     // Phase numbering helper
     var current_phase: u8 = 0;
@@ -73,13 +88,15 @@ fn compileInternal(
 
     // Phase 1: Load and parse file
     const phase1 = nextPhase(&current_phase);
-    std.debug.print("{s}[{d}/{d}]{s} Parsing {s}...\n", .{
-        colors.info.code(),
-        phase1,
-        total_phases,
-        colors.Color.reset.code(),
-        input_file,
-    });
+    if (verbose) {
+        std.debug.print("{s}[{d}/{d}]{s} Parsing {s}...\n", .{
+            colors.info.code(),
+            phase1,
+            total_phases,
+            colors.Color.reset.code(),
+            input_file,
+        });
+    }
 
     const source = std.fs.cwd().readFileAlloc(allocator, input_file, 1024 * 1024) catch |err| {
         std.debug.print("{s}error:{s} Could not read file '{s}': {s}\n", .{
@@ -112,35 +129,35 @@ fn compileInternal(
     }
 
     if (diagnostics.len > 0) {
-        std.debug.print("{s}[{d}/{d}]{s} Parsing {s}failed{s}\n", .{
+        std.debug.print("{s}error:{s} Parse failed\n", .{
             colors.error_color.code(),
-            phase1,
-            total_phases,
-            colors.Color.reset.code(),
-            colors.Color.bright_red.code(),
             colors.Color.reset.code(),
         });
         printDiagnostics(input_file, source, diagnostics);
         return;
     }
 
-    std.debug.print("{s}[{d}/{d}]{s} Parsed {s}✓{s}\n", .{
-        colors.success.code(),
-        phase1,
-        total_phases,
-        colors.Color.reset.code(),
-        colors.Color.bright_green.code(),
-        colors.Color.reset.code(),
-    });
+    if (verbose) {
+        std.debug.print("{s}[{d}/{d}]{s} Parsed {s}✓{s}\n", .{
+            colors.success.code(),
+            phase1,
+            total_phases,
+            colors.Color.reset.code(),
+            colors.Color.bright_green.code(),
+            colors.Color.reset.code(),
+        });
+    }
 
     // Phase 2: Get AST and expand macros
     const phase2 = nextPhase(&current_phase);
-    std.debug.print("{s}[{d}/{d}]{s} Expanding macros...\n", .{
-        colors.info.code(),
-        phase2,
-        total_phases,
-        colors.Color.reset.code(),
-    });
+    if (verbose) {
+        std.debug.print("{s}[{d}/{d}]{s} Expanding macros...\n", .{
+            colors.info.code(),
+            phase2,
+            total_phases,
+            colors.Color.reset.code(),
+        });
+    }
 
     const parse_result = db.parse(input_file) catch |err| {
         std.debug.print("{s}error:{s} Parse failed: {s}\n", .{
@@ -164,29 +181,25 @@ fn compileInternal(
 
     // Load standard library macros (@derive, etc.)
     loader.loadStdMacros() catch |err| {
-        std.debug.print("{s}[{d}/{d}]{s} Standard macros {s}warning{s}: {s} (continuing without std macros)\n", .{
-            colors.warning.code(),
-            phase2,
-            total_phases,
-            colors.Color.reset.code(),
-            colors.Color.bright_yellow.code(),
-            colors.Color.reset.code(),
-            @errorName(err),
-        });
+        if (verbose) {
+            std.debug.print("{s}warning:{s} std macros: {s}\n", .{
+                colors.warning.code(),
+                colors.Color.reset.code(),
+                @errorName(err),
+            });
+        }
         // Continue without std macros - they might not be needed
     };
 
     // Load the entry module (this triggers loading of all imported dependencies)
     _ = loader.loadModule(input_file) catch |err| {
-        std.debug.print("{s}[{d}/{d}]{s} Module loading {s}warning{s}: {s} (continuing with parsed AST)\n", .{
-            colors.warning.code(),
-            phase2,
-            total_phases,
-            colors.Color.reset.code(),
-            colors.Color.bright_yellow.code(),
-            colors.Color.reset.code(),
-            @errorName(err),
-        });
+        if (verbose) {
+            std.debug.print("{s}warning:{s} module loading: {s}\n", .{
+                colors.warning.code(),
+                colors.Color.reset.code(),
+                @errorName(err),
+            });
+        }
         // Continue with just the parsed AST - imports may not be resolvable
     };
 
@@ -202,97 +215,108 @@ fn compileInternal(
             bytecode_cache,
             null, // network cache not used in CLI compile
         ) catch |err| {
-            std.debug.print("{s}[{d}/{d}]{s} Macro expansion {s}warning{s}: {s}\n", .{
-                colors.warning.code(),
-                phase2,
-                total_phases,
-                colors.Color.reset.code(),
-                colors.Color.bright_yellow.code(),
-                colors.Color.reset.code(),
-                @errorName(err),
-            });
+            if (verbose) {
+                std.debug.print("{s}warning:{s} macro expansion: {s}\n", .{
+                    colors.warning.code(),
+                    colors.Color.reset.code(),
+                    @errorName(err),
+                });
+            }
             // Continue with unexpanded AST
             break :blk parse_result.tree;
         };
         break :blk expanded;
     };
 
-    std.debug.print("{s}[{d}/{d}]{s} Macros expanded {s}✓{s}\n", .{
-        colors.success.code(),
-        phase2,
-        total_phases,
-        colors.Color.reset.code(),
-        colors.Color.bright_green.code(),
-        colors.Color.reset.code(),
-    });
+    if (verbose) {
+        std.debug.print("{s}[{d}/{d}]{s} Macros expanded {s}✓{s}\n", .{
+            colors.success.code(),
+            phase2,
+            total_phases,
+            colors.Color.reset.code(),
+            colors.Color.bright_green.code(),
+            colors.Color.reset.code(),
+        });
+    }
 
     // Phase 2.5: Transform Pipeline (optional - runs if transforms configured)
     const transformed_ast = if (has_transforms) transform_blk: {
         const phase_transform = nextPhase(&current_phase);
-        std.debug.print("{s}[{d}/{d}]{s} Running transforms...\n", .{
-            colors.info.code(),
-            phase_transform,
-            total_phases,
-            colors.Color.reset.code(),
-        });
+        if (verbose) {
+            std.debug.print("{s}[{d}/{d}]{s} Running transforms...\n", .{
+                colors.info.code(),
+                phase_transform,
+                total_phases,
+                colors.Color.reset.code(),
+            });
+        }
 
         var pipeline = transform_pipeline.Pipeline.init(allocator);
         defer pipeline.deinit();
 
         // Load transforms from build config
         pipeline.loadFromBuildConfig(cfg.?) catch |err| {
-            std.debug.print("{s}[{d}/{d}]{s} Transform loading {s}warning{s}: {s}\n", .{
-                colors.warning.code(),
-                phase_transform,
-                total_phases,
-                colors.Color.reset.code(),
-                colors.Color.bright_yellow.code(),
-                colors.Color.reset.code(),
-                @errorName(err),
-            });
+            if (verbose) {
+                std.debug.print("{s}warning:{s} transform loading: {s}\n", .{
+                    colors.warning.code(),
+                    colors.Color.reset.code(),
+                    @errorName(err),
+                });
+            }
         };
 
         // Sort transforms by dependencies
         pipeline.sortTransforms() catch |err| {
-            std.debug.print("{s}[{d}/{d}]{s} Transform sort {s}warning{s}: {s}\n", .{
-                colors.warning.code(),
-                phase_transform,
-                total_phases,
-                colors.Color.reset.code(),
-                colors.Color.bright_yellow.code(),
-                colors.Color.reset.code(),
-                @errorName(err),
-            });
+            if (verbose) {
+                std.debug.print("{s}warning:{s} transform sort: {s}\n", .{
+                    colors.warning.code(),
+                    colors.Color.reset.code(),
+                    @errorName(err),
+                });
+            }
             break :transform_blk program_ast;
         };
 
         if (pipeline.count() > 0) {
             const result = pipeline.run(parse_result.arena, allocator, program_ast, input_file) catch |err| {
-                std.debug.print("{s}[{d}/{d}]{s} Transform {s}warning{s}: {s}\n", .{
-                    colors.warning.code(),
-                    phase_transform,
-                    total_phases,
-                    colors.Color.reset.code(),
-                    colors.Color.bright_yellow.code(),
-                    colors.Color.reset.code(),
-                    @errorName(err),
-                });
+                if (verbose) {
+                    std.debug.print("{s}warning:{s} transform: {s}\n", .{
+                        colors.warning.code(),
+                        colors.Color.reset.code(),
+                        @errorName(err),
+                    });
+                }
                 break :transform_blk program_ast;
             };
 
-            if (result.changed) {
-                std.debug.print("{s}[{d}/{d}]{s} Transforms applied {s}✓{s} ({d} transforms)\n", .{
-                    colors.success.code(),
-                    phase_transform,
-                    total_phases,
-                    colors.Color.reset.code(),
-                    colors.Color.bright_green.code(),
-                    colors.Color.reset.code(),
-                    result.transform_count,
-                });
-            } else {
-                std.debug.print("{s}[{d}/{d}]{s} No transforms needed {s}✓{s}\n", .{
-                    colors.success.code(),
+            if (verbose) {
+                if (result.changed) {
+                    std.debug.print("{s}[{d}/{d}]{s} Transforms applied {s}✓{s} ({d} transforms)\n", .{
+                        colors.success.code(),
+                        phase_transform,
+                        total_phases,
+                        colors.Color.reset.code(),
+                        colors.Color.bright_green.code(),
+                        colors.Color.reset.code(),
+                        result.transform_count,
+                    });
+                } else {
+                    std.debug.print("{s}[{d}/{d}]{s} No transforms needed {s}✓{s}\n", .{
+                        colors.success.code(),
+                        phase_transform,
+                        total_phases,
+                        colors.Color.reset.code(),
+                        colors.Color.bright_green.code(),
+                        colors.Color.reset.code(),
+                    });
+                }
+            }
+
+            break :transform_blk result.node;
+        } else {
+            if (verbose) {
+                std.debug.print("{s}[{d}/{d}]{s} No transforms configured {s}✓{s}\n", .{
+                    colors.dim_text.code(),
                     phase_transform,
                     total_phases,
                     colors.Color.reset.code(),
@@ -300,29 +324,20 @@ fn compileInternal(
                     colors.Color.reset.code(),
                 });
             }
-
-            break :transform_blk result.node;
-        } else {
-            std.debug.print("{s}[{d}/{d}]{s} No transforms configured {s}✓{s}\n", .{
-                colors.dim_text.code(),
-                phase_transform,
-                total_phases,
-                colors.Color.reset.code(),
-                colors.Color.bright_green.code(),
-                colors.Color.reset.code(),
-            });
             break :transform_blk program_ast;
         }
     } else program_ast;
 
     // Phase 3: Type checking
     const phase3 = nextPhase(&current_phase);
-    std.debug.print("{s}[{d}/{d}]{s} Type checking...\n", .{
-        colors.info.code(),
-        phase3,
-        total_phases,
-        colors.Color.reset.code(),
-    });
+    if (verbose) {
+        std.debug.print("{s}[{d}/{d}]{s} Type checking...\n", .{
+            colors.info.code(),
+            phase3,
+            total_phases,
+            colors.Color.reset.code(),
+        });
+    }
 
     // Run type checker to populate node.type fields
     var type_checker = checker.TypeChecker.init(allocator) catch |err| {
@@ -349,15 +364,11 @@ fn compileInternal(
     };
 
     if (!type_check_ok) {
-        std.debug.print("{s}[{d}/{d}]{s} Type checking {s}failed{s}\n", .{
+        // Always show type errors
+        std.debug.print("{s}error:{s} Type checking failed\n", .{
             colors.error_color.code(),
-            phase3,
-            total_phases,
-            colors.Color.reset.code(),
-            colors.Color.bright_red.code(),
             colors.Color.reset.code(),
         });
-        // Print type errors
         for (type_checker.errors.items) |err| {
             std.debug.print("{s}error:{s} {s}\n", .{
                 colors.error_color.code(),
@@ -373,7 +384,7 @@ fn compileInternal(
             });
         }
         // Continue anyway for now - type errors shouldn't block codegen
-    } else {
+    } else if (verbose) {
         std.debug.print("{s}[{d}/{d}]{s} Type checked {s}✓{s}\n", .{
             colors.success.code(),
             phase3,
@@ -385,17 +396,17 @@ fn compileInternal(
     }
 
     // AST Normalization (integrated into type checking phase - no separate phase number)
-    const final_ast = if (enable_normalize and type_check_ok) blk: {
+    const final_ast = if (options.enable_normalize and type_check_ok) blk: {
         var normalize_ctx = normalize.NormalizeContext.init(parse_result.arena, allocator, &type_checker);
         const normalized_ast = normalize.normalizeAST(&normalize_ctx, transformed_ast) catch {
             // Continue with unnormalized AST (normalization is optimization, not required)
             break :blk transformed_ast;
         };
 
-        // Print normalization stats if any
-        if (normalize_ctx.stats.object_spreads_normalized > 0 or
+        // Print normalization stats if any (only in verbose mode)
+        if (verbose and (normalize_ctx.stats.object_spreads_normalized > 0 or
             normalize_ctx.stats.array_chains_fused > 0 or
-            normalize_ctx.stats.closures_inlined > 0)
+            normalize_ctx.stats.closures_inlined > 0))
         {
             std.debug.print("{s}  Normalized:{s} ", .{
                 colors.dim_text.code(),
@@ -421,12 +432,14 @@ fn compileInternal(
     var drc_storage: Drc = undefined;
 
     if (target == .c) {
-        std.debug.print("{s}[{d}/{d}]{s} Running DRC analysis...\n", .{
-            colors.info.code(),
-            phase4,
-            total_phases,
-            colors.Color.reset.code(),
-        });
+        if (verbose) {
+            std.debug.print("{s}[{d}/{d}]{s} Running DRC analysis...\n", .{
+                colors.info.code(),
+                phase4,
+                total_phases,
+                colors.Color.reset.code(),
+            });
+        }
 
         // Initialize DRC with move optimization enabled
         // Move optimization detects last-use of variables and elides RC ops
@@ -438,38 +451,44 @@ fn compileInternal(
 
         var analyzer = DrcAnalyzer.init(drc.?);
         analyzer.analyze(final_ast) catch |err| {
-            std.debug.print("{s}[{d}/{d}]{s} DRC analysis {s}warning{s}: {s}\n", .{
-                colors.warning.code(),
-                phase4,
-                total_phases,
-                colors.Color.reset.code(),
-                colors.Color.bright_yellow.code(),
-                colors.Color.reset.code(),
-                @errorName(err),
-            });
+            if (verbose) {
+                std.debug.print("{s}warning:{s} DRC analysis: {s}\n", .{
+                    colors.warning.code(),
+                    colors.Color.reset.code(),
+                    @errorName(err),
+                });
+            }
             drc.?.deinit();
             drc = null; // Fall back to legacy mode
         };
 
         if (drc != null) {
             drc.?.finalize() catch |err| {
-                std.debug.print("{s}[{d}/{d}]{s} DRC finalize {s}warning{s}: {s}\n", .{
-                    colors.warning.code(),
-                    phase4,
-                    total_phases,
-                    colors.Color.reset.code(),
-                    colors.Color.bright_yellow.code(),
-                    colors.Color.reset.code(),
-                    @errorName(err),
-                });
+                if (verbose) {
+                    std.debug.print("{s}warning:{s} DRC finalize: {s}\n", .{
+                        colors.warning.code(),
+                        colors.Color.reset.code(),
+                        @errorName(err),
+                    });
+                }
                 drc.?.deinit();
                 drc = null;
             };
         }
 
-        if (drc != null) {
+        if (drc != null and verbose) {
             const stats = drc.?.getStats();
-            std.debug.print("{s}[{d}/{d}]{s} DRC analyzed {s}✓{s} ({d} vars, {d} RC ops, {d:.0}% elided)\n", .{
+            // Build optimization suffix (RVO, stack alloc)
+            var opt_buf: [128]u8 = undefined;
+            var opt_suffix: []const u8 = "";
+            if (stats.rvo_applied > 0 or stats.stack_allocations > 0) {
+                const written = std.fmt.bufPrint(&opt_buf, ", {d} RVO, {d} stack", .{
+                    stats.rvo_applied,
+                    stats.stack_allocations,
+                }) catch "";
+                opt_suffix = written;
+            }
+            std.debug.print("{s}[{d}/{d}]{s} DRC analyzed {s}✓{s} ({d} vars, {d} RC ops, {d:.0}% elided{s})\n", .{
                 colors.success.code(),
                 phase4,
                 total_phases,
@@ -479,17 +498,49 @@ fn compileInternal(
                 stats.variables_analyzed,
                 stats.total_ops,
                 stats.elisionRate() * 100,
+                opt_suffix,
             });
-        }
-    } else {
-        std.debug.print("{s}[{d}/{d}]{s} Preparing codegen...\n", .{
-            colors.info.code(),
-            phase4,
-            total_phases,
-            colors.Color.reset.code(),
-        });
 
-        std.debug.print("{s}[{d}/{d}]{s} Ready {s}✓{s}\n", .{
+            // Print DRC diagnostics to stderr (TODO-1.3: memory safety warnings)
+            const drc_diagnostics = drc.?.getDiagnostics();
+            if (drc_diagnostics.len > 0) {
+                const stderr = std.io.getStdErr().writer();
+                stderr.print("\n{s}DRC Diagnostics:{s}\n", .{
+                    colors.Color.bright_yellow.code(),
+                    colors.Color.reset.code(),
+                }) catch {};
+                for (drc_diagnostics) |diag| {
+                    const severity_str = switch (diag.severity) {
+                        .@"error" => colors.Color.bright_red.code(),
+                        .warning => colors.Color.bright_yellow.code(),
+                        .hint => colors.Color.bright_cyan.code(),
+                    };
+                    const severity_name = switch (diag.severity) {
+                        .@"error" => "error",
+                        .warning => "warning",
+                        .hint => "hint",
+                    };
+                    const code_name = switch (diag.code) {
+                        .use_after_move => "use-after-move",
+                        .potential_cycle => "potential-cycle",
+                        .uninitialized_use => "uninitialized-use",
+                        .double_free_risk => "double-free-risk",
+                    };
+                    stderr.print("{s}{s}{s}[{s}]: line {d}:{d}: {s}\n", .{
+                        severity_str,
+                        severity_name,
+                        colors.Color.reset.code(),
+                        code_name,
+                        diag.line,
+                        diag.column,
+                        diag.message,
+                    }) catch {};
+                }
+                stderr.print("\n", .{}) catch {};
+            }
+        }
+    } else if (verbose) {
+        std.debug.print("{s}[{d}/{d}]{s} Preparing codegen {s}✓{s}\n", .{
             colors.success.code(),
             phase4,
             total_phases,
@@ -509,13 +560,15 @@ fn compileInternal(
         .erlang => "Erlang",
     };
 
-    std.debug.print("{s}[{d}/{d}]{s} Generating {s}...\n", .{
-        colors.info.code(),
-        phase5,
-        total_phases,
-        colors.Color.reset.code(),
-        target_name,
-    });
+    if (verbose) {
+        std.debug.print("{s}[{d}/{d}]{s} Generating {s}...\n", .{
+            colors.info.code(),
+            phase5,
+            total_phases,
+            colors.Color.reset.code(),
+            target_name,
+        });
+    }
 
     switch (target) {
         .js => {
@@ -545,7 +598,7 @@ fn compileInternal(
                 return;
             };
 
-            printCompletionMessage(phase5, total_phases, out_path, start_time);
+            printCompletionMessage(phase5, total_phases, out_path, start_time, verbose);
         },
         .c => {
             if (drc == null) {
@@ -556,18 +609,21 @@ fn compileInternal(
                 return;
             }
 
-            var gen = cgen.CGenerator.init(allocator, drc.?);
+            // Pass TypeChecker symbols to CGenerator for type-driven optimizations
+            var gen = cgen.CGenerator.initWithSymbols(allocator, drc.?, &type_checker.symbols);
             defer gen.deinit();
 
             // Check if we have multiple modules loaded (imports present)
             const has_imports = loader.modules.count() > 1;
 
             const c_code = if (has_imports) blk: {
-                std.debug.print("{s}  Multi-module:{s} bundling {d} modules\n", .{
-                    colors.dim_text.code(),
-                    colors.Color.reset.code(),
-                    loader.modules.count(),
-                });
+                if (verbose) {
+                    std.debug.print("{s}  Multi-module:{s} bundling {d} modules\n", .{
+                        colors.dim_text.code(),
+                        colors.Color.reset.code(),
+                        loader.modules.count(),
+                    });
+                }
                 break :blk gen.generateMultiModule(&loader, input_file) catch |err| {
                     std.debug.print("{s}error:{s} C generation failed: {s}\n", .{
                         colors.error_color.code(),
@@ -601,7 +657,7 @@ fn compileInternal(
                 return;
             };
 
-            printCompletionMessage(phase5, total_phases, out_path, start_time);
+            printCompletionMessage(phase5, total_phases, out_path, start_time, verbose);
         },
         .erlang => {
             var gen = try erlgen.ErlangGenerator.init(allocator, input_file);
@@ -630,7 +686,7 @@ fn compileInternal(
                 return;
             };
 
-            printCompletionMessage(phase5, total_phases, out_path, start_time);
+            printCompletionMessage(phase5, total_phases, out_path, start_time, verbose);
         },
     }
 }
@@ -659,28 +715,38 @@ fn getOutputPath(allocator: std.mem.Allocator, input_file: []const u8, output_pa
 }
 
 /// Helper to print completion message
-fn printCompletionMessage(phase: u8, total_phases: u8, out_path: []const u8, start_time: i64) void {
-    std.debug.print("{s}[{d}/{d}]{s} Generated {s} {s}✓{s}\n", .{
-        colors.success.code(),
-        phase,
-        total_phases,
-        colors.Color.reset.code(),
-        out_path,
-        colors.Color.bright_green.code(),
-        colors.Color.reset.code(),
-    });
-
+fn printCompletionMessage(phase: u8, total_phases: u8, out_path: []const u8, start_time: i64, show_verbose: bool) void {
     const elapsed = std.time.milliTimestamp() - start_time;
-    std.debug.print("\n{s}✓{s} Compilation complete ({d}ms)\n", .{
-        colors.success.code(),
-        colors.Color.reset.code(),
-        elapsed,
-    });
-    std.debug.print("  {s}Output:{s} {s}\n", .{
-        colors.dim_text.code(),
-        colors.Color.reset.code(),
-        out_path,
-    });
+
+    if (show_verbose) {
+        std.debug.print("{s}[{d}/{d}]{s} Generated {s} {s}✓{s}\n", .{
+            colors.success.code(),
+            phase,
+            total_phases,
+            colors.Color.reset.code(),
+            out_path,
+            colors.Color.bright_green.code(),
+            colors.Color.reset.code(),
+        });
+        std.debug.print("\n{s}✓{s} Compilation complete ({d}ms)\n", .{
+            colors.success.code(),
+            colors.Color.reset.code(),
+            elapsed,
+        });
+        std.debug.print("  {s}Output:{s} {s}\n", .{
+            colors.dim_text.code(),
+            colors.Color.reset.code(),
+            out_path,
+        });
+    } else {
+        // Cargo-style minimal output
+        std.debug.print("{s}✓{s} Compiled {s} ({d}ms)\n", .{
+            colors.success.code(),
+            colors.Color.reset.code(),
+            out_path,
+            elapsed,
+        });
+    }
 }
 
 fn printDiagnostics(path: []const u8, source: []const u8, diagnostics: []const transam.Diagnostic) void {

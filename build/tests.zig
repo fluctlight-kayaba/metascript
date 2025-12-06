@@ -75,6 +75,15 @@ pub fn setup(
     typechecker_tests.root_module.addImport("src", src_module);
     const run_typechecker_tests = b.addRunArtifact(typechecker_tests);
 
+    // LSP integration tests (Trans-Am cache, hover, completion, diagnostics)
+    const lsp_integration_tests = b.addTest(.{
+        .root_source_file = b.path("tests/lsp/lsp_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lsp_integration_tests.root_module.addImport("src", src_module);
+    const run_lsp_integration_tests = b.addRunArtifact(lsp_integration_tests);
+
     // Ownership analysis tests (shared DRC infrastructure)
     const ownership_tests = b.addTest(.{
         .root_source_file = b.path("src/analysis/ownership.zig"),
@@ -116,10 +125,18 @@ pub fn setup(
     test_step.dependOn(&run_normalize_tests.step);
     test_step.dependOn(&run_spread_element_tests.step);
     test_step.dependOn(&run_typechecker_tests.step);
+    test_step.dependOn(&run_lsp_integration_tests.step);
     test_step.dependOn(&run_ownership_tests.step);
     test_step.dependOn(&run_cycle_detection_tests.step);
     test_step.dependOn(&run_rc_trait_tests.step);
     test_step.dependOn(&run_drc_tests.step);
+
+    // LSP integration tests (hover, completion, diagnostics, go-to-definition)
+    const test_lsp_step = b.step("test-lsp", "Run LSP integration tests with Trans-Am cache");
+    test_lsp_step.dependOn(&run_lsp_server_tests.step);
+    test_lsp_step.dependOn(&run_jsonrpc_tests.step);
+    test_lsp_step.dependOn(&run_filestore_tests.step);
+    test_lsp_step.dependOn(&run_lsp_integration_tests.step);
 
     // Analysis tests (DRC infrastructure)
     const test_analysis_step = b.step("test-analysis", "Run DRC/ownership analysis tests");
@@ -351,6 +368,7 @@ pub fn setup(
     test_all_step.dependOn(&run_lsp_server_tests.step);
     test_all_step.dependOn(&run_jsonrpc_tests.step);
     test_all_step.dependOn(&run_filestore_tests.step);
+    test_all_step.dependOn(&run_lsp_integration_tests.step);
     test_all_step.dependOn(&run_normalize_tests.step);
     test_all_step.dependOn(&run_helper_tests.step);
     test_all_step.dependOn(&run_property_tests.step);

@@ -2220,6 +2220,22 @@ pub const Parser = struct {
         // Simple type name (identifier)
         if (self.check(.identifier)) {
             const name = self.current.text;
+
+            // Check for built-in primitive type names before treating as type reference
+            // These are keywords in TypeScript but identifiers in our lexer
+            if (std.mem.eql(u8, name, "number")) {
+                self.advance();
+                return try self.arena.createType(.number, loc, .{ .number = {} });
+            }
+            if (std.mem.eql(u8, name, "string")) {
+                self.advance();
+                return try self.arena.createType(.string, loc, .{ .string = {} });
+            }
+            if (std.mem.eql(u8, name, "boolean")) {
+                self.advance();
+                return try self.arena.createType(.boolean, loc, .{ .boolean = {} });
+            }
+
             self.advance();
 
             // Check for generic type args: Type<T, U>

@@ -17,48 +17,65 @@
 
 **Production Validation:** Nim 2.0+ uses ORC as default (August 2023).
 
- ┌─────────────────────────────────────────────────────────────────────────┐
- │                    METASCRIPT MEMORY MODEL                              │
- │                    ══════════════════════                               │
- ├─────────────────────────────────────────────────────────────────────────┤
- │                                                                         │
- │                        YOUR CODE                                        │
- │                           │                                             │
- │                           ▼                                             │
- │              ┌────────────────────────┐                                 │
- │              │   SHARED BY DEFAULT    │  ← Safe, TypeScript-compatible  │
- │              │   (All refs are RC)    │    Zero learning curve          │
- │              └────────────────────────┘                                 │
- │                           │                                             │
- │                           ▼                                             │
- │              ┌────────────────────────┐                                 │
- │              │DRC LOBSTER OPTIMIZATION│  ← Compiler magic (automatic)   │
- │              │   (Compile-time)       │                                 │
- │              └────────────────────────┘                                 │
- │                      /        \                                         │
- │                     /          \                                        │
- │                    ▼            ▼                                       │
- │         ┌──────────────┐  ┌──────────────┐                              │
- │         │  95% CASES   │  │   5% CASES   │                              │
- │         │  ──────────  │  │  ──────────  │                              │
- │         │              │  │              │                              │
- │         │ Single-owner │  │ Can't prove  │                              │
- │         │ detected     │  │ single-owner │                              │
- │         │              │  │              │                              │
- │         │ → NO RC ops! │  │ → ORC ops    │  ← Still safe! Just slower   │
- │         │   (elided)   │  │   (shared)   │                              │
- │         └──────────────┘  └──────────────┘                              │
- │                                  │                                      │
- │                                  ▼                                      │
- │                     ┌────────────────────────┐                          │
- │                     │  OPTIONAL: move        │  ← User optimization     │
- │                     │  keyword for 5%        │    Only if they care     │
- │                     └────────────────────────┘                          │
- │                                  │                                      │
- │                                  ▼                                      │
- │                           → NO RC ops!                                  │
- │                                                                         │
- └─────────────────────────────────────────────────────────────────────────┘
+ ┌─────────────────────────────────────────────────────────────────────────────────┐
+ │                    METASCRIPT MEMORY MODEL (Complete)                           │
+ ├─────────────────────────────────────────────────────────────────────────────────┤
+ │                                                                                 │
+ │                              YOUR CODE                                          │
+ │                    ┌────────────┴────────────┐                                  │
+ │                    ▼                         ▼                                  │
+ │             ┌───────────┐             ┌─────────────┐                           │
+ │             │   SYNC    │             │    ASYNC    │                           │
+ │             │  let x=f()│             │ await f()   │                           │
+ │             └─────┬─────┘             └──────┬──────┘                           │
+ │                   │                          │                                  │
+ │                   │                          ▼                                  │
+ │                   │               ┌──────────────────┐                          │
+ │                   │               │ ASYNC TRANSFORM  │ → State Machine          │
+ │                   │               │ • await → yield  │ → Future<T>              │
+ │                   │               │ • captures vars  │ → Callbacks              │
+ │                   │               └────────┬─────────┘                          │
+ │                   └──────────┬─────────────┘                                    │
+ │                              ▼                                                  │
+ │                   ┌──────────────────────┐                                      │
+ │                   │  SHARED BY DEFAULT   │  TypeScript semantics                │
+ │                   │  (All refs are RC)   │  Zero learning curve                 │
+ │                   └──────────┬───────────┘                                      │
+ │                              ▼                                                  │
+ │                   ┌──────────────────────┐                                      │
+ │                   │  DRC OPTIMIZATION    │  Compile-time analysis               │
+ │                   ├──────────────────────┤                                      │
+ │                   │ + Capture tracking   │ ◄── NEW: vars across await           │
+ │                   │ + Callback cycles    │ ◄── NEW: fut→cb→fut                  │
+ │                   └──────────┬───────────┘                                      │
+ │                        ┌─────┴─────┐                                            │
+ │                        ▼           ▼                                            │
+ │                 ┌──────────┐ ┌───────────┐                                      │
+ │                 │ 90% FAST │ │ 10% SAFE  │                                      │
+ │                 │ ──────── │ │ ───────── │                                      │
+ │                 │ RC elided│ │ ORC + GC  │                                      │
+ │                 │ (single  │ │ (shared/  │                                      │
+ │                 │  owner)  │ │  cycles)  │                                      │
+ │                 └──────────┘ └─────┬─────┘                                      │
+ │                                    ▼                                            │
+ │                         ┌──────────────────────┐                                │
+ │                         │    ORC RUNTIME       │                                │
+ │                         ├──────────────────────┤                                │
+ │                         │ + Future.callbacks   │ ◄── NEW: cleared on complete   │
+ │                         │ + State machine      │ ◄── NEW: traced for cycles     │
+ │                         │   cycle detection    │                                │
+ │                         └──────────────────────┘                                │
+ │                                                                                 │
+ ├─────────────────────────────────────────────────────────────────────────────────┤
+ │  TOOLING IMPACT                                                                 │
+ ├────────────────────┬────────────────────┬───────────────────────────────────────┤
+ │  ANALYZER          │  LSP               │  C CODEGEN                            │
+ │  ─────────         │  ───               │  ────────                             │
+ │  • await validation│  • Hover: captures │  • State struct + trace_fn            │
+ │  • capture analysis│  • Errors: async   │  • Step function (switch)             │
+ │  • cycle detection │  • Quick fixes     │  • Callback ref management            │
+ └────────────────────┴────────────────────┴───────────────────────────────────────┘
+
 
  0%                        95%            100%
  │                          │               │

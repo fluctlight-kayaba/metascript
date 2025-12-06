@@ -195,7 +195,8 @@ fn hoistInFunction(ctx: *TransformContext, body: *node_mod.Node) TransformError!
     const block = &body.data.block_stmt;
     const hoisted_count = vars.items.len;
 
-    var new_statements = std.ArrayList(*node_mod.Node).init(ctx.allocator);
+    // Use arena allocator so toOwnedSlice() allocates from arena (no leak)
+    var new_statements = std.ArrayList(*node_mod.Node).init(ctx.arena.allocator());
     defer new_statements.deinit();
 
     // Add hoisted var declarations (without initializers, deduplicated)
@@ -338,7 +339,8 @@ fn convertVarToAssignments(ctx: *TransformContext, node_ptr: *node_mod.Node, out
         .block_stmt => {
             // Recursively process block contents
             const block = &node_ptr.data.block_stmt;
-            var new_stmts = std.ArrayList(*node_mod.Node).init(ctx.allocator);
+            // Use arena allocator so toOwnedSlice() allocates from arena (no leak)
+            var new_stmts = std.ArrayList(*node_mod.Node).init(ctx.arena.allocator());
             defer new_stmts.deinit();
 
             for (block.statements) |stmt| {
@@ -355,7 +357,8 @@ fn convertVarToAssignments(ctx: *TransformContext, node_ptr: *node_mod.Node, out
             const if_s = &node_ptr.data.if_stmt;
 
             // Convert consequent
-            var cons_stmts = std.ArrayList(*node_mod.Node).init(ctx.allocator);
+            // Use arena allocator so toOwnedSlice() allocates from arena (no leak)
+            var cons_stmts = std.ArrayList(*node_mod.Node).init(ctx.arena.allocator());
             defer cons_stmts.deinit();
             try convertVarToAssignments(ctx, if_s.consequent, &cons_stmts);
 
@@ -371,7 +374,8 @@ fn convertVarToAssignments(ctx: *TransformContext, node_ptr: *node_mod.Node, out
 
             // Convert alternate if present
             if (if_s.alternate) |alt| {
-                var alt_stmts = std.ArrayList(*node_mod.Node).init(ctx.allocator);
+                // Use arena allocator so toOwnedSlice() allocates from arena (no leak)
+                var alt_stmts = std.ArrayList(*node_mod.Node).init(ctx.arena.allocator());
                 defer alt_stmts.deinit();
                 try convertVarToAssignments(ctx, alt, &alt_stmts);
 

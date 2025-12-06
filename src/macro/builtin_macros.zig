@@ -31,11 +31,11 @@ pub fn expandDerive(arena: *ast.ASTArena, allocator: std.mem.Allocator, class_no
 
     if (std.mem.eql(u8, trait, "Eq")) {
         // Generate equals() method
-        const method = try generateEqualsMethodDirect(arena, allocator, class, loc);
+        const method = try generateEqualsMethodCore(arena, allocator, class, loc);
         try addMethodToClass(allocator, class, method);
     } else if (std.mem.eql(u8, trait, "Hash")) {
         // Generate hash() method
-        const method = try generateHashMethodDirect(arena, allocator, class, loc);
+        const method = try generateHashMethodCore(arena, allocator, class, loc);
         try addMethodToClass(allocator, class, method);
     } else {
         std.log.warn("[MACRO] Unknown trait for @derive: {s}", .{trait});
@@ -143,184 +143,15 @@ fn deriveMacro(ctx: *expander.MacroContext, invocation: *ast.Node) !?*ast.Node {
 
 /// Generate equals(other: ClassName): boolean method
 /// Compares all fields for structural equality
+/// Wrapper that delegates to the core implementation
 fn generateEqualsMethod(ctx: *expander.MacroContext, class: *ast.node.ClassDecl, loc: ast.SourceLocation) !*ast.Node {
-    // equals(other: User): boolean {
-    //     return this.name === other.name && this.age === other.age;
-    // }
-
-    const arena = ctx.arena;
-
-    // Build comparison expression: this.field === other.field for each property
-    var comparisons = std.ArrayList(*ast.Node).init(ctx.allocator);
-    defer comparisons.deinit();
-
-    for (class.members) |member| {
-        if (member.kind == .property_decl) {
-            const prop = &member.data.property_decl;
-
-            // this.field
-            const this_member = try createMemberAccess(arena, loc, "this", prop.name);
-
-            // other.field
-            const other_member = try createMemberAccess(arena, loc, "other", prop.name);
-
-            // this.field === other.field
-            const comparison = try expander.createBinaryExpr(
-                arena,
-                loc,
-                .eq,
-                this_member,
-                other_member,
-            );
-
-            try comparisons.append(comparison);
-        }
-    }
-
-    // Chain comparisons with &&
-    var result_expr = comparisons.items[0];
-    for (comparisons.items[1..]) |comp| {
-        result_expr = try expander.createBinaryExpr(
-            arena,
-            loc,
-            .@"and",
-            result_expr,
-            comp,
-        );
-    }
-
-    // return <result_expr>;
-    const return_stmt = try arena.createNode(
-        .return_stmt,
-        loc,
-        .{ .return_stmt = .{ .argument = result_expr } },
-    );
-
-    // { return ...; }
-    const body_stmts = try ctx.allocator.alloc(*ast.Node, 1);
-    body_stmts[0] = return_stmt;
-
-    const body = try arena.createNode(
-        .block_stmt,
-        loc,
-        .{ .block_stmt = .{ .statements = body_stmts } },
-    );
-
-    // Parameter: other: ClassName
-    const type_ref_old = try ctx.allocator.create(ast.types.TypeReference);
-    type_ref_old.* = .{
-        .name = class.name,
-        .type_args = &[_]*ast.Type{},
-    };
-    const param_type = try arena.createType(
-        .type_reference,
-        loc,
-        .{ .type_reference = type_ref_old },
-    );
-
-    const params = try ctx.allocator.alloc(ast.node.FunctionExpr.FunctionParam, 1);
-    params[0] = .{
-        .name = "other",
-        .type = param_type,
-        .optional = false,
-        .default_value = null,
-    };
-
-    // Return type: boolean
-    const return_type = try arena.createType(
-        .boolean,
-        loc,
-        .{ .boolean = {} },
-    );
-
-    // Create method declaration
-    return try expander.createMethodDecl(
-        arena,
-        loc,
-        "equals",
-        params,
-        return_type,
-        body,
-    );
+    return generateEqualsMethodCore(ctx.arena, ctx.allocator, class, loc);
 }
 
 /// Generate hash(): number method
+/// Wrapper that delegates to the core implementation
 fn generateHashMethod(ctx: *expander.MacroContext, class: *ast.node.ClassDecl, loc: ast.SourceLocation) !*ast.Node {
-    // hash(): number {
-    //     return hashString(this.name) ^ this.age;
-    // }
-
-    const arena = ctx.arena;
-
-    // Build hash expression: hash each field and XOR them together
-    var hash_expr: ?*ast.Node = null;
-
-    for (class.members) |member| {
-        if (member.kind == .property_decl) {
-            const prop = &member.data.property_decl;
-
-            // this.field
-            const field_access = try createMemberAccess(arena, loc, "this", prop.name);
-
-            // hashString(this.field) or just this.field for numbers
-            const field_hash = if (prop.type) |t| blk: {
-                if (t.kind == .string) {
-                    // hashString(this.field)
-                    const hash_fn = try expander.createIdentifier(arena, loc, "hashString");
-                    const args = try ctx.allocator.alloc(*ast.Node, 1);
-                    args[0] = field_access;
-
-                    break :blk try arena.createNode(
-                        .call_expr,
-                        loc,
-                        .{
-                            .call_expr = .{
-                                .callee = hash_fn,
-                                .arguments = args,
-                                .type_args = &[_]*ast.Type{},
-                            },
-                        },
-                    );
-                } else {
-                    break :blk field_access;
-                }
-            } else field_access;
-
-            // XOR with previous hash
-            if (hash_expr) |prev| {
-                hash_expr = try expander.createBinaryExpr(arena, loc, .bit_xor, prev, field_hash);
-            } else {
-                hash_expr = field_hash;
-            }
-        }
-    }
-
-    // return <hash_expr>;
-    const return_stmt = try arena.createNode(
-        .return_stmt,
-        loc,
-        .{ .return_stmt = .{ .argument = hash_expr } },
-    );
-
-    const body_stmts = try ctx.allocator.alloc(*ast.Node, 1);
-    body_stmts[0] = return_stmt;
-
-    const body = try arena.createNode(
-        .block_stmt,
-        loc,
-        .{ .block_stmt = .{ .statements = body_stmts } },
-    );
-
-    const return_type = try arena.createType(.number, loc, .{ .number = {} });
-
-    return try expander.createMethodDecl(
-        arena,
-        loc,
-        "hash",
-        &[_]ast.node.FunctionExpr.FunctionParam{},
-        return_type,
-        body,
-    );
+    return generateHashMethodCore(ctx.arena, ctx.allocator, class, loc);
 }
 
 /// Generate clone(): ClassName method
@@ -428,10 +259,13 @@ fn createMemberAccess(arena: *ast.ASTArena, loc: ast.SourceLocation, object: []c
     );
 }
 
-// === Direct generation functions (not requiring MacroContext) ===
+// === Core generation functions ===
+// These are the single source of truth for method generation.
+// The wrapper functions (generateEqualsMethod, generateHashMethod) delegate here.
 
-/// Generate equals method directly (without MacroContext)
-fn generateEqualsMethodDirect(arena: *ast.ASTArena, allocator: std.mem.Allocator, class: *ast.node.ClassDecl, loc: ast.SourceLocation) !*ast.Node {
+/// Core implementation: Generate equals(other: ClassName): boolean method
+/// Compares all fields for structural equality
+fn generateEqualsMethodCore(arena: *ast.ASTArena, allocator: std.mem.Allocator, class: *ast.node.ClassDecl, loc: ast.SourceLocation) !*ast.Node {
     // Build comparison expression: this.field === other.field for each property
     var comparisons = std.ArrayList(*ast.Node).init(allocator);
     defer comparisons.deinit();
@@ -510,8 +344,9 @@ fn generateEqualsMethodDirect(arena: *ast.ASTArena, allocator: std.mem.Allocator
     return try expander.createMethodDecl(arena, loc, "equals", params, return_type, body);
 }
 
-/// Generate hash method directly (without MacroContext)
-fn generateHashMethodDirect(arena: *ast.ASTArena, allocator: std.mem.Allocator, class: *ast.node.ClassDecl, loc: ast.SourceLocation) !*ast.Node {
+/// Core implementation: Generate hash(): number method
+/// XORs all field values together (simplified hash)
+fn generateHashMethodCore(arena: *ast.ASTArena, allocator: std.mem.Allocator, class: *ast.node.ClassDecl, loc: ast.SourceLocation) !*ast.Node {
     // Build hash expression: XOR all field hashes together
     var hash_expr: ?*ast.Node = null;
 

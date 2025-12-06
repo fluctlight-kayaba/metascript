@@ -303,6 +303,7 @@ pub const TypeChecker = struct {
             .type_alias_decl => {
                 const alias = &node.data.type_alias_decl;
                 var sym = symbol.Symbol.init(alias.name, .type_alias, node.location);
+                sym.type = alias.type; // Store aliased type for codegen to resolve
                 sym.doc_comment = node.doc_comment; // Propagate JSDoc from AST
 
                 self.symbols.define(sym) catch {

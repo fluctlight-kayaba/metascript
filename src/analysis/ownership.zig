@@ -269,7 +269,16 @@ pub const OwnershipAnalyzer = struct {
             .is_parameter = is_param,
             .type_kind = type_kind,
         });
-        try self.uses.put(name, std.ArrayList(UseInfo).init(self.allocator));
+        // Use getOrPut to avoid leaking if the same name is registered twice
+        // (e.g., same variable name in different function scopes)
+        const gop = try self.uses.getOrPut(name);
+        if (gop.found_existing) {
+            // Clear the existing list instead of creating a new one
+            gop.value_ptr.clearRetainingCapacity();
+        } else {
+            // New entry - create the list
+            gop.value_ptr.* = std.ArrayList(UseInfo).init(self.allocator);
+        }
     }
 
     /// Record a variable use

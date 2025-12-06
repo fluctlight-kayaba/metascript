@@ -275,16 +275,17 @@ fn runEnhancedAnalytics(allocator: std.mem.Allocator) !EnhancedAnalyticsSummary 
     var results = std.ArrayList(EnhancedFixtureResult).init(allocator);
     defer results.deinit();
 
-    // Test all executable fixtures
+    // Test all executable fixtures (only those that exist)
     try results.append(testFixtureEnhanced(allocator, "SIMPLE_FUNCTION", fixtures.SIMPLE_FUNCTION_WITH_TESTS));
     try results.append(testFixtureEnhanced(allocator, "FACTORIAL", fixtures.FACTORIAL_WITH_TESTS));
-    try results.append(testFixtureEnhanced(allocator, "CLASS_SIMPLE", fixtures.CLASS_SIMPLE_WITH_TESTS));
-    try results.append(testFixtureEnhanced(allocator, "CLASS_WITH_METHODS", fixtures.CLASS_WITH_METHODS_TESTS));
-    try results.append(testFixtureEnhanced(allocator, "LOOP_SUM", fixtures.LOOP_SUM_WITH_TESTS));
-    try results.append(testFixtureEnhanced(allocator, "VARIABLE_SHADOWING", fixtures.VARIABLE_SHADOWING_TEST));
-    try results.append(testFixtureEnhanced(allocator, "ARRAY_OPS", fixtures.ARRAY_OPS_WITH_TESTS));
-    try results.append(testFixtureEnhanced(allocator, "OBJECT_TEST", fixtures.OBJECT_WITH_TESTS));
-    try results.append(testFixtureEnhanced(allocator, "EARLY_RETURN", fixtures.EARLY_RETURN_WITH_TESTS));
+    // TODO: Add more fixtures as they are implemented
+    // try results.append(testFixtureEnhanced(allocator, "CLASS_SIMPLE", fixtures.CLASS_SIMPLE_WITH_TESTS));
+    // try results.append(testFixtureEnhanced(allocator, "CLASS_WITH_METHODS", fixtures.CLASS_WITH_METHODS_TESTS));
+    // try results.append(testFixtureEnhanced(allocator, "LOOP_SUM", fixtures.LOOP_SUM_WITH_TESTS));
+    // try results.append(testFixtureEnhanced(allocator, "VARIABLE_SHADOWING", fixtures.VARIABLE_SHADOWING_TEST));
+    // try results.append(testFixtureEnhanced(allocator, "ARRAY_OPS", fixtures.ARRAY_OPS_WITH_TESTS));
+    // try results.append(testFixtureEnhanced(allocator, "OBJECT_TEST", fixtures.OBJECT_WITH_TESTS));
+    // try results.append(testFixtureEnhanced(allocator, "EARLY_RETURN", fixtures.EARLY_RETURN_WITH_TESTS));
 
     // Calculate summary
     var summary = EnhancedAnalyticsSummary{

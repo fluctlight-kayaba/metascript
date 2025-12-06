@@ -37,6 +37,12 @@ const DrcAnalyzer = @import("../../analysis/drc_analyzer.zig").DrcAnalyzer;
 // Module system for multi-module compilation
 const module_loader = @import("../../module/loader.zig");
 
+// Type system - for accessing TypeChecker results
+const symbol_mod = @import("../../checker/symbol.zig");
+const Symbol = symbol_mod.Symbol;
+const SymbolTable = symbol_mod.SymbolTable;
+const location = @import("../../ast/location.zig");
+
 pub const CGenerator = struct {
     allocator: std.mem.Allocator,
     output: std.ArrayList(u8),
@@ -92,15 +98,37 @@ pub const CGenerator = struct {
     /// Used during expression emission to substitute temps for nested calls
     hoisted_calls: std.AutoHashMap(*ast.Node, []const u8),
 
+    // ========================================================================
+    // Stack Allocation Optimization (TODO-3.3)
+    // ========================================================================
+    /// Variables that were stack-allocated (don't escape scope)
+    /// Used to skip RC operations for these variables
+    stack_allocated_vars: std.StringHashMap(void),
+
+    // ========================================================================
+    // TypeChecker Integration - Type-driven optimizations
+    // ========================================================================
+    /// Symbol table from TypeChecker (optional, enables type-driven optimizations)
+    /// When available, provides:
+    ///   - Exact types for better C type emission
+    ///   - Mutability info for const qualification
+    ///   - Ownership hints for RC optimization
+    symbols: ?*const SymbolTable,
+
     const Self = @This();
 
     /// Initialize C generator with DRC analysis results (required)
     pub fn init(allocator: std.mem.Allocator, drc: *Drc) Self {
-        return initWithModule(allocator, drc, null);
+        return initWithModule(allocator, drc, null, null);
+    }
+
+    /// Initialize C generator with DRC and TypeChecker symbols
+    pub fn initWithSymbols(allocator: std.mem.Allocator, drc: *Drc, symbols: *const SymbolTable) Self {
+        return initWithModule(allocator, drc, null, symbols);
     }
 
     /// Initialize C generator with DRC analysis and optional module path for name mangling
-    pub fn initWithModule(allocator: std.mem.Allocator, drc: *Drc, module_path: ?[]const u8) Self {
+    pub fn initWithModule(allocator: std.mem.Allocator, drc: *Drc, module_path: ?[]const u8, symbols: ?*const SymbolTable) Self {
         // Derive module prefix from path: "/path/to/foo.ms" -> "foo_"
         const prefix = if (module_path) |path| blk: {
             const basename = std.fs.path.basename(path);
@@ -133,6 +161,10 @@ pub const CGenerator = struct {
             .nested_call_temp_counter = 0,
             .pending_temps = std.ArrayList([]const u8).init(allocator),
             .hoisted_calls = std.AutoHashMap(*ast.Node, []const u8).init(allocator),
+            // Stack allocation optimization
+            .stack_allocated_vars = std.StringHashMap(void).init(allocator),
+            // TypeChecker integration
+            .symbols = symbols,
         };
     }
 
@@ -180,7 +212,199 @@ pub const CGenerator = struct {
         }
         self.pending_temps.deinit();
         self.hoisted_calls.deinit();
+        // Stack allocation tracking (keys are from AST, no need to free)
+        self.stack_allocated_vars.deinit();
         self.output.deinit();
+    }
+
+    // ========================================================================
+    // TypeChecker Integration - Symbol lookup helpers
+    // ========================================================================
+
+    /// Look up a symbol by name from TypeChecker's symbol table
+    /// Returns null if symbols not available or symbol not found
+    ///
+    /// When line/column are provided, uses position-aware lookup to correctly
+    /// resolve shadowed variables (finds the symbol visible at that source position).
+    /// Otherwise falls back to lookupAll() which returns the most recently defined.
+    fn getSymbol(self: *const Self, name: []const u8) ?Symbol {
+        const symbols = self.symbols orelse return null;
+        return symbols.lookupAll(name);
+    }
+
+    /// Position-aware symbol lookup - correctly handles shadowing
+    /// Use this when you have source location (e.g., from AST node or RcOp)
+    fn getSymbolAtPosition(self: *const Self, name: []const u8, line: u32, column: u32) ?Symbol {
+        const symbols = self.symbols orelse return null;
+        // Try position-aware lookup first (handles shadowing correctly)
+        if (symbols.lookupAtPosition(name, line, column)) |sym| {
+            return sym;
+        }
+        // Fall back to lookupAll for symbols without position info
+        return symbols.lookupAll(name);
+    }
+
+    /// Check if a type is a primitive (non-pointer) type in C
+    /// Primitives can have "const" prefix; objects become pointers
+    fn isPrimitiveTypeKind(kind: types_mod.TypeKind) bool {
+        return switch (kind) {
+            .number, .int8, .int16, .int32, .int64,
+            .uint8, .uint16, .uint32, .uint64,
+            .float32, .float64, .boolean,
+            => true,
+            else => false,
+        };
+    }
+
+    /// Emit "const " prefix for const variable declarations of primitive types
+    /// Call this BEFORE emitting the type.
+    /// For primitives: "const int x" (value is const)
+    /// For objects: use emitConstSuffixIfNeeded AFTER the type for "Type* const x"
+    fn emitConstPrefixIfNeeded(self: *Self, var_kind: node_mod.VariableStmt.VariableKind, typ: ?*types_mod.Type) !void {
+        if (var_kind != .@"const") return;
+        if (typ) |t| {
+            // Use follow() to unwrap type wrappers (ref, lent)
+            const resolved = types_mod.follow(t);
+            if (resolved) |r| {
+                // For type_reference, resolve type alias via SymbolTable
+                if (r.kind == .type_reference) {
+                    const name = r.data.type_reference.name;
+                    if (self.getSymbol(name)) |sym| {
+                        if (sym.kind == .type_alias) {
+                            if (sym.type) |aliased_type| {
+                                return self.emitConstPrefixIfNeeded(var_kind, aliased_type);
+                            }
+                        }
+                    }
+                    // Unresolved custom types are pointers, no prefix
+                    return;
+                }
+                if (isPrimitiveTypeKind(r.kind)) {
+                    try self.emit("const ");
+                }
+            }
+        }
+    }
+
+    /// Check if a type is a pointer type in C (object, string, array, etc.)
+    /// These need " const" AFTER the "*" for const declarations
+    fn isPointerType(self: *const Self, typ: ?*types_mod.Type) bool {
+        const t = typ orelse return false;
+        // Use follow() to unwrap type wrappers (ref, lent)
+        const resolved = types_mod.follow(t);
+        if (resolved == null) return false;
+
+        // For type_reference, check if it resolves to a type alias
+        if (resolved.?.kind == .type_reference) {
+            const name = resolved.?.data.type_reference.name;
+            // Resolve type alias via SymbolTable
+            if (self.getSymbol(name)) |sym| {
+                if (sym.kind == .type_alias) {
+                    if (sym.type) |aliased_type| {
+                        return self.isPointerType(aliased_type);
+                    }
+                }
+            }
+            // Unresolved custom types (classes) become struct*
+            return true;
+        }
+
+        return switch (resolved.?.kind) {
+            .object, .string, .array => true,
+            else => false,
+        };
+    }
+
+    /// Emit " const" suffix for const pointer declarations
+    /// Call this AFTER emitting the type (which ends with "*").
+    /// For objects: "Type* const x" (pointer can't be reassigned)
+    fn emitConstSuffixIfNeeded(self: *Self, var_kind: node_mod.VariableStmt.VariableKind, typ: ?*types_mod.Type) !void {
+        if (var_kind != .@"const") return;
+        if (self.isPointerType(typ)) {
+            try self.emit(" const");
+        }
+    }
+
+    /// Emit "const " for inferred primitive types (number literals, etc.)
+    /// Call when we know the type is primitive but don't have Type* struct
+    fn emitConstPrefixForPrimitive(self: *Self, var_kind: node_mod.VariableStmt.VariableKind) !void {
+        if (var_kind == .@"const") {
+            try self.emit("const ");
+        }
+    }
+
+    /// Check if a type is a borrowed/lent reference
+    /// Lent types should be emitted with const in C (can't modify borrowed data)
+    fn isLentType(typ: ?*types_mod.Type) bool {
+        const t = typ orelse return false;
+        return t.kind == .lent;
+    }
+
+    /// Emit "const " prefix for borrowed/lent parameter types
+    /// In C: `lent User` → `const User*` (read-only borrowed reference)
+    fn emitConstPrefixForLent(self: *Self, typ: ?*types_mod.Type) !void {
+        if (isLentType(typ)) {
+            try self.emit("const ");
+        }
+    }
+
+    /// Check if a variable has borrowed ownership (Phase 4 optimization)
+    /// Uses SymbolTable to look up the variable's type and check:
+    /// 1. Type.kind == .lent (borrowed reference from caller)
+    /// 2. Type.ownership == .borrowed (when TypeChecker populates this)
+    ///
+    /// Variables with borrowed ownership don't need RC operations because
+    /// the caller owns them and is responsible for cleanup.
+    ///
+    /// Uses position-aware lookup to correctly handle shadowed variables.
+    fn hasBorrowedOwnershipAtPosition(self: *const Self, var_name: []const u8, line: u32, column: u32) bool {
+        const symbol = self.getSymbolAtPosition(var_name, line, column) orelse return false;
+        const typ = symbol.type orelse return false;
+
+        // Check 1: Type is a lent reference (borrowed from caller)
+        if (typ.kind == .lent) {
+            return true;
+        }
+
+        // Check 2: Type has explicit borrowed ownership (future: TypeChecker populates this)
+        if (typ.ownership) |ownership| {
+            return ownership == .borrowed;
+        }
+
+        return false;
+    }
+
+    /// Convenience wrapper when no position info available (falls back to lookupAll)
+    fn hasBorrowedOwnership(self: *const Self, var_name: []const u8) bool {
+        const symbol = self.getSymbol(var_name) orelse return false;
+        const typ = symbol.type orelse return false;
+
+        if (typ.kind == .lent) {
+            return true;
+        }
+
+        if (typ.ownership) |ownership| {
+            return ownership == .borrowed;
+        }
+
+        return false;
+    }
+
+    /// Get the resolved type for a variable from SymbolTable (Phase 3.1)
+    /// This provides the TypeChecker's resolved type, which may be more precise
+    /// than the AST node's type (e.g., for inferred types, generics resolution).
+    ///
+    /// Priority: Use AST types first (decl.type, init_expr.type), then fall back
+    /// to SymbolTable for cases where AST doesn't have type info.
+    fn getSymbolType(self: *const Self, var_name: []const u8) ?*types_mod.Type {
+        const symbol = self.getSymbol(var_name) orelse return null;
+        return symbol.type;
+    }
+
+    /// Position-aware version - correctly handles shadowed variables
+    fn getSymbolTypeAtPosition(self: *const Self, var_name: []const u8, line: u32, column: u32) ?*types_mod.Type {
+        const symbol = self.getSymbolAtPosition(var_name, line, column) orelse return null;
+        return symbol.type;
     }
 
     // ========================================================================
@@ -233,11 +457,50 @@ pub const CGenerator = struct {
         }
     }
 
+    /// Convert RcOp.Reason to human-readable string for debug comments
+    fn reasonToString(reason: RcOp.Reason) []const u8 {
+        return switch (reason) {
+            .allocation => "allocation",
+            .assignment => "assignment",
+            .reassignment => "reassignment",
+            .field_store => "field store",
+            .function_arg => "function argument",
+            .return_value => "return value",
+            .scope_exit => "scope exit cleanup",
+            .last_use => "last use optimization",
+            .cycle_candidate => "cycle candidate",
+        };
+    }
+
     /// Emit a single RC operation from DRC
     fn emitRcOp(self: *Self, op: RcOp) !void {
         // Skip RC ops for StringBuilder variables - they manage their own memory
         if (self.isStringBuilderVar(op.target)) {
             return;
+        }
+
+        // Skip RC ops for stack-allocated variables (TODO-3.4)
+        // Stack-allocated objects have automatic lifetime, no RC needed
+        if (self.stack_allocated_vars.contains(op.target)) {
+            return;
+        }
+
+        // Phase 4: Skip RC ops for borrowed/lent ownership (type-driven optimization)
+        // DRC already handles this at analysis level (doesn't generate ops for borrowed vars),
+        // but this provides a safety net using TypeChecker's type information.
+        // Note: Type.ownership field exists but isn't populated yet by TypeChecker.
+        // For now, we check Type.kind == .lent to identify borrowed references.
+        // Uses position-aware lookup to correctly resolve shadowed variables.
+        if (self.hasBorrowedOwnershipAtPosition(op.target, op.line, op.column)) {
+            return;
+        }
+
+        // Emit debug comment if available (TODO-1.1: op.comment in debug mode)
+        if (op.comment) |comment| {
+            try self.emitIndent();
+            try self.emit("// DRC: ");
+            try self.emit(comment);
+            try self.emit("\n");
         }
 
         switch (op.kind) {
@@ -248,13 +511,17 @@ pub const CGenerator = struct {
                 try self.emitIndent();
                 try self.emit("ms_incref(");
                 try self.emit(op.target);
-                try self.emit(");\n");
+                try self.emit(");  // ");
+                try self.emit(reasonToString(op.reason));
+                try self.emit("\n");
             },
             .decref => {
                 try self.emitIndent();
                 try self.emit("ms_decref(");
                 try self.emit(op.target);
-                try self.emit(");\n");
+                try self.emit(");  // ");
+                try self.emit(reasonToString(op.reason));
+                try self.emit("\n");
             },
             .decref_cycle_check => {
                 // Emit typed decref for cycle detection if type info is available
@@ -266,12 +533,16 @@ pub const CGenerator = struct {
                     try self.emit(op.target);
                     try self.emit(", &");
                     try self.emit(type_name);
-                    try self.emit("_type);\n");
+                    try self.emit("_type);  // ");
+                    try self.emit(reasonToString(op.reason));
+                    try self.emit("\n");
                 } else {
                     // Fall back to simple decref if no type info available
                     try self.emit("ms_decref(");
                     try self.emit(op.target);
-                    try self.emit(");\n");
+                    try self.emit(");  // ");
+                    try self.emit(reasonToString(op.reason));
+                    try self.emit("\n");
                 }
             },
             .decref_reassign => {
@@ -285,16 +556,13 @@ pub const CGenerator = struct {
                 try self.emit(op.target);
                 try self.emit(" = ");
                 try self.emit(op.target);
-                try self.emit(";\n");
+                try self.emit(";  // ");
+                try self.emit(reasonToString(op.reason));
+                try self.emit("\n");
             },
             .move => {
                 // Transfer ownership - no RC change needed
-                // Emit comment for debugging
-                if (op.comment) |comment| {
-                    try self.emitIndent();
-                    try self.emit(comment);
-                    try self.emit("\n");
-                }
+                // op.comment is already emitted at the top of emitRcOp
             },
             .scope_cleanup_start => {
                 try self.emitIndent();
@@ -719,6 +987,8 @@ pub const CGenerator = struct {
         } else {
             for (func.params, 0..) |param, i| {
                 if (i > 0) try self.emit(", ");
+                // Emit const for lent (borrowed) parameters
+                try self.emitConstPrefixForLent(param.type);
                 if (param.type) |ptype| {
                     try self.emitType(ptype);
                 } else {
@@ -1519,7 +1789,7 @@ pub const CGenerator = struct {
 
     /// Emit ORC support (trace function + TypeInfo) for a class
     fn emitClassOrcSupport(self: *Self, class_name: []const u8, members: []*ast.Node) !void {
-        // Check if class has any reference-type fields (determines is_cyclic)
+        // Check if class has any reference-type fields (needed for trace function)
         var has_ref_fields = false;
         for (members) |member| {
             if (member.kind == .property_decl) {
@@ -1530,6 +1800,18 @@ pub const CGenerator = struct {
                 }
             }
         }
+
+        // Use types.isCyclic() for proper transitive cycle detection
+        // This catches cycles like A → B → A that shallow field checking misses
+        const is_cyclic = blk: {
+            if (self.getSymbol(class_name)) |symbol| {
+                if (symbol.type) |class_type| {
+                    break :blk types_mod.isCyclic(class_type);
+                }
+            }
+            // Fallback: if we can't find the type, assume cyclic if has ref fields
+            break :blk has_ref_fields;
+        };
 
         // Emit trace function (traces reference fields for cycle detection)
         try self.emit("static void ");
@@ -1583,7 +1865,7 @@ pub const CGenerator = struct {
         try self.emit("),\n");
 
         try self.emitIndent();
-        if (has_ref_fields) {
+        if (is_cyclic) {
             try self.emit(".is_cyclic = true,\n");
         } else {
             try self.emit(".is_cyclic = false,\n");
@@ -1732,6 +2014,11 @@ pub const CGenerator = struct {
         try self.clearStringBuilderVars();
         self.current_function = func.name;
 
+        // Enter function context for DRC scope-qualified variable lookup
+        // This ensures variables from different functions don't collide in DRC queries
+        self.drc.enterFunction(func.name);
+        defer self.drc.exitFunction();
+
         // Detect StringBuilder candidates for THIS function only
         if (self.enable_stringbuilder) {
             if (func.body) |body| {
@@ -1759,6 +2046,9 @@ pub const CGenerator = struct {
         try self.emit("(");
         for (func.params, 0..) |param, i| {
             if (i > 0) try self.emit(", ");
+
+            // Emit const for lent (borrowed) parameters
+            try self.emitConstPrefixForLent(param.type);
 
             // Emit parameter type
             if (param.type) |param_type| {
@@ -2155,15 +2445,27 @@ pub const CGenerator = struct {
             if (needs_split) {
                 // Declare variable, then assign fields separately
                 if (decl.type) |typ| {
+                    try self.emitConstPrefixIfNeeded(var_stmt.kind, typ);
                     try self.emitType(typ);
+                    try self.emitConstSuffixIfNeeded(var_stmt.kind, typ);
                 } else if (decl.init) |init_expr| {
                     // Try to use the inferred type from the initializer
                     if (init_expr.type) |inferred_type| {
+                        try self.emitConstPrefixIfNeeded(var_stmt.kind, inferred_type);
                         try self.emitType(inferred_type);
+                        try self.emitConstSuffixIfNeeded(var_stmt.kind, inferred_type);
+                    } else if (self.getSymbolTypeAtPosition(decl.name, node.location.start.line, node.location.start.column)) |symbol_type| {
+                        // Phase 3.1: Use TypeChecker's resolved type from SymbolTable
+                        // Uses position-aware lookup to handle shadowed variables correctly
+                        try self.emitConstPrefixIfNeeded(var_stmt.kind, symbol_type);
+                        try self.emitType(symbol_type);
+                        try self.emitConstSuffixIfNeeded(var_stmt.kind, symbol_type);
                     } else if (init_expr.kind == .array_expr) {
+                        try self.emitConstPrefixForPrimitive(var_stmt.kind);
                         try self.emit("double");
                     } else if (init_expr.kind == .number_literal) {
                         // Heuristic: if it's an integer literal, use int; otherwise double
+                        try self.emitConstPrefixForPrimitive(var_stmt.kind);
                         const num = init_expr.data.number_literal;
                         if (@floor(num) == num and num >= -2147483648 and num <= 2147483647) {
                             try self.emit("int");
@@ -2172,12 +2474,21 @@ pub const CGenerator = struct {
                         }
                     } else if (init_expr.kind == .member_expr) {
                         // Member access or array indexing - default to double
+                        try self.emitConstPrefixForPrimitive(var_stmt.kind);
                         try self.emit("double");
                     } else {
                         try self.emit("void*");
+                        if (var_stmt.kind == .@"const") try self.emit(" const");
                     }
+                } else if (self.getSymbolTypeAtPosition(decl.name, node.location.start.line, node.location.start.column)) |symbol_type| {
+                    // Phase 3.1: Use TypeChecker's resolved type from SymbolTable
+                    // Uses position-aware lookup to handle shadowed variables correctly
+                    try self.emitConstPrefixIfNeeded(var_stmt.kind, symbol_type);
+                    try self.emitType(symbol_type);
+                    try self.emitConstSuffixIfNeeded(var_stmt.kind, symbol_type);
                 } else {
                     try self.emit("void*");
+                    if (var_stmt.kind == .@"const") try self.emit(" const");
                 }
                 try self.emit(" ");
                 try self.emit(decl.name);
@@ -2237,20 +2548,59 @@ pub const CGenerator = struct {
                     if (init_expr.kind == .new_expr) {
                         const new_e = &init_expr.data.new_expr;
                         if (new_e.callee.kind == .identifier) {
-                            try self.emit(new_e.callee.data.identifier);
+                            const class_name = new_e.callee.data.identifier;
+
+                            // Stack allocation optimization (TODO-3.3):
+                            // If variable doesn't escape, allocate on stack instead of heap
+                            if (self.drc.canStackAllocate(decl.name)) {
+                                // Stack-allocate: ClassName var_storage; ClassName* [const] var = &var_storage;
+                                try self.emit(class_name);
+                                try self.emit(" ");
+                                try self.emit(decl.name);
+                                try self.emit("_storage = {0};  // stack-allocated (no escape)\n");
+                                try self.emitIndent();
+                                try self.emit(class_name);
+                                try self.emit("*");
+                                // Emit const suffix for const pointer declarations
+                                if (var_stmt.kind == .@"const") try self.emit(" const");
+                                try self.emit(" ");
+                                try self.emit(decl.name);
+                                try self.emit(" = &");
+                                try self.emit(decl.name);
+                                try self.emit("_storage;\n");
+                                // Track this variable as stack-allocated (for skipping RC ops)
+                                try self.stack_allocated_vars.put(decl.name, {});
+                                continue; // Skip the normal emission
+                            }
+
+                            // Heap-allocate (normal path - variable escapes)
+                            try self.emit(class_name);
                             try self.emit("*");
+                            // Emit const suffix for const pointer declarations
+                            if (var_stmt.kind == .@"const") try self.emit(" const");
                         } else {
                             try self.emit("void*");
+                            if (var_stmt.kind == .@"const") try self.emit(" const");
                         }
                     } else if (decl.type) |typ| {
+                        try self.emitConstPrefixIfNeeded(var_stmt.kind, typ);
                         try self.emitType(typ);
+                        try self.emitConstSuffixIfNeeded(var_stmt.kind, typ);
                     } else if (init_expr.type) |inferred_type| {
-                        // Try to use the inferred type from the initializer
+                        try self.emitConstPrefixIfNeeded(var_stmt.kind, inferred_type);
                         try self.emitType(inferred_type);
+                        try self.emitConstSuffixIfNeeded(var_stmt.kind, inferred_type);
+                    } else if (self.getSymbolTypeAtPosition(decl.name, node.location.start.line, node.location.start.column)) |symbol_type| {
+                        // Phase 3.1: Use TypeChecker's resolved type from SymbolTable
+                        // Uses position-aware lookup to handle shadowed variables correctly
+                        try self.emitConstPrefixIfNeeded(var_stmt.kind, symbol_type);
+                        try self.emitType(symbol_type);
+                        try self.emitConstSuffixIfNeeded(var_stmt.kind, symbol_type);
                     } else if (init_expr.kind == .array_expr) {
+                        try self.emitConstPrefixForPrimitive(var_stmt.kind);
                         try self.emit("double");
                     } else if (init_expr.kind == .number_literal) {
-                        // Heuristic: if it's an integer literal, use int; otherwise double
+                        try self.emitConstPrefixForPrimitive(var_stmt.kind);
                         const num = init_expr.data.number_literal;
                         if (@floor(num) == num and num >= -2147483648 and num <= 2147483647) {
                             try self.emit("int");
@@ -2258,16 +2608,28 @@ pub const CGenerator = struct {
                             try self.emit("double");
                         }
                     } else if (init_expr.kind == .member_expr) {
-                        // Member access or array indexing - default to double
+                        // Member access - could be primitive or object, default conservatively
+                        try self.emitConstPrefixForPrimitive(var_stmt.kind);
                         try self.emit("double");
                     } else {
+                        // void* for unknown pointer types - emit const suffix for const declarations
                         try self.emit("void*");
+                        if (var_stmt.kind == .@"const") try self.emit(" const");
                     }
                 } else if (decl.type) |typ| {
-                    // No initializer, but have explicit type
+                    try self.emitConstPrefixIfNeeded(var_stmt.kind, typ);
                     try self.emitType(typ);
+                    try self.emitConstSuffixIfNeeded(var_stmt.kind, typ);
+                } else if (self.getSymbolTypeAtPosition(decl.name, node.location.start.line, node.location.start.column)) |symbol_type| {
+                    // Phase 3.1: Use TypeChecker's resolved type from SymbolTable
+                    // Uses position-aware lookup to handle shadowed variables correctly
+                    try self.emitConstPrefixIfNeeded(var_stmt.kind, symbol_type);
+                    try self.emitType(symbol_type);
+                    try self.emitConstSuffixIfNeeded(var_stmt.kind, symbol_type);
                 } else {
+                    // void* for unknown types - emit const suffix for const declarations
                     try self.emit("void*");
+                    if (var_stmt.kind == .@"const") try self.emit(" const");
                 }
 
                 try self.emit(" ");
@@ -2624,6 +2986,12 @@ pub const CGenerator = struct {
     fn emitReturnStmt(self: *Self, node: *ast.Node) !void {
         const ret = &node.data.return_stmt;
 
+        // For main(), emit cycle collection before return
+        const is_main = if (self.current_function) |fn_name|
+            std.mem.eql(u8, fn_name, "main")
+        else
+            false;
+
         // Note: StringBuilder finalization is handled by checkAndFinalizeStringBuildersForStmt
         // before this function is called
 
@@ -2670,6 +3038,12 @@ pub const CGenerator = struct {
             try self.emitAllScopeCleanup();
             try self.emitStringBuilderCleanupForReturn(returned_var);
 
+            // For main(), collect cycles before return
+            if (is_main) {
+                try self.emitIndent();
+                try self.emit("ms_collect_cycles();\n");
+            }
+
             // Return the saved value
             try self.emitIndent();
             try self.emit("return _return_value;\n");
@@ -2679,8 +3053,14 @@ pub const CGenerator = struct {
             try self.emit("\n"); // End the current (empty) line
             try self.emitAllScopeCleanup();
             try self.emitStringBuilderCleanupForReturn(returned_var);
-            try self.emitIndent(); // Indent for the return statement
 
+            // For main(), collect cycles before return
+            if (is_main) {
+                try self.emitIndent();
+                try self.emit("ms_collect_cycles();\n");
+            }
+
+            try self.emitIndent(); // Indent for the return statement
             try self.emit("return");
             if (ret.argument) |arg| {
                 try self.emit(" ");
@@ -2689,6 +3069,13 @@ pub const CGenerator = struct {
             try self.emit(";\n");
         } else {
             // No cleanup needed - simple return
+            // For main(), collect cycles before return
+            if (is_main) {
+                try self.emit("\n");
+                try self.emitIndent();
+                try self.emit("ms_collect_cycles();\n");
+                try self.emitIndent();
+            }
             try self.emit("return");
             if (ret.argument) |arg| {
                 try self.emit(" ");
@@ -3147,24 +3534,33 @@ pub const CGenerator = struct {
                 } else {
                     // Use -> for pointer types (class instances allocated with ms_alloc)
                     // Use . for stack-allocated value types (object literals)
-                    const is_pointer = if (member.object.type) |obj_type| blk: {
-                        // type_reference means it's a named type (like Point)
-                        if (obj_type.kind == .type_reference) {
-                            break :blk true;
+                    const is_pointer = blk: {
+                        // First check: type information from type checker
+                        if (member.object.type) |obj_type| {
+                            // type_reference means it's a named type (like Point)
+                            if (obj_type.kind == .type_reference) {
+                                break :blk true;
+                            }
+                            // ref type (explicit ref annotation)
+                            if (obj_type.kind == .ref) {
+                                break :blk true;
+                            }
+                            // object type with a name = class instance (heap pointer)
+                            // object type without name = object literal (stack value)
+                            if (obj_type.kind == .object) {
+                                if (obj_type.data.object.name != null) {
+                                    break :blk true; // Class instance -> pointer
+                                }
+                            }
                         }
-                        // ref type (explicit ref annotation)
-                        if (obj_type.kind == .ref) {
-                            break :blk true;
-                        }
-                        // object type with a name = class instance (heap pointer)
-                        // object type without name = object literal (stack value)
-                        if (obj_type.kind == .object) {
-                            if (obj_type.data.object.name != null) {
-                                break :blk true; // Class instance -> pointer
+                        // Second check: DRC knows if this identifier is a class instance
+                        if (member.object.kind == .identifier) {
+                            if (self.drc.isClassInstance(member.object.data.identifier)) {
+                                break :blk true;
                             }
                         }
                         break :blk false;
-                    } else false;
+                    };
                     if (is_pointer) {
                         try self.emit("->");
                     } else {
@@ -3300,7 +3696,22 @@ pub const CGenerator = struct {
             return;
         }
 
-        const t = typ.?;
+        // Check for lent (borrowed) BEFORE follow() unwraps it
+        // Borrowed data is immutable, so emit "const Type*"
+        const is_lent = typ.?.kind == .lent;
+        if (is_lent) {
+            try self.emit("const ");
+        }
+
+        // Use types.follow() to resolve type aliases and ref/lent wrappers
+        // This handles chained aliases (alias1 → alias2 → concrete) correctly
+        const resolved = types_mod.follow(typ);
+        if (resolved == null) {
+            try self.emit("void");
+            return;
+        }
+
+        const t = resolved.?;
         switch (t.kind) {
             .int8 => try self.emit("int8_t"),
             .int16 => try self.emit("int16_t"),
@@ -3318,15 +3729,22 @@ pub const CGenerator = struct {
             .void => try self.emit("void"),
             .type_reference => {
                 // Type references (e.g., string, number, User)
+                // types.follow() handles resolved type references, but unresolved ones
+                // (like type aliases before resolution) need SymbolTable lookup
                 const type_ref = t.data.type_reference;
+                const name = type_ref.name;
 
-                // Check if resolved to actual type
-                if (type_ref.resolved) |resolved| {
-                    return try self.emitType(resolved);
+                // Try to resolve type aliases from SymbolTable
+                if (self.getSymbol(name)) |sym| {
+                    if (sym.kind == .type_alias) {
+                        if (sym.type) |aliased_type| {
+                            // Recursively emit the aliased type
+                            return try self.emitType(aliased_type);
+                        }
+                    }
                 }
 
                 // Map common type names to C types
-                const name = type_ref.name;
                 if (std.mem.eql(u8, name, "string")) {
                     try self.emit("msString*");
                 } else if (std.mem.eql(u8, name, "number")) {
@@ -3415,3 +3833,236 @@ pub const CGenerator = struct {
         try self.emit("\n");
     }
 };
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
+test "isPrimitiveTypeKind identifies primitive types" {
+    // Primitives should return true
+    try std.testing.expect(CGenerator.isPrimitiveTypeKind(.number));
+    try std.testing.expect(CGenerator.isPrimitiveTypeKind(.int32));
+    try std.testing.expect(CGenerator.isPrimitiveTypeKind(.int64));
+    try std.testing.expect(CGenerator.isPrimitiveTypeKind(.float32));
+    try std.testing.expect(CGenerator.isPrimitiveTypeKind(.float64));
+    try std.testing.expect(CGenerator.isPrimitiveTypeKind(.boolean));
+
+    // Non-primitives should return false
+    try std.testing.expect(!CGenerator.isPrimitiveTypeKind(.object));
+    try std.testing.expect(!CGenerator.isPrimitiveTypeKind(.array));
+    try std.testing.expect(!CGenerator.isPrimitiveTypeKind(.function));
+    try std.testing.expect(!CGenerator.isPrimitiveTypeKind(.string));
+    try std.testing.expect(!CGenerator.isPrimitiveTypeKind(.ref));
+    try std.testing.expect(!CGenerator.isPrimitiveTypeKind(.lent));
+}
+
+test "isLentType identifies borrowed types" {
+    // null type is not lent
+    try std.testing.expect(!CGenerator.isLentType(null));
+
+    // Note: Can't easily test with actual Type* without more setup
+    // The logic is simple: t.kind == .lent
+}
+
+test "TypeChecker->CGenerator integration: hasBorrowedOwnership" {
+    // Test that hasBorrowedOwnership returns false when no SymbolTable is provided
+    // (graceful degradation for tests without type checking)
+    var drc = Drc.init(std.testing.allocator);
+    defer drc.deinit();
+
+    var gen = CGenerator.init(std.testing.allocator, &drc);
+    defer gen.deinit();
+
+    // Without SymbolTable, should return false (safe fallback)
+    try std.testing.expect(!gen.hasBorrowedOwnership("anyVar"));
+}
+
+test "TypeChecker->CGenerator integration: SymbolTable lookup" {
+    // Test that getSymbol returns null when SymbolTable is not provided
+    var drc = Drc.init(std.testing.allocator);
+    defer drc.deinit();
+
+    var gen = CGenerator.init(std.testing.allocator, &drc);
+    defer gen.deinit();
+
+    // Without SymbolTable, lookup should return null
+    try std.testing.expect(gen.getSymbol("x") == null);
+}
+
+test "TypeChecker->CGenerator integration: getSymbolType fallback" {
+    // Test that getSymbolType returns null when SymbolTable is not provided
+    // This verifies Phase 3.1 integration gracefully degrades
+    var drc = Drc.init(std.testing.allocator);
+    defer drc.deinit();
+
+    var gen = CGenerator.init(std.testing.allocator, &drc);
+    defer gen.deinit();
+
+    // Without SymbolTable, getSymbolType should return null (safe fallback)
+    try std.testing.expect(gen.getSymbolType("anyVar") == null);
+}
+
+test "TypeChecker->CGenerator E2E: symbol lookup with real SymbolTable" {
+    // E2E test: Create real SymbolTable with typed symbol, verify CGenerator can look it up
+    var drc = Drc.init(std.testing.allocator);
+    defer drc.deinit();
+
+    // Create a real SymbolTable
+    var symbols = try SymbolTable.init(std.testing.allocator);
+    defer symbols.deinit();
+
+    // Create a type (int32)
+    var int32_type = types_mod.Type{
+        .kind = .int32,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .int32 = {} },
+    };
+
+    // Define a symbol with the type
+    var sym_x = Symbol.init("myVar", .variable, location.SourceLocation.dummy());
+    sym_x.type = &int32_type;
+    try symbols.define(sym_x);
+
+    // Create CGenerator WITH the SymbolTable
+    var gen = CGenerator.initWithSymbols(std.testing.allocator, &drc, &symbols);
+    defer gen.deinit();
+
+    // Verify getSymbol finds the symbol
+    const found_symbol = gen.getSymbol("myVar");
+    try std.testing.expect(found_symbol != null);
+    try std.testing.expectEqualStrings("myVar", found_symbol.?.name);
+
+    // Verify getSymbolType returns the type
+    const found_type = gen.getSymbolType("myVar");
+    try std.testing.expect(found_type != null);
+    try std.testing.expectEqual(types_mod.TypeKind.int32, found_type.?.kind);
+
+    // Verify hasBorrowedOwnership returns false for non-borrowed type
+    try std.testing.expect(!gen.hasBorrowedOwnership("myVar"));
+}
+
+test "TypeChecker->CGenerator E2E: lookupAll finds symbols in nested scopes" {
+    // E2E test: Verify lookupAll() finds symbols after scope is exited
+    var drc = Drc.init(std.testing.allocator);
+    defer drc.deinit();
+
+    var symbols = try SymbolTable.init(std.testing.allocator);
+    defer symbols.deinit();
+
+    // Enter a function scope and define a variable
+    try symbols.enterScope(.function);
+
+    var int64_type = types_mod.Type{
+        .kind = .int64,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .int64 = {} },
+    };
+
+    var sym_local = Symbol.init("localVar", .variable, location.SourceLocation.dummy());
+    sym_local.type = &int64_type;
+    try symbols.define(sym_local);
+
+    // Exit the scope (simulating end of type checking)
+    symbols.exitScope();
+
+    // Now current scope is global, but localVar was in function scope
+    // Create CGenerator - it should still find localVar via lookupAll()
+    var gen = CGenerator.initWithSymbols(std.testing.allocator, &drc, &symbols);
+    defer gen.deinit();
+
+    // Verify we can still find the symbol (this is why we use lookupAll, not lookup)
+    const found = gen.getSymbol("localVar");
+    try std.testing.expect(found != null);
+    try std.testing.expectEqualStrings("localVar", found.?.name);
+
+    // Verify type is preserved
+    const found_type = gen.getSymbolType("localVar");
+    try std.testing.expect(found_type != null);
+    try std.testing.expectEqual(types_mod.TypeKind.int64, found_type.?.kind);
+}
+
+test "TypeChecker->CGenerator E2E: position-aware lookup resolves shadowing" {
+    // E2E test: Verify getSymbolAtPosition correctly resolves shadowed variables
+    //
+    // Simulates:
+    //   function outer() {      // line 1
+    //     let x: int32 = 1;     // line 2, outer's x
+    //     {                     // line 3
+    //       let x: string = ""; // line 4, inner's x (shadows outer)
+    //     }                     // line 5
+    //     return x;             // line 6, should resolve to outer's x (int32)
+    //   }
+    var drc = Drc.init(std.testing.allocator);
+    defer drc.deinit();
+
+    var symbols = try SymbolTable.init(std.testing.allocator);
+    defer symbols.deinit();
+
+    // Create types
+    var int32_type = types_mod.Type{
+        .kind = .int32,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .int32 = {} },
+    };
+    var string_type = types_mod.Type{
+        .kind = .string,
+        .location = location.SourceLocation.dummy(),
+        .data = .{ .string = {} },
+    };
+
+    // Enter outer function scope (lines 1-7)
+    try symbols.enterScope(.function);
+    symbols.scopes.items[symbols.scopes.items.len - 1].start_location = location.SourceLocation.init(
+        1,
+        .{ .line = 1, .column = 0 },
+        .{ .line = 7, .column = 1 },
+    );
+
+    // Define outer's x at line 2
+    var outer_x = Symbol.init("x", .variable, location.SourceLocation.init(
+        1,
+        .{ .line = 2, .column = 8 },
+        .{ .line = 2, .column = 9 },
+    ));
+    outer_x.type = &int32_type;
+    try symbols.define(outer_x);
+
+    // Enter inner block scope (lines 3-5)
+    try symbols.enterScope(.block);
+    symbols.scopes.items[symbols.scopes.items.len - 1].start_location = location.SourceLocation.init(
+        1,
+        .{ .line = 3, .column = 4 },
+        .{ .line = 5, .column = 5 },
+    );
+
+    // Define inner's x at line 4 (shadows outer)
+    var inner_x = Symbol.init("x", .variable, location.SourceLocation.init(
+        1,
+        .{ .line = 4, .column = 10 },
+        .{ .line = 4, .column = 11 },
+    ));
+    inner_x.type = &string_type;
+    try symbols.define(inner_x);
+
+    // Exit both scopes (simulating end of type checking)
+    symbols.exitScope(); // inner block
+    symbols.exitScope(); // outer function
+
+    // Create CGenerator
+    var gen = CGenerator.initWithSymbols(std.testing.allocator, &drc, &symbols);
+    defer gen.deinit();
+
+    // At line 6 (after inner block), "x" should resolve to outer's x (int32)
+    const found_at_line6 = gen.getSymbolAtPosition("x", 6, 10);
+    try std.testing.expect(found_at_line6 != null);
+    const type_at_line6 = found_at_line6.?.type;
+    try std.testing.expect(type_at_line6 != null);
+    try std.testing.expectEqual(types_mod.TypeKind.int32, type_at_line6.?.kind);
+
+    // At line 4 (inside inner block), "x" should resolve to inner's x (string)
+    const found_at_line4 = gen.getSymbolAtPosition("x", 4, 15);
+    try std.testing.expect(found_at_line4 != null);
+    const type_at_line4 = found_at_line4.?.type;
+    try std.testing.expect(type_at_line4 != null);
+    try std.testing.expectEqual(types_mod.TypeKind.string, type_at_line4.?.kind);
+}

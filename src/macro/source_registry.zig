@@ -60,18 +60,33 @@ pub const SourceMacroRegistry = struct {
 
         const decl = &node.data.macro_decl;
 
-        // IMPORTANT: Duplicate the name since the source buffer may be freed
-        const name_copy = try self.allocator.dupe(u8, decl.name);
+        // Check if already registered to avoid leaking duplicate name allocations
+        // (StringHashMap.put keeps the OLD key, so new key would be lost)
+        const gop = try self.macros.getOrPut(decl.name);
 
-        try self.macros.put(name_copy, .{
-            .name = name_copy,
-            .params = decl.params,
-            .body = decl.body,
-            .location = node.location,
-            .js_source = null,
-        });
-
-        std.log.info("[SourceMacroRegistry] Registered macro: @{s}", .{name_copy});
+        if (gop.found_existing) {
+            // Already registered - update in place without allocating new name
+            gop.value_ptr.* = .{
+                .name = gop.key_ptr.*,  // Reuse existing key
+                .params = decl.params,
+                .body = decl.body,
+                .location = node.location,
+                .js_source = null,
+            };
+            std.log.info("[SourceMacroRegistry] Updated macro: @{s}", .{decl.name});
+        } else {
+            // New macro - allocate name copy since source buffer may be freed
+            const name_copy = try self.allocator.dupe(u8, decl.name);
+            gop.key_ptr.* = name_copy;
+            gop.value_ptr.* = .{
+                .name = name_copy,
+                .params = decl.params,
+                .body = decl.body,
+                .location = node.location,
+                .js_source = null,
+            };
+            std.log.info("[SourceMacroRegistry] Registered macro: @{s}", .{name_copy});
+        }
     }
 
     /// Look up a macro by name

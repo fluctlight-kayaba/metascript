@@ -3,6 +3,7 @@
 .metascript-cache/
 .score-codegen
 zig-out/
+out/
 
 # IDE
 .vscode/

@@ -24,6 +24,7 @@
 #include "orc.h"
 #include <string.h>
 #include <stdbool.h>
+#include <stdio.h>   /* for snprintf in ms_string_concat_num */
 
 #ifdef __cplusplus
 extern "C" {

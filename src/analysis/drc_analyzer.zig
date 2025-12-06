@@ -68,6 +68,11 @@ pub const DrcAnalyzer = struct {
         const func = &node.data.function_decl;
         const start_line = node.location.start.line;
 
+        // Enter function context for scope-qualified variable tracking
+        // This ensures variables from different functions don't collide
+        self.drc.enterFunction(func.name);
+        defer self.drc.exitFunction();
+
         // Enter function scope
         try self.drc.enterScope(start_line);
 
